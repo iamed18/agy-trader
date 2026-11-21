@@ -490,6 +490,63 @@ def test_alpaca_news_provider_null_json_resilience() -> None:
 
 
 @respx.mock
+def test_alpaca_news_provider_429_retry_and_rate_limit_pacing() -> None:
+    base_url = "https://data.alpaca.markets/v1beta1/news"
+    start = datetime(2025, 4, 1, 0, 0, tzinfo=UTC)
+    end = datetime(2025, 4, 2, 23, 59, tzinfo=UTC)
+
+    route = respx.get(base_url).mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "3"}),
+            httpx.Response(
+                200,
+                headers={"X-RateLimit-Remaining": "1", "X-RateLimit-Reset": "1010"},
+                json={
+                    "news": [
+                        {
+                            "id": "201",
+                            "created_at": "2025-04-01T12:00:00Z",
+                            "headline": "First page after retry",
+                            "symbols": ["SPY"],
+                        }
+                    ],
+                    "next_page_token": "tok-2",
+                },
+            ),
+            httpx.Response(429, headers={"X-RateLimit-Reset": "1025"}),
+            httpx.Response(
+                200,
+                json={
+                    "news": [
+                        {
+                            "id": "202",
+                            "created_at": "2025-04-02T12:00:00Z",
+                            "headline": "Second page after reset wait",
+                            "symbols": ["SPY"],
+                        }
+                    ],
+                    "next_page_token": None,
+                },
+            ),
+        ]
+    )
+
+    sleeps: list[float] = []
+    provider = AlpacaNewsProvider(
+        api_key="k",
+        secret_key="s",
+        base_url=base_url,
+        sleep_fn=sleeps.append,
+        now_fn=lambda: 1000.0,
+    )
+    articles = provider.fetch_news(["SPY"], start=start, end=end)
+
+    assert route.call_count == 4
+    assert [a.article_id for a in articles] == ["201", "202"]
+    assert sleeps == [3.0, 10.5, 25.5]
+
+
+@respx.mock
 def test_fred_macro_provider_skips_dots_and_handles_empty_api_key() -> None:
     url = "https://api.stlouisfed.org/fred/series/observations"
 
