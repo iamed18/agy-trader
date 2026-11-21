@@ -31,9 +31,9 @@ ENV/
 env.bak
 venv.bak
 
-# Data & Reports
-data/
-reports/
+# Data & Reports (repo root only so src/agy_trader/data/ stays tracked)
+/data/
+/reports/
 *.db
 *.db-wal
 *.db-shm
