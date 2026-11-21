@@ -1,0 +1,474 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from typer.testing import CliRunner
+
+from agy_trader.cli.main import app
+
+runner = CliRunner()
+REPO_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
+
+
+def test_backfill_synthetic_and_status_json(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+
+    res_backfill = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--synthetic",
+            "--days",
+            "140",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_backfill.exit_code == 0, res_backfill.output
+    backfill_payload = json.loads(res_backfill.stdout)
+    assert backfill_payload["mode"] == "synthetic"
+    assert backfill_payload["days"] == 140
+    assert backfill_payload["symbols"] > 0
+    assert backfill_payload["bars_saved"] > 0
+    assert backfill_payload["news_saved"] > 0
+    assert backfill_payload["news_scored"] == backfill_payload["news_saved"]
+
+    res_status = runner.invoke(
+        app,
+        [
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "status",
+            "--json",
+        ],
+    )
+    assert res_status.exit_code == 0, res_status.output
+    status_payload = json.loads(res_status.stdout)
+    assert status_payload["parquet_symbols_count"] == backfill_payload["symbols"]
+    assert status_payload["counts"]["news_articles"] == backfill_payload["news_saved"]
+    assert status_payload["counts"]["scored_news"] == backfill_payload["news_saved"]
+    assert status_payload["llm_budget"]["allowed"] is True
+
+
+def test_backtest_ablate_json_and_report(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+
+    res_backfill = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--synthetic",
+            "--days",
+            "140",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_backfill.exit_code == 0, res_backfill.output
+
+    res_bt = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--ablate",
+            "--report-dir",
+            str(report_dir),
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_bt.exit_code == 0, res_bt.output
+    bt_payload = json.loads(res_bt.stdout)
+    assert len(bt_payload["results"]) == 4
+    report_path = Path(bt_payload["report_path"])
+    assert report_path.exists()
+    assert report_path.parent == report_dir
+    content = report_path.read_text(encoding="utf-8")
+    assert "Strategy Variant Comparison" in content
+
+
+def test_ops_controls_and_validation(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+
+    res_set = runner.invoke(
+        app,
+        [
+            "ops",
+            "set-exposure",
+            "0.5",
+            "--reason",
+            "vol spike",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_set.exit_code == 0, res_set.output
+    assert json.loads(res_set.stdout)["exposure_multiplier"] == 0.5
+
+    res_bad = runner.invoke(
+        app,
+        [
+            "ops",
+            "set-exposure",
+            "1.5",
+            "--reason",
+            "bad",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_bad.exit_code != 0
+
+    res_pause = runner.invoke(
+        app,
+        [
+            "ops",
+            "pause",
+            "--reason",
+            "risk event",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_pause.exit_code == 0, res_pause.output
+    assert json.loads(res_pause.stdout)["pause_new_entries"] is True
+
+    res_resume = runner.invoke(
+        app,
+        [
+            "ops",
+            "resume",
+            "--reason",
+            "clear",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_resume.exit_code == 0, res_resume.output
+    assert json.loads(res_resume.stdout)["pause_new_entries"] is False
+
+    res_bl_add = runner.invoke(
+        app,
+        [
+            "ops",
+            "blacklist",
+            "add",
+            "tsla",
+            "--hours",
+            "48",
+            "--reason",
+            "earnings vol",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_bl_add.exit_code == 0, res_bl_add.output
+    assert "TSLA" in json.loads(res_bl_add.stdout)["blacklisted_symbols"]
+
+    res_bl_rm = runner.invoke(
+        app,
+        [
+            "ops",
+            "blacklist",
+            "remove",
+            "TSLA",
+            "--reason",
+            "resolved",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_bl_rm.exit_code == 0, res_bl_rm.output
+    assert "TSLA" not in json.loads(res_bl_rm.stdout)["blacklisted_symbols"]
+
+    res_short = runner.invoke(
+        app,
+        [
+            "ops",
+            "set-shorting",
+            "false",
+            "--reason",
+            "short squeeze risk",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_short.exit_code == 0, res_short.output
+    assert json.loads(res_short.stdout)["allow_shorting"] is False
+
+    res_show = runner.invoke(
+        app,
+        [
+            "ops",
+            "show",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_show.exit_code == 0, res_show.output
+    assert json.loads(res_show.stdout)["exposure_multiplier"] == 0.5
+
+    res_audit = runner.invoke(
+        app,
+        [
+            "ops",
+            "audit-log",
+            "--limit",
+            "10",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_audit.exit_code == 0, res_audit.output
+    assert len(json.loads(res_audit.stdout)["entries"]) == 6
+
+
+def test_ops_authorize_restart_rate_limit(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+
+    for attempt in (1, 2):
+        res = runner.invoke(
+            app,
+            [
+                "ops",
+                "authorize-restart",
+                "trader",
+                "--reason",
+                f"restart attempt {attempt}",
+                "--data-dir",
+                str(data_dir),
+                "--config-dir",
+                str(REPO_CONFIG_DIR),
+                "--json",
+            ],
+        )
+        assert res.exit_code == 0, res.output
+        assert json.loads(res.stdout)["authorized"] is True
+
+    res_third = runner.invoke(
+        app,
+        [
+            "ops",
+            "authorize-restart",
+            "trader",
+            "--reason",
+            "restart attempt 3",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_third.exit_code != 0
+
+    res_disallowed = runner.invoke(
+        app,
+        [
+            "ops",
+            "authorize-restart",
+            "unknown-svc",
+            "--reason",
+            "bad service",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_disallowed.exit_code != 0
+
+
+def test_cli_score_news_walk_forward_empty_data_and_rich_tables(tmp_path: Path) -> None:
+    from datetime import UTC, datetime
+
+    from agy_trader.core.models import NewsArticle
+    from agy_trader.storage.db import StateDB
+
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+
+    # 1. Empty-data backtest fails with exit code 1
+    res_empty = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_empty.exit_code == 1
+
+    # 2. score-news --json scores newly inserted unscored articles
+    db = StateDB(data_dir / "state.db")
+    db.upsert_news_articles(
+        [
+            NewsArticle(
+                article_id="cli-news-1",
+                published_at=datetime(2025, 5, 1, 14, 0, tzinfo=UTC),
+                headline="Apple beats estimates and raises guidance",
+                symbols=["AAPL"],
+            )
+        ]
+    )
+    res_score = runner.invoke(
+        app,
+        [
+            "score-news",
+            "--backend",
+            "lexicon",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_score.exit_code == 0, res_score.output
+    score_payload = json.loads(res_score.stdout)
+    assert score_payload["scored_count"] == 1
+    assert score_payload["scorer_model"] == "lexicon-v1"
+
+    # 3. Synthetic backfill (non-JSON Rich table) + walk-forward --folds 2 --start --end
+    res_bf_rich = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--synthetic",
+            "--days",
+            "160",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_bf_rich.exit_code == 0, res_bf_rich.output
+    assert "Backfill Complete" in res_bf_rich.stdout
+
+    # Load actual date range from Parquet to pick valid --start and --end window
+    from agy_trader.storage.parquet_store import ParquetBarStore
+
+    spy_df = ParquetBarStore(data_dir / "parquet").load_bars("SPY", timeframe="1d")
+    start_str = spy_df["timestamp"].iloc[70].date().isoformat()
+    end_str = spy_df["timestamp"].iloc[-1].date().isoformat()
+
+    res_wf_json = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--walk-forward",
+            "--folds",
+            "2",
+            "--start",
+            start_str,
+            "--end",
+            end_str,
+            "--report-dir",
+            str(report_dir),
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_wf_json.exit_code == 0, res_wf_json.output
+    wf_payload = json.loads(res_wf_json.stdout)
+    assert len(wf_payload["results"]) == 1
+    assert len(wf_payload["walk_forward_folds"]) == 2
+    assert wf_payload["walk_forward_folds"][0]["end_date"] < wf_payload["walk_forward_folds"][1]["start_date"]
+
+    # 4. Non-JSON Rich table output for backtest, status, and ops show
+    res_bt_rich = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--walk-forward",
+            "--folds",
+            "2",
+            "--start",
+            start_str,
+            "--end",
+            end_str,
+            "--report-dir",
+            str(report_dir),
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_bt_rich.exit_code == 0, res_bt_rich.output
+    assert "Backtest Results" in res_bt_rich.stdout
+    assert "Walk-Forward Out-of-Sample Folds" in res_bt_rich.stdout
+
+    res_status_rich = runner.invoke(
+        app,
+        [
+            "status",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_status_rich.exit_code == 0, res_status_rich.output
+    assert "agy-trader Status" in res_status_rich.stdout
+    assert "Recent Backtest Runs" in res_status_rich.stdout
+
+    res_ops_rich = runner.invoke(
+        app,
+        [
+            "ops",
+            "show",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_ops_rich.exit_code == 0, res_ops_rich.output
+    assert "Active Ops Control Dials" in res_ops_rich.stdout
+

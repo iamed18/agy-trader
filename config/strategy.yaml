@@ -1,0 +1,46 @@
+strategy:
+  rebalance_checkpoints_et:
+    - "10:00"
+    - "13:00"
+    - "15:40"
+  w_trend: 0.45
+  w_pullback: 0.25
+  w_news_sentiment: 0.30
+  news_half_life_hours: 24.0
+  news_lookback_hours: 72.0
+  top_k_long: 8
+  top_k_short: 6
+  min_signal_threshold: 0.35
+  rebalance_deadband_pct: 0.015
+  allow_fractional_longs: true
+
+risk:
+  max_long_position_pct: 0.10
+  max_short_position_pct: 0.06
+  max_gross_exposure: 1.00
+  min_net_exposure: -0.25
+  max_net_exposure: 0.60
+  max_sector_gross_pct: 0.25
+  daily_loss_halt_pct: 0.02
+  max_drawdown_halt_pct: 0.08
+  earnings_blackout_days: 2
+  stop_loss_atr_mult_long: 2.5
+  stop_loss_atr_mult_short: 2.0
+  short_squeeze_5d_return_cap: 0.20
+  short_squeeze_ann_vol_cap: 0.90
+  max_data_staleness_minutes: 15
+
+backtest:
+  initial_capital: 100000.0
+  etf_slippage_bps: 5.0
+  equity_slippage_bps: 10.0
+  short_borrow_apr: 0.015
+  sec_sell_fee_bps: 0.28
+  benchmark_symbol: "SPY"
+
+llm_quota:
+  daily_usd_cap: 1.50
+  monthly_usd_cap: 25.00
+  tier1_model: "flash"
+  tier2_model: "pro"
+  max_input_tokens_per_call: 8000
