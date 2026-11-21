@@ -2,6 +2,8 @@
 
 Deterministic, backtestable quantitative swing-trading system for US equities and ETFs on Alpaca, combining price/volume/macro signals with local quantitative news sentiment (FinBERT / lexicon), immutable hard risk guardrails, and an Active Ops agent control plane.
 
+> **New local agent / session handoff:** See [`docs/HANDOFF.md`](docs/HANDOFF.md) for locked-in design decisions, Phase 1 audit status, quota/audit policies, and the Phase 2–3 roadmap.
+
 ## Phase 1 Quickstart
 
 ```bash
