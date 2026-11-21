@@ -7,19 +7,18 @@ Deterministic, backtestable quantitative swing-trading system for US equities an
 ## Phase 1 Quickstart
 
 ```bash
-uv venv .venv
-uv pip install --python .venv/bin/python -e ".[dev]"
+uv sync
 cp .env.example .env
 
 # Run synthetic backfill + 4-way A/B backtest ablation (zero API keys needed)
-.venv/bin/agy backfill --synthetic --days 730
-.venv/bin/agy backtest --ablate
+uv run agy backfill --synthetic --days 730
+uv run agy backtest --ablate
 ```
 
 For real Alpaca Paper historical data and Benzinga news, populate `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in `.env` and run:
 
 ```bash
-.venv/bin/agy backfill --days 365
-.venv/bin/agy score-news --backend lexicon   # or --backend finbert with .[nlp] installed
-.venv/bin/agy backtest --ablate
+uv run agy backfill --days 365
+uv run agy score-news --backend lexicon   # or --backend finbert after: uv sync --extra nlp
+uv run agy backtest --ablate
 ```

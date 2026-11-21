@@ -280,7 +280,7 @@ class FinBERTScorer(SentimentScorer):
         except ImportError as exc:
             raise RuntimeError(
                 "FinBERT requires optional NLP dependencies. "
-                "Install with: uv pip install -e '.[nlp]'"
+                "Install with: uv sync --extra nlp"
             ) from exc
 
         self._device = "cuda" if torch.cuda.is_available() else "cpu"

@@ -30,6 +30,8 @@ nlp = [
     "torch>=2.2",
     "scipy>=1.13"
 ]
+
+[dependency-groups]
 dev = [
     "pytest>=8.2",
     "ruff>=0.4",

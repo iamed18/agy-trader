@@ -9,9 +9,9 @@
 - **Repository:** `https://github.com/iamed18/agy-trader` (`main`)
 - **Completed Scope:** **Phase 1** (Foundation, Local SQLite WAL + Parquet Storage, Alpaca Historical Bars & Benzinga News Backfill, FRED Macro & `yfinance` Earnings Calendar, Local FinBERT & Lexicon NLP Sentiment Scorer + Point-in-Time Aggregator, Point-in-Time Feature Engine, ATR Inverse-Vol Long/Short Portfolio Constructor, Immutable Hard Risk Engine, Audited Bounded Control Plane, Event-Driven Backtester + 4-Way A/B Ablation + Walk-Forward, and Phase 1 `agy` CLI).
 - **Verification State:**
-  - `.venv/bin/ruff check src tests` -> **0 errors**
-  - `.venv/bin/mypy src tests` -> **0 errors across 34 files**
-  - `.venv/bin/pytest -v` -> **55/55 tests passing**
+  - `uv run ruff check src tests` -> **0 errors**
+  - `uv run mypy src tests` -> **0 errors across 34 files**
+  - `uv run pytest -v` -> **55/55 tests passing**
 - **Adversarial Audit State:** All 3 Phase 1 Independent Adversarial Audit Gates cleared with **0 `CRITICAL`, 0 `HIGH`, and 0 `MEDIUM` findings remaining**:
   - [docs/audits/phase1_gate_a.md](audits/phase1_gate_a.md) — Data & Lookahead Bias (`PASS`)
   - [docs/audits/phase1_gate_b.md](audits/phase1_gate_b.md) — Risk Engine & Short-Safety Invariants (`PASS`)
@@ -62,25 +62,24 @@ All architectural decisions below were explicitly agreed with the user during di
 1. **Environment & Secrets Setup (stay strictly local on `local-host` — `.env` is gitignored):**
    ```bash
    cd ~/src/agy-trader
-   uv venv .venv
-   uv pip install --python .venv/bin/python -e ".[dev]"
+   uv sync
    # Optional for real local FinBERT (~2-4 GB RAM on CPU):
-   # uv pip install --python .venv/bin/python -e ".[dev,nlp]"
-   cp .env.example .env
+   # uv sync --extra nlp
+   cp .env.example .env && chmod 600 .env
    # Edit .env with ALPACA_API_KEY, ALPACA_SECRET_KEY, optional FRED_API_KEY
    ```
 2. **Verify Local Suite:**
    ```bash
-   .venv/bin/ruff check src tests
-   .venv/bin/mypy src tests
-   .venv/bin/pytest -v
+   uv run ruff check src tests
+   uv run mypy src tests
+   uv run pytest -v
    ```
 3. **Run Real Historical Backfill & 4-Way A/B Ablation:**
    ```bash
-   .venv/bin/agy backfill --days 730
-   # Optional: re-score all backfilled Benzinga news with FinBERT if .[nlp] installed:
-   # .venv/bin/agy score-news --backend finbert
-   .venv/bin/agy backtest --ablate --walk-forward --folds 3
+   uv run agy backfill --days 730
+   # Optional: re-score all backfilled Benzinga news with FinBERT if --extra nlp installed:
+   # uv run agy score-news --backend finbert
+   uv run agy backtest --ablate --walk-forward --folds 3
    ```
 4. **Inspect Turnover & Strategy Tuning (Key Insight from Phase 1 Synthetic Dry Run):**
    - Our 365-day synthetic dry run confirmed the `-8%` drawdown kill-switch and stops protected capital (capping drawdown around `-8.5%` to `-9.4%` vs `-14.5%` on synthetic `SPY`), **but** daily rebalancing generated high turnover (`20x–41x`) and significant slippage drag.
