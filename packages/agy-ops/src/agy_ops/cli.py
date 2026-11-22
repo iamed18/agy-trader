@@ -21,6 +21,13 @@ from agy_ops.daemons import (
 )
 from agy_ops.dashboard.app import create_dashboard_app, serve_dashboard, validate_dashboard_host
 from agy_ops.deploy.service_manifests import write_service_manifests
+from agy_ops.notifications import (
+    DiscordWebhookNotifier,
+    build_daily_summary_discord_embed,
+    build_morning_discord_embed,
+    build_test_discord_embed,
+    redact_webhook_url,
+)
 from agy_ops.reporting.digests import (
     build_daily_summary,
     build_morning_plan,
@@ -34,6 +41,12 @@ app = typer.Typer(
     help="Always-on daemons, read-only dashboard, and operational reporting CLI",
     no_args_is_help=True,
 )
+notify_app = typer.Typer(
+    name="notify",
+    help="Send operational Discord notifications to agy-trader",
+    no_args_is_help=True,
+)
+app.add_typer(notify_app, name="notify")
 console = Console()
 err_console = Console(stderr=True)
 
@@ -281,6 +294,190 @@ def render_manifests_cmd(
         username=username,
     )
     _emit_json({"target": target, "files": [str(p) for p in paths]})
+
+
+def _post_discord_embed(
+    settings: EnvSettings,
+    embed: dict[str, Any],
+    *,
+    dry_run: bool,
+) -> tuple[bool, str | None]:
+    raw_url = settings.discord_webhook_url.strip()
+    if dry_run:
+        return False, redact_webhook_url(raw_url) or None
+    if not raw_url:
+        err_console.print(
+            "[red]Error:[/red] DISCORD_WEBHOOK_URL is not configured "
+            "(set it in environment/.env or pass --dry-run)."
+        )
+        raise typer.Exit(code=1)
+    try:
+        with DiscordWebhookNotifier(raw_url) as notifier:
+            delivery = notifier.send_embed(
+                title=embed["title"],
+                description=embed["description"],
+                color=embed["color"],
+                fields=embed.get("fields", ()),
+                footer=embed.get("footer", "agy-trader"),
+            )
+    except (ValueError, RuntimeError) as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    return True, str(delivery["webhook_url"])
+
+
+def _format_morning_archive_markdown(
+    readiness: dict[str, Any],
+    morning_plan: dict[str, Any],
+) -> str:
+    lines = [
+        str(morning_plan.get("markdown_summary", "")),
+        "",
+        f"## Readiness Status: {readiness['status']}",
+    ]
+    issues = readiness.get("issues", [])
+    if issues:
+        for issue in issues:
+            lines.append(
+                f"- [{str(issue.get('severity', '')).upper()}] "
+                f"{issue.get('check', '?')}: {issue.get('message', '')}"
+            )
+    else:
+        lines.append("- All readiness checks passed.")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+@notify_app.command("morning")
+def notify_morning_cmd(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Render & archive report without posting to Discord"),
+    ] = False,
+    report_dir: Annotated[
+        Path,
+        typer.Option("--report-dir", help="Directory to archive morning_plan_latest.md"),
+    ] = Path("reports/daily"),
+    data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
+    config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Build morning readiness & plan, archive markdown, and post to Discord."""
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+    readiness = build_readiness_report(resolved_data, resolved_config)
+    morning_plan = build_morning_plan(resolved_data, resolved_config)
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = report_dir / "morning_plan_latest.md"
+    archive_path.write_text(
+        _format_morning_archive_markdown(readiness, morning_plan),
+        encoding="utf-8",
+    )
+
+    embed = build_morning_discord_embed(readiness, morning_plan)
+    sent, redacted_url = _post_discord_embed(settings, embed, dry_run=dry_run)
+
+    if json_output:
+        _emit_json(
+            {
+                "command": "morning",
+                "dry_run": dry_run,
+                "sent": sent,
+                "readiness_status": readiness["status"],
+                "archive_path": str(archive_path),
+                "webhook_url": redacted_url,
+                "embed": embed,
+            }
+        )
+        return
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    action = "prepared" if dry_run else "sent"
+    typer.echo(
+        f"{prefix}Morning notification {action} "
+        f"(status={readiness['status']}, archive={archive_path})"
+    )
+
+
+@notify_app.command("close")
+def notify_close_cmd(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Render & archive summary without posting to Discord"),
+    ] = False,
+    report_dir: Annotated[
+        Path,
+        typer.Option("--report-dir", help="Directory to archive daily_summary_latest.md"),
+    ] = Path("reports/daily"),
+    data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
+    config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Build daily close summary, archive markdown, and post to Discord."""
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+    summary = build_daily_summary(resolved_data, resolved_config)
+
+    report_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = report_dir / "daily_summary_latest.md"
+    archive_path.write_text(
+        str(summary.get("markdown_summary", "")).rstrip() + "\n",
+        encoding="utf-8",
+    )
+
+    embed = build_daily_summary_discord_embed(summary)
+    sent, redacted_url = _post_discord_embed(settings, embed, dry_run=dry_run)
+
+    if json_output:
+        _emit_json(
+            {
+                "command": "close",
+                "dry_run": dry_run,
+                "sent": sent,
+                "session_date_et": summary["session_date_et"],
+                "archive_path": str(archive_path),
+                "webhook_url": redacted_url,
+                "embed": embed,
+            }
+        )
+        return
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    action = "prepared" if dry_run else "sent"
+    typer.echo(
+        f"{prefix}Daily close notification {action} "
+        f"(date={summary['session_date_et']}, archive={archive_path})"
+    )
+
+
+@notify_app.command("test")
+def notify_test_cmd(
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Render test embed without posting to Discord"),
+    ] = False,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Send a connectivity verification embed to agy-trader."""
+    settings = EnvSettings()
+    embed = build_test_discord_embed()
+    sent, redacted_url = _post_discord_embed(settings, embed, dry_run=dry_run)
+
+    if json_output:
+        _emit_json(
+            {
+                "command": "test",
+                "dry_run": dry_run,
+                "sent": sent,
+                "webhook_url": redacted_url,
+                "embed": embed,
+            }
+        )
+        return
+
+    prefix = "[DRY RUN] " if dry_run else ""
+    action = "prepared" if dry_run else "sent"
+    typer.echo(f"{prefix}Test notification {action} for agy-trader")
 
 
 if __name__ == "__main__":

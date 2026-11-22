@@ -24,6 +24,7 @@ class EnvSettings(BaseSettings):
     fred_api_key: str = ""
     finnhub_api_key: str = ""
     sec_edgar_user_agent: str = ""
+    discord_webhook_url: str = ""
     nlp_backend: Literal["lexicon", "finbert"] = "lexicon"
     agy_data_dir: Path = Path("data")
     agy_config_dir: Path = Path("config")
