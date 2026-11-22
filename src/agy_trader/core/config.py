@@ -22,6 +22,8 @@ class EnvSettings(BaseSettings):
     live_trading_confirmation: str = ""
     alpaca_data_feed: Literal["iex", "sip"] = "iex"
     fred_api_key: str = ""
+    finnhub_api_key: str = ""
+    sec_edgar_user_agent: str = ""
     nlp_backend: Literal["lexicon", "finbert"] = "lexicon"
     agy_data_dir: Path = Path("data")
     agy_config_dir: Path = Path("config")
@@ -67,6 +69,11 @@ class StrategyConfig(BaseModel):
     w_trend: float = Field(default=0.45, ge=0.0, le=1.0)
     w_pullback: float = Field(default=0.25, ge=0.0, le=1.0)
     w_news_sentiment: float = Field(default=0.30, ge=0.0, le=1.0)
+    w_insider: float = Field(default=0.0, ge=0.0, le=1.0)
+    insider_lookback_days: int = Field(default=60, ge=5, le=180)
+    model_news_sources: list[str] | None = Field(
+        default_factory=lambda: ["benzinga", "fiscal.ai", "finnhub"]
+    )
     news_half_life_hours: float = Field(default=24.0, gt=0.0)
     news_lookback_hours: float = Field(default=72.0, gt=0.0)
     top_k_long: int = Field(default=8, ge=1)
@@ -78,6 +85,7 @@ class StrategyConfig(BaseModel):
     hold_rank_buffer: int = Field(default=0, ge=0, le=50)
     exit_signal_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
     abs_momentum_filter: bool = False
+    use_rf_hurdle_for_abs_momentum: bool = True
     short_only_in_bear_regime: bool = False
     max_pair_corr_60d: float | None = Field(default=None, ge=-1.0, le=1.0)
     corr_penalty_eta: float = Field(default=0.0, ge=0.0, le=5.0)
@@ -92,6 +100,13 @@ class StrategyConfig(BaseModel):
     spy_ret10_crash_thresh: float = Field(default=-0.055, lt=0.0)
     spy_ret10_crash_scale: float | None = Field(default=None, ge=0.0, le=1.0)
 
+    @field_validator("model_news_sources")
+    @classmethod
+    def _validate_model_news_sources(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return None
+        return [s.strip().lower() for s in v if s.strip()]
+
     @field_validator("rebalance_checkpoints_et")
     @classmethod
     def _validate_rebalance_checkpoints_et(cls, v: list[str]) -> list[str]:
@@ -104,7 +119,7 @@ class StrategyConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_weights(self) -> StrategyConfig:
-        total = self.w_trend + self.w_pullback + self.w_news_sentiment
+        total = self.w_trend + self.w_pullback + self.w_news_sentiment + self.w_insider
         if total <= 0.0:
             raise ValueError("Strategy signal weights must sum to > 0")
         if self.momentum_mode == "m2_residual":
@@ -135,6 +150,7 @@ class RiskConfig(BaseModel):
     daily_loss_halt_pct: float = Field(default=0.02, gt=0.0, lt=1.0)
     max_drawdown_halt_pct: float = Field(default=0.08, gt=0.0, lt=1.0)
     earnings_blackout_days: int = Field(default=2, ge=0, le=30)
+    restatement_blackout_days: int = Field(default=10, ge=0, le=60)
     stop_loss_atr_mult_long: float = Field(default=2.5, gt=0.0)
     stop_loss_atr_mult_short: float = Field(default=2.0, gt=0.0)
     short_squeeze_5d_return_cap: float = Field(default=0.20, gt=0.0)
@@ -160,6 +176,10 @@ class BacktestConfig(BaseModel):
     equity_slippage_bps: float = Field(default=10.0, ge=0.0)
     short_borrow_apr: float = Field(default=0.015, ge=0.0, le=1.0)
     sec_sell_fee_bps: float = Field(default=0.28, ge=0.0)
+    risk_free_rate_apr: float = Field(default=0.045, ge=0.0, le=0.25)
+    cash_yield_apr: float = Field(default=0.045, ge=0.0, le=0.25)
+    use_fred_tbill_yield: bool = True
+    execution_timing: Literal["same_close", "next_open"] = "same_close"
     benchmark_symbol: str = "SPY"
 
 

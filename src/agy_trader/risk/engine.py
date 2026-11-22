@@ -2,24 +2,12 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
-from datetime import date, datetime, timedelta
-from functools import lru_cache
-from typing import Any, ClassVar
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
-from pandas.tseries.holiday import (
-    AbstractHolidayCalendar,
-    GoodFriday,
-    Holiday,
-    USLaborDay,
-    USMartinLutherKingJr,
-    USMemorialDay,
-    USPresidentsDay,
-    USThanksgivingDay,
-    nearest_workday,
-)
 from pydantic import BaseModel, ConfigDict, Field
 
+from agy_trader.core.calendar import nyse_trading_days_apart
 from agy_trader.core.config import RiskConfig
 from agy_trader.core.models import (
     AssetRiskMetadata,
@@ -36,57 +24,7 @@ from agy_trader.core.models import (
 NY_TZ = ZoneInfo("America/New_York")
 MAX_REF_PRICE_DEVIATION = 0.02  # 2% max divergence between order.reference_price and state.prices
 MAX_FALLBACK_LONG_STOP_PCT = 0.25  # Hard 25% max stop width if signal is unavailable on long
-
-
-class _NYSEHolidayCalendar(AbstractHolidayCalendar):
-    rules: ClassVar[list[Any]] = [
-        Holiday("NewYearsDay", month=1, day=1, observance=nearest_workday),
-        USMartinLutherKingJr,
-        USPresidentsDay,
-        GoodFriday,
-        USMemorialDay,
-        Holiday("Juneteenth", month=6, day=19, start_date="2022-01-01", observance=nearest_workday),
-        Holiday("IndependenceDay", month=7, day=4, observance=nearest_workday),
-        USLaborDay,
-        USThanksgivingDay,
-        Holiday("Christmas", month=12, day=25, observance=nearest_workday),
-    ]
-
-
-_NYSE_CAL = _NYSEHolidayCalendar()
-
-
-@lru_cache(maxsize=64)
-def _nyse_holidays_for_year(year: int) -> frozenset[date]:
-    hols = _NYSE_CAL.holidays(start=f"{year}-01-01", end=f"{year}-12-31")
-    return frozenset(ts.date() for ts in hols)
-
-
-def _is_nyse_trading_day(d: date) -> bool:
-    return d.weekday() < 5 and d not in _nyse_holidays_for_year(d.year)
-
-
-def _trading_days_apart(d1: date, d2: date) -> int:
-    """Count NYSE trading sessions strictly separating two dates (symmetric, >= 0).
-
-    For two trading days, consecutive sessions (e.g., Thu & Fri, or Fri & Tue after a
-    Monday NYSE holiday) return 1. If an earnings date falls on a weekend/holiday,
-    the immediately preceding and following trading sessions both have distance 0
-    (treated conservatively so blackout_days=0 still blocks adjacent sessions).
-    """
-    if d1 == d2:
-        return 0
-    lo, hi = (d1, d2) if d1 < d2 else (d2, d1)
-    # Count trading days strictly between lo and hi, plus 1 if both endpoints are trading days
-    between = 0
-    cur = lo + timedelta(days=1)
-    while cur < hi:
-        if _is_nyse_trading_day(cur):
-            between += 1
-        cur += timedelta(days=1)
-    if _is_nyse_trading_day(lo) and _is_nyse_trading_day(hi):
-        return between + 1
-    return between
+_trading_days_apart = nyse_trading_days_apart
 
 
 class PortfolioRiskState(BaseModel):
@@ -343,6 +281,14 @@ class HardRiskEngine:
             if sig_age_hours < -1e-6 or sig_age_hours > self.max_signal_age_hours:
                 violations.append("STALE_OR_FUTURE_SIGNAL")
                 sig = None
+
+        if (
+            not is_short_order
+            and sig is not None
+            and sig.has_recent_restatement
+            and self.config.restatement_blackout_days > 0
+        ):
+            violations.append("RESTATEMENT_BLACKOUT")
 
         # 6. Asset Metadata, Earnings Blackout & Shorting Safety Checks
         meta = universe_meta.get(sym)

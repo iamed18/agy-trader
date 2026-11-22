@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import bisect
+import itertools
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
+from typing import Literal
 
 import numpy as np
 import pandas as pd
 
-from agy_trader.core.config import AppConfig, StrategyConfig
+from agy_trader.core.config import AppConfig, BacktestConfig, RiskConfig, StrategyConfig
 from agy_trader.core.models import (
     AssetRiskMetadata,
     AssetType,
@@ -18,16 +20,22 @@ from agy_trader.core.models import (
     NewsArticle,
     OrderSide,
     RiskVerdict,
+    SecFilingEvent,
     UniverseSymbol,
     ensure_utc,
 )
 from agy_trader.risk.engine import HardRiskEngine, PortfolioRiskState
-from agy_trader.strategy.features import MIN_HISTORY_BARS, FeatureEngine
+from agy_trader.strategy.features import (
+    MIN_HISTORY_BARS,
+    FeatureEngine,
+    latest_pit_rf_apr,
+)
 from agy_trader.strategy.portfolio import PortfolioConstructor
 
 from .metrics import (
     BacktestMetrics,
     BacktestResult,
+    CPCVSummary,
     EquityPoint,
     SimulatedTrade,
     compute_backtest_metrics,
@@ -54,22 +62,43 @@ class _PendingExecution:
     stop_loss_dist_pct: float | None  # Distance from signal-bar close to stop, re-anchored at fill
 
 
+@dataclass
+class _SimState:
+    cash: float
+    positions: dict[str, _PositionLot] = field(default_factory=dict)
+    carried_exits: list[_PendingExecution] = field(default_factory=list)
+    bankrupt: bool = False
+    trades: list[SimulatedTrade] = field(default_factory=list)
+    total_traded_notional: float = 0.0
+    total_orders_filled: int = 0
+    stop_loss_exits: int = 0
+    risk_rejections: int = 0
+    total_slippage_usd: float = 0.0
+    total_borrow_cost_usd: float = 0.0
+    total_sec_fees_usd: float = 0.0
+    total_cash_yield_usd: float = 0.0
+
+
 class BacktestEngine:
     """Event-driven bar-by-bar backtester sharing exact live Feature/Portfolio/Risk code.
 
-    Execution timeline for every trading day t:
-      1. Overnight short borrow accrual from bar t-1 to bar t (exact elapsed days / 365).
-      2. Open-gap stop-loss checks on existing positions (fill at bar t open + adverse slippage).
-      3. Queued rebalance orders from bar t-1 close execute at bar t open:
-         - Pass 1 risk-reducing exits execute first (carried forward if a bar is missing!).
-         - Pass 2 entries are cancelled if bar t open already gapped past their stop-loss,
-           and are re-checked against live t-open cash, gross, net, and position caps so
-           overnight gaps or deferred exits can never breach cash or hard risk limits.
-      4. Intra-bar stop-loss checks on all open positions (fill at stop or worse open + slippage).
-      5. Mark-to-market at bar t close -> compute equity, daily PnL, drawdown -> record curve.
-         Only live symbols with a fresh bar at t enter pit_bars & benchmark_closes.
-      6. Generate strictly point-in-time signals at bar t close -> PortfolioConstructor ->
-         HardRiskEngine (with real bar-age staleness) -> queue approved orders for bar t+1 open.
+    Supports two execution timing modes:
+      - ``"same_close"`` (default, matching ``15:40 ET`` live execution):
+        1. Overnight short borrow + positive-cash T-bill yield accrual (prev_ts -> ts).
+        2. Open-gap stop-loss checks on existing positions at bar t open.
+        3. Intraday stop-loss checks on existing positions using bar t high/low.
+        4. Mark-to-market at bar t close -> PIT signals -> PortfolioConstructor ->
+           HardRiskEngine -> execute approved orders at bar t close + adverse slippage
+           (stop-losses for new entries anchor to fill price and start on bar t+1).
+        5. Re-compute post-trade EOD mark-to-market equity/exposures -> record EquityPoint.
+      - ``"next_open"`` (bar t close signal -> bar t+1 open fill):
+        1. Overnight short borrow + positive-cash T-bill yield accrual (prev_ts -> ts).
+        2. Open-gap stop-loss checks on existing positions at bar t open.
+        3. Execute queued orders from bar t-1 close at bar t open (Pass 1 exits first,
+           Pass 2 entries with gap-past-stop cancellation and live open headroom checks).
+        4. Intraday stop-loss checks on all open positions using bar t high/low.
+        5. Mark-to-market at bar t close -> record EquityPoint.
+        6. Generate strictly PIT signals at bar t close -> queue orders for bar t+1 open.
     """
 
     def __init__(self, app_config: AppConfig, universe: Sequence[UniverseSymbol]) -> None:
@@ -93,6 +122,7 @@ class BacktestEngine:
         news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
         macro_points: Sequence[MacroPoint] | None = None,
         earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
         label: str = "Strategy",
@@ -100,7 +130,45 @@ class BacktestEngine:
         use_news: bool = True,
         exposure_multiplier: float = 1.0,
         close_open_positions_at_end: bool = False,
+        execution_timing: Literal["same_close", "next_open"] | None = None,
+        n_trials: int = 1,
     ) -> BacktestResult:
+        res, _, _, _ = self._run_with_series(
+            bars_by_symbol,
+            news_by_symbol=news_by_symbol,
+            macro_points=macro_points,
+            earnings_by_symbol=earnings_by_symbol,
+            sec_filings_by_symbol=sec_filings_by_symbol,
+            start_date=start_date,
+            end_date=end_date,
+            label=label,
+            allow_shorting=allow_shorting,
+            use_news=use_news,
+            exposure_multiplier=exposure_multiplier,
+            close_open_positions_at_end=close_open_positions_at_end,
+            execution_timing=execution_timing,
+            n_trials=n_trials,
+        )
+        return res
+
+    def _run_with_series(
+        self,
+        bars_by_symbol: Mapping[str, pd.DataFrame],
+        *,
+        news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
+        macro_points: Sequence[MacroPoint] | None = None,
+        earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        label: str = "Strategy",
+        allow_shorting: bool = True,
+        use_news: bool = True,
+        exposure_multiplier: float = 1.0,
+        close_open_positions_at_end: bool = False,
+        execution_timing: Literal["same_close", "next_open"] | None = None,
+        n_trials: int = 1,
+    ) -> tuple[BacktestResult, list[float], list[float], list[float]]:
         # Validate variant strategy config (guards news-only config + use_news=False -> sum=0)
         strat_payload = self.config.strategy.model_dump()
         strat_payload["w_news_sentiment"] = (
@@ -109,6 +177,9 @@ class BacktestEngine:
         strat_cfg = StrategyConfig.model_validate(strat_payload)
         risk_cfg = self.config.risk
         bt_cfg = self.config.backtest
+        eff_timing: Literal["same_close", "next_open"] = (
+            execution_timing if execution_timing is not None else bt_cfg.execution_timing
+        )
 
         feature_engine = FeatureEngine(strat_cfg)
         portfolio_ctor = PortfolioConstructor(strat_cfg, risk_cfg)
@@ -116,7 +187,400 @@ class BacktestEngine:
             risk_cfg, allow_fractional_longs=strat_cfg.allow_fractional_longs
         )
 
-        # Normalize keys, pre-sort bars once, and index ns timestamps safely
+        sorted_bars, ts_arrays, bar_lookup, all_timestamps = self._prepare_bars(bars_by_symbol)
+        if not all_timestamps:
+            empty_metrics = compute_backtest_metrics(
+                label=label,
+                equity_curve=[],
+                trades=[],
+                initial_capital=bt_cfg.initial_capital,
+                total_traded_notional=0.0,
+                total_orders_filled=0,
+                stop_loss_exits=0,
+                risk_rejections=0,
+                total_slippage_usd=0.0,
+                total_borrow_cost_usd=0.0,
+                total_sec_fees_usd=0.0,
+                total_cash_yield_usd=0.0,
+                benchmark_symbol=bt_cfg.benchmark_symbol,
+                benchmark_closes=[],
+                n_trials=n_trials,
+                execution_timing=eff_timing,
+            )
+            return BacktestResult(metrics=empty_metrics), [], [], []
+
+        # Determine active evaluation window (ensure MIN_HISTORY_BARS warm-up before first trade)
+        first_eval_idx = min(MIN_HISTORY_BARS, max(len(all_timestamps) - 1, 0))
+        sim_timestamps: list[datetime] = []
+        for idx, ts in enumerate(all_timestamps):
+            if idx < first_eval_idx:
+                continue
+            d = ts.date()
+            if start_date is not None and d < start_date:
+                continue
+            if end_date is not None and d > end_date:
+                continue
+            sim_timestamps.append(ts)
+
+        if not sim_timestamps:
+            empty_metrics = compute_backtest_metrics(
+                label=label,
+                equity_curve=[],
+                trades=[],
+                initial_capital=bt_cfg.initial_capital,
+                total_traded_notional=0.0,
+                total_orders_filled=0,
+                stop_loss_exits=0,
+                risk_rejections=0,
+                total_slippage_usd=0.0,
+                total_borrow_cost_usd=0.0,
+                total_sec_fees_usd=0.0,
+                total_cash_yield_usd=0.0,
+                benchmark_symbol=bt_cfg.benchmark_symbol,
+                benchmark_closes=[],
+                n_trials=n_trials,
+                execution_timing=eff_timing,
+            )
+            return BacktestResult(metrics=empty_metrics), [], [], []
+
+        news_sorted, news_ts_sorted = self._prepare_news(news_by_symbol if use_news else None)
+        sec_sorted, sec_ts_sorted = self._prepare_sec_filings(sec_filings_by_symbol)
+
+        state = _SimState(cash=float(bt_cfg.initial_capital))
+        last_known_close: dict[str, float] = {}
+        last_bar_ts: dict[str, datetime] = {}
+        pending_queue: list[_PendingExecution] = []
+
+        high_water_mark = state.cash
+        prev_day_equity = state.cash
+        prev_ts: datetime | None = None
+
+        equity_curve: list[EquityPoint] = []
+        benchmark_closes: list[float] = []
+        daily_rf_rates: list[float] = []
+        ew_universe_equities: list[float] = []
+        ew_equity = float(bt_cfg.initial_capital)
+        prev_ew_closes: dict[str, float] = {}
+
+        # Pre-seed last_known_close & last_bar_ts from the last bar before sim_timestamps[0]
+        first_sim_ns = int(pd.Timestamp(sim_timestamps[0]).as_unit("ns").value)
+        for sym, df in sorted_bars.items():
+            pos = int(np.searchsorted(ts_arrays[sym], first_sim_ns, side="left"))
+            if pos > 0:
+                last_known_close[sym] = float(df["close"].iloc[pos - 1])
+                last_bar_ts[sym] = ensure_utc(df["timestamp"].iloc[pos - 1].to_pydatetime())
+
+        for bar_idx, ts in enumerate(sim_timestamps):
+            # 1. Overnight borrow accrual + positive-cash T-bill yield accrual
+            period_rf = 0.0
+            if prev_ts is not None and not state.bankrupt:
+                period_rf = self._accrue_overnight_carry(
+                    state=state,
+                    prev_ts=prev_ts,
+                    ts=ts,
+                    last_known_close=last_known_close,
+                    macro_points=macro_points,
+                    bt_cfg=bt_cfg,
+                )
+            daily_rf_rates.append(period_rf)
+
+            # 2. Open-gap stop-losses on existing positions at bar t open
+            stopped_at_open: set[str] = set()
+            if not state.bankrupt:
+                stopped_at_open = self._check_stop_losses(
+                    state=state,
+                    ts=ts,
+                    bar_lookup=bar_lookup,
+                    mode="open_gap",
+                    bt_cfg=bt_cfg,
+                )
+
+            if eff_timing == "next_open":
+                # 3. Execute queued approved orders from bar t-1 close at bar t open
+                open_marks: dict[str, float] = dict(last_known_close)
+                for sym, sym_bars in bar_lookup.items():
+                    b = sym_bars.get(ts)
+                    if b is not None and math.isfinite(b[0]) and b[0] > 0.0:
+                        open_marks[sym] = b[0]
+
+                if not state.bankrupt and pending_queue:
+                    state.carried_exits = self._execute_order_batch(
+                        state=state,
+                        items=pending_queue,
+                        ts=ts,
+                        bar_lookup=bar_lookup,
+                        exec_price_idx=0,
+                        marks=open_marks,
+                        strat_cfg=strat_cfg,
+                        risk_cfg=risk_cfg,
+                        bt_cfg=bt_cfg,
+                        exposure_multiplier=exposure_multiplier,
+                        skip_symbols=stopped_at_open,
+                        check_stop_gap=True,
+                    )
+                else:
+                    state.carried_exits = []
+                pending_queue = []
+
+                # 4. Intra-bar stop-loss checks on all open positions (bar t high/low)
+                if not state.bankrupt:
+                    self._check_stop_losses(
+                        state=state,
+                        ts=ts,
+                        bar_lookup=bar_lookup,
+                        mode="intraday",
+                        bt_cfg=bt_cfg,
+                    )
+            else:
+                # same_close Step 3: Intra-bar stops on existing positions BEFORE close signal/fill
+                if not state.bankrupt:
+                    self._check_stop_losses(
+                        state=state,
+                        ts=ts,
+                        bar_lookup=bar_lookup,
+                        mode="intraday",
+                        bt_cfg=bt_cfg,
+                    )
+
+            # Mark-to-market at bar t close (distinguish live bars vs carried marks!)
+            live_close_prices: dict[str, float] = {}
+            mtm_prices: dict[str, float] = {}
+            for sym, sym_bars in bar_lookup.items():
+                bar = sym_bars.get(ts)
+                if bar is not None:
+                    last_known_close[sym] = bar[3]
+                    last_bar_ts[sym] = ts
+                    live_close_prices[sym] = bar[3]
+                    mtm_prices[sym] = bar[3]
+                elif sym in last_known_close:
+                    mtm_prices[sym] = last_known_close[sym]
+
+            is_rebalance_day = (bar_idx % strat_cfg.rebalance_every_n_days) == 0
+            is_last_bar = ts == sim_timestamps[-1]
+
+            if eff_timing == "same_close":
+                # Step 4 (same_close): pre-trade MTM -> PIT signals -> Risk -> fill at bar t close
+                pre_mtm = sum(
+                    lot.qty * mtm_prices.get(sym, lot.avg_entry_price)
+                    for sym, lot in state.positions.items()
+                )
+                pre_equity = 0.0 if state.bankrupt else (state.cash + pre_mtm)
+                if pre_equity <= 0.0:
+                    self._mark_bankrupt(state)
+                    pre_equity = 0.0
+
+                if not state.bankrupt and pre_equity > 0.0:
+                    pre_drawdown = (
+                        (pre_equity - max(high_water_mark, pre_equity))
+                        / max(high_water_mark, pre_equity)
+                        if max(high_water_mark, pre_equity) > 1e-9
+                        else 0.0
+                    )
+                    pre_daily_pnl = (
+                        (pre_equity - prev_day_equity) / prev_day_equity
+                        if prev_day_equity > 1e-9
+                        else 0.0
+                    )
+                    batch_to_exec = list(state.carried_exits)
+                    carried_symbols = {item.verdict.order.symbol for item in state.carried_exits}
+                    if is_rebalance_day and not (close_open_positions_at_end and is_last_bar):
+                        new_items = self._generate_signals_and_verdicts(
+                            ts=ts,
+                            sorted_bars=sorted_bars,
+                            ts_arrays=ts_arrays,
+                            last_bar_ts=last_bar_ts,
+                            news_sorted=news_sorted,
+                            news_ts_sorted=news_ts_sorted,
+                            sec_sorted=sec_sorted,
+                            sec_ts_sorted=sec_ts_sorted,
+                            macro_points=macro_points,
+                            earnings_by_symbol=earnings_by_symbol,
+                            feature_engine=feature_engine,
+                            portfolio_ctor=portfolio_ctor,
+                            risk_engine=risk_engine,
+                            strat_cfg=strat_cfg,
+                            risk_cfg=risk_cfg,
+                            bt_cfg=bt_cfg,
+                            state=state,
+                            mtm_prices=mtm_prices,
+                            equity=pre_equity,
+                            daily_pnl_pct=pre_daily_pnl,
+                            drawdown_pct=pre_drawdown,
+                            allow_shorting=allow_shorting,
+                            use_news=use_news,
+                            exposure_multiplier=exposure_multiplier,
+                            label=label,
+                            carried_symbols=carried_symbols,
+                        )
+                        batch_to_exec.extend(new_items)
+
+                    if batch_to_exec:
+                        state.carried_exits = self._execute_order_batch(
+                            state=state,
+                            items=batch_to_exec,
+                            ts=ts,
+                            bar_lookup=bar_lookup,
+                            exec_price_idx=3,
+                            marks=mtm_prices,
+                            strat_cfg=strat_cfg,
+                            risk_cfg=risk_cfg,
+                            bt_cfg=bt_cfg,
+                            exposure_multiplier=exposure_multiplier,
+                            skip_symbols=set(),
+                            check_stop_gap=False,
+                        )
+                    else:
+                        state.carried_exits = []
+
+            # Optional end-of-window mark-to-close liquidation for exact trade reconciliation
+            if close_open_positions_at_end and is_last_bar and state.positions and not state.bankrupt:
+                self._liquidate_positions_at_end(
+                    state=state,
+                    ts=ts,
+                    mtm_prices=mtm_prices,
+                    bt_cfg=bt_cfg,
+                )
+
+            # Final post-trade EOD mark-to-market
+            mtm_value = 0.0
+            gross_notional = 0.0
+            net_notional = 0.0
+            for sym, lot in state.positions.items():
+                px = mtm_prices.get(sym, lot.avg_entry_price)
+                val = lot.qty * px
+                mtm_value += val
+                gross_notional += abs(val)
+                net_notional += val
+
+            equity = 0.0 if state.bankrupt else (state.cash + mtm_value)
+            if equity <= 0.0:
+                self._mark_bankrupt(state)
+                equity = 0.0
+                mtm_value = 0.0
+                gross_notional = 0.0
+                net_notional = 0.0
+
+            high_water_mark = max(high_water_mark, equity)
+            drawdown_pct = (
+                (equity - high_water_mark) / high_water_mark if high_water_mark > 1e-9 else 0.0
+            )
+            daily_pnl_pct = (
+                (equity - prev_day_equity) / prev_day_equity if prev_day_equity > 1e-9 else 0.0
+            )
+            gross_exp = gross_notional / equity if equity > 1e-9 else 0.0
+            net_exp = net_notional / equity if equity > 1e-9 else 0.0
+
+            equity_curve.append(
+                EquityPoint(
+                    timestamp=ts,
+                    equity=round(equity, 2),
+                    cash=round(state.cash, 2),
+                    gross_exposure=round(gross_exp, 4),
+                    net_exposure=round(net_exp, 4),
+                    daily_pnl_pct=round(daily_pnl_pct, 6),
+                    drawdown_pct=round(min(0.0, drawdown_pct), 6),
+                )
+            )
+            # Only append genuine live benchmark bars (never carry forward stale SPY closes!)
+            if bt_cfg.benchmark_symbol in live_close_prices:
+                benchmark_closes.append(live_close_prices[bt_cfg.benchmark_symbol])
+
+            # Track equal-weight universe index across live bars on day t
+            if bar_idx == 0:
+                ew_universe_equities.append(ew_equity)
+            else:
+                sym_rets = [
+                    close_px / prev_ew_closes[sym] - 1.0
+                    for sym, close_px in live_close_prices.items()
+                    if sym in prev_ew_closes and prev_ew_closes[sym] > 0.0 and close_px > 0.0
+                ]
+                if sym_rets:
+                    ew_equity = max(0.0, ew_equity * (1.0 + float(np.mean(sym_rets))))
+                ew_universe_equities.append(ew_equity)
+            prev_ew_closes = dict(live_close_prices)
+
+            if eff_timing == "next_open":
+                # 6. Compute strictly point-in-time signals & queue approved orders for bar t+1 open
+                pending_queue = list(state.carried_exits)
+                carried_symbols = {item.verdict.order.symbol for item in state.carried_exits}
+                if is_rebalance_day and not is_last_bar and not state.bankrupt and equity > 0.0:
+                    new_items = self._generate_signals_and_verdicts(
+                        ts=ts,
+                        sorted_bars=sorted_bars,
+                        ts_arrays=ts_arrays,
+                        last_bar_ts=last_bar_ts,
+                        news_sorted=news_sorted,
+                        news_ts_sorted=news_ts_sorted,
+                        sec_sorted=sec_sorted,
+                        sec_ts_sorted=sec_ts_sorted,
+                        macro_points=macro_points,
+                        earnings_by_symbol=earnings_by_symbol,
+                        feature_engine=feature_engine,
+                        portfolio_ctor=portfolio_ctor,
+                        risk_engine=risk_engine,
+                        strat_cfg=strat_cfg,
+                        risk_cfg=risk_cfg,
+                        bt_cfg=bt_cfg,
+                        state=state,
+                        mtm_prices=mtm_prices,
+                        equity=equity,
+                        daily_pnl_pct=daily_pnl_pct,
+                        drawdown_pct=drawdown_pct,
+                        allow_shorting=allow_shorting,
+                        use_news=use_news,
+                        exposure_multiplier=exposure_multiplier,
+                        label=label,
+                        carried_symbols=carried_symbols,
+                    )
+                    pending_queue.extend(new_items)
+
+            prev_day_equity = equity
+            prev_ts = ts
+
+        metrics = compute_backtest_metrics(
+            label=label,
+            equity_curve=equity_curve,
+            trades=state.trades,
+            initial_capital=bt_cfg.initial_capital,
+            total_traded_notional=state.total_traded_notional,
+            total_orders_filled=state.total_orders_filled,
+            stop_loss_exits=state.stop_loss_exits,
+            risk_rejections=state.risk_rejections,
+            total_slippage_usd=state.total_slippage_usd,
+            total_borrow_cost_usd=state.total_borrow_cost_usd,
+            total_sec_fees_usd=state.total_sec_fees_usd,
+            total_cash_yield_usd=state.total_cash_yield_usd,
+            benchmark_symbol=bt_cfg.benchmark_symbol,
+            benchmark_closes=benchmark_closes,
+            daily_rf_rates=daily_rf_rates,
+            ew_universe_equities=ew_universe_equities,
+            n_trials=n_trials,
+            execution_timing=eff_timing,
+        )
+        result = BacktestResult(
+            metrics=metrics,
+            equity_curve=equity_curve,
+            trades=state.trades,
+            config_snapshot={
+                "label": label,
+                "allow_shorting": allow_shorting,
+                "use_news": use_news,
+                "exposure_multiplier": exposure_multiplier,
+                "execution_timing": eff_timing,
+                "n_trials": n_trials,
+            },
+        )
+        return result, daily_rf_rates, benchmark_closes, ew_universe_equities
+
+    @staticmethod
+    def _prepare_bars(
+        bars_by_symbol: Mapping[str, pd.DataFrame],
+    ) -> tuple[
+        dict[str, pd.DataFrame],
+        dict[str, np.ndarray],
+        dict[str, dict[datetime, tuple[float, float, float, float]]],
+        list[datetime],
+    ]:
         sorted_bars: dict[str, pd.DataFrame] = {}
         ts_arrays: dict[str, np.ndarray] = {}
         bar_lookup: dict[str, dict[datetime, tuple[float, float, float, float]]] = {}
@@ -144,761 +608,607 @@ class BacktestEngine:
                 all_timestamps_set.add(ts_dt)
             bar_lookup[sym] = sym_map
 
-        all_timestamps = sorted(all_timestamps_set)
-        if not all_timestamps:
-            return BacktestResult(
-                metrics=compute_backtest_metrics(
-                    label=label,
-                    equity_curve=[],
-                    trades=[],
-                    initial_capital=bt_cfg.initial_capital,
-                    total_traded_notional=0.0,
-                    total_orders_filled=0,
-                    stop_loss_exits=0,
-                    risk_rejections=0,
-                    total_slippage_usd=0.0,
-                    total_borrow_cost_usd=0.0,
-                    total_sec_fees_usd=0.0,
-                    benchmark_symbol=bt_cfg.benchmark_symbol,
-                    benchmark_closes=[],
-                )
-            )
+        return sorted_bars, ts_arrays, bar_lookup, sorted(all_timestamps_set)
 
-        # Determine active evaluation window (ensure MIN_HISTORY_BARS warm-up before first trade)
-        first_eval_idx = min(MIN_HISTORY_BARS, max(len(all_timestamps) - 1, 0))
-        sim_timestamps: list[datetime] = []
-        for idx, ts in enumerate(all_timestamps):
-            if idx < first_eval_idx:
-                continue
-            d = ts.date()
-            if start_date is not None and d < start_date:
-                continue
-            if end_date is not None and d > end_date:
-                continue
-            sim_timestamps.append(ts)
-
-        if not sim_timestamps:
-            return BacktestResult(
-                metrics=compute_backtest_metrics(
-                    label=label,
-                    equity_curve=[],
-                    trades=[],
-                    initial_capital=bt_cfg.initial_capital,
-                    total_traded_notional=0.0,
-                    total_orders_filled=0,
-                    stop_loss_exits=0,
-                    risk_rejections=0,
-                    total_slippage_usd=0.0,
-                    total_borrow_cost_usd=0.0,
-                    total_sec_fees_usd=0.0,
-                    benchmark_symbol=bt_cfg.benchmark_symbol,
-                    benchmark_closes=[],
-                )
-            )
-
-        # Pre-sort scored news per symbol by published_at for O(log N) point-in-time windowing
+    @staticmethod
+    def _prepare_news(
+        news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None,
+    ) -> tuple[dict[str, list[NewsArticle]], dict[str, list[datetime]]]:
         news_sorted: dict[str, list[NewsArticle]] = {}
         news_ts_sorted: dict[str, list[datetime]] = {}
-        if use_news and news_by_symbol:
-            for raw_sym, arts in news_by_symbol.items():
-                sym = raw_sym.strip().upper()
-                scored = sorted(
-                    (a for a in arts if a.sentiment_score is not None),
-                    key=lambda a: a.published_at,
-                )
-                if scored:
-                    news_sorted[sym] = scored
-                    news_ts_sorted[sym] = [a.published_at for a in scored]
-
-        # Portfolio state
-        cash = float(bt_cfg.initial_capital)
-        positions: dict[str, _PositionLot] = {}
-        last_known_close: dict[str, float] = {}
-        last_bar_ts: dict[str, datetime] = {}
-        pending_queue: list[_PendingExecution] = []
-
-        high_water_mark = cash
-        prev_day_equity = cash
-        prev_ts: datetime | None = None
-        bankrupt = False
-
-        equity_curve: list[EquityPoint] = []
-        trades: list[SimulatedTrade] = []
-        benchmark_closes: list[float] = []
-
-        total_traded_notional = 0.0
-        total_orders_filled = 0
-        stop_loss_exits = 0
-        risk_rejections = 0
-        total_slippage_usd = 0.0
-        total_borrow_cost_usd = 0.0
-        total_sec_fees_usd = 0.0
-
-        # Pre-seed last_known_close & last_bar_ts from the last bar before sim_timestamps[0]
-        first_sim_ns = int(pd.Timestamp(sim_timestamps[0]).as_unit("ns").value)
-        for sym, df in sorted_bars.items():
-            pos = int(np.searchsorted(ts_arrays[sym], first_sim_ns, side="left"))
-            if pos > 0:
-                last_known_close[sym] = float(df["close"].iloc[pos - 1])
-                last_bar_ts[sym] = ensure_utc(df["timestamp"].iloc[pos - 1].to_pydatetime())
-
-        for bar_idx, ts in enumerate(sim_timestamps):
-            # 1. Accrue short borrow cost using exact elapsed calendar days / 365
-            if prev_ts is not None and bt_cfg.short_borrow_apr > 0.0 and not bankrupt:
-                elapsed_days = max(0.0, (ts - prev_ts).total_seconds() / 86400.0)
-                day_frac = elapsed_days / 365.0
-                if day_frac > 0.0:
-                    for sym, lot in positions.items():
-                        if lot.qty < -1e-9:
-                            mark_px = last_known_close.get(sym, lot.avg_entry_price)
-                            borrow_fee = abs(lot.qty) * mark_px * bt_cfg.short_borrow_apr * day_frac
-                            cash -= borrow_fee
-                            lot.accrued_borrow_usd += borrow_fee
-                            total_borrow_cost_usd += borrow_fee
-
-            # 2. Check open-gap stop-losses on existing positions at bar t open
-            stopped_at_open: set[str] = set()
-            if not bankrupt:
-                for sym in list(positions.keys()):
-                    lot = positions[sym]
-                    if lot.stop_loss_price is None:
-                        continue
-                    bar = bar_lookup.get(sym, {}).get(ts)
-                    if bar is None:
-                        continue
-                    bar_open, _, _, _ = bar
-                    slip_rate = self._slippage_rate(sym)
-                    if lot.qty > 1e-9 and bar_open <= lot.stop_loss_price:
-                        fill_px = bar_open * (1.0 - slip_rate)
-                        qty = lot.qty
-                        slip_usd = qty * (bar_open - fill_px)
-                        sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
-                        cash += qty * fill_px - sec_fee
-                        total_traded_notional += qty * fill_px
-                        total_orders_filled += 1
-                        stop_loss_exits += 1
-                        total_slippage_usd += slip_usd
-                        total_sec_fees_usd += sec_fee
-                        gross_pnl = (fill_px - lot.avg_entry_price) * qty
-                        net_pnl = (
-                            gross_pnl - sec_fee - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
-                        )
-                        trades.append(
-                            SimulatedTrade(
-                                symbol=sym,
-                                side="long",
-                                entry_time=lot.entry_time,
-                                exit_time=ts,
-                                qty=qty,
-                                entry_price=round(lot.avg_entry_price, 6),
-                                exit_price=round(fill_px, 6),
-                                gross_pnl=round(gross_pnl, 4),
-                                net_pnl=round(net_pnl, 4),
-                                holding_days=max(
-                                    0.0, (ts - lot.entry_time).total_seconds() / 86400.0
-                                ),
-                                exit_reason="stop_loss_open_gap",
-                            )
-                        )
-                        del positions[sym]
-                        stopped_at_open.add(sym)
-                    elif lot.qty < -1e-9 and bar_open >= lot.stop_loss_price:
-                        fill_px = bar_open * (1.0 + slip_rate)
-                        qty = abs(lot.qty)
-                        slip_usd = qty * (fill_px - bar_open)
-                        cash -= qty * fill_px
-                        total_traded_notional += qty * fill_px
-                        total_orders_filled += 1
-                        stop_loss_exits += 1
-                        total_slippage_usd += slip_usd
-                        gross_pnl = (lot.avg_entry_price - fill_px) * qty
-                        net_pnl = gross_pnl - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
-                        trades.append(
-                            SimulatedTrade(
-                                symbol=sym,
-                                side="short",
-                                entry_time=lot.entry_time,
-                                exit_time=ts,
-                                qty=qty,
-                                entry_price=round(lot.avg_entry_price, 6),
-                                exit_price=round(fill_px, 6),
-                                gross_pnl=round(gross_pnl, 4),
-                                net_pnl=round(net_pnl, 4),
-                                holding_days=max(
-                                    0.0, (ts - lot.entry_time).total_seconds() / 86400.0
-                                ),
-                                exit_reason="stop_loss_open_gap",
-                            )
-                        )
-                        del positions[sym]
-                        stopped_at_open.add(sym)
-
-            # 3. Execute queued approved orders from bar t-1 close at bar t open
-            ordered_pending = sorted(
-                pending_queue,
-                key=lambda item: 0 if item.verdict.order.is_risk_reducing else 1,
+        if not news_by_symbol:
+            return news_sorted, news_ts_sorted
+        for raw_sym, arts in news_by_symbol.items():
+            sym = raw_sym.strip().upper()
+            scored = sorted(
+                (a for a in arts if a.sentiment_score is not None),
+                key=lambda a: a.published_at,
             )
-            pending_queue = []
-            carried_exits: list[_PendingExecution] = []
+            if scored:
+                news_sorted[sym] = scored
+                news_ts_sorted[sym] = [a.published_at for a in scored]
+        return news_sorted, news_ts_sorted
 
-            # Build open-price mark table for live post-gap exposure checks
-            open_marks: dict[str, float] = dict(last_known_close)
-            for sym, sym_bars in bar_lookup.items():
-                b = sym_bars.get(ts)
-                if b is not None and math.isfinite(b[0]) and b[0] > 0.0:
-                    open_marks[sym] = b[0]
+    @staticmethod
+    def _prepare_sec_filings(
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None,
+    ) -> tuple[dict[str, list[SecFilingEvent]], dict[str, list[datetime]]]:
+        sec_sorted: dict[str, list[SecFilingEvent]] = {}
+        sec_ts_sorted: dict[str, list[datetime]] = {}
+        if not sec_filings_by_symbol:
+            return sec_sorted, sec_ts_sorted
+        for raw_sym, events in sec_filings_by_symbol.items():
+            sym = raw_sym.strip().upper()
+            ordered = sorted(events, key=lambda e: e.accepted_at)
+            if ordered:
+                sec_sorted[sym] = ordered
+                sec_ts_sorted[sym] = [e.accepted_at for e in ordered]
+        return sec_sorted, sec_ts_sorted
 
-            if not bankrupt:
-                for item in ordered_pending:
-                    verdict = item.verdict
-                    order = verdict.order
-                    sym = order.symbol
-                    if sym in stopped_at_open:
+    @staticmethod
+    def _mark_bankrupt(state: _SimState) -> None:
+        state.bankrupt = True
+        state.cash = 0.0
+        state.positions.clear()
+        state.carried_exits.clear()
+
+    @staticmethod
+    def _accrue_overnight_carry(
+        *,
+        state: _SimState,
+        prev_ts: datetime,
+        ts: datetime,
+        last_known_close: Mapping[str, float],
+        macro_points: Sequence[MacroPoint] | None,
+        bt_cfg: BacktestConfig,
+    ) -> float:
+        elapsed_days = max(0.0, (ts - prev_ts).total_seconds() / 86400.0)
+        day_frac = elapsed_days / 365.0
+        if bt_cfg.use_fred_tbill_yield:
+            pit_rf_apr = latest_pit_rf_apr(
+                prev_ts, macro_points, fallback_apr=bt_cfg.risk_free_rate_apr
+            )
+            pit_cash_apr = latest_pit_rf_apr(
+                prev_ts, macro_points, fallback_apr=bt_cfg.cash_yield_apr
+            )
+        else:
+            pit_rf_apr = bt_cfg.risk_free_rate_apr
+            pit_cash_apr = bt_cfg.cash_yield_apr
+
+        if day_frac > 0.0:
+            if bt_cfg.short_borrow_apr > 0.0:
+                for sym, lot in state.positions.items():
+                    if lot.qty < -1e-9:
+                        mark_px = last_known_close.get(sym, lot.avg_entry_price)
+                        borrow_fee = abs(lot.qty) * mark_px * bt_cfg.short_borrow_apr * day_frac
+                        state.cash -= borrow_fee
+                        lot.accrued_borrow_usd += borrow_fee
+                        state.total_borrow_cost_usd += borrow_fee
+            if pit_cash_apr > 0.0:
+                short_notional = sum(
+                    abs(lot.qty) * last_known_close.get(sym, lot.avg_entry_price)
+                    for sym, lot in state.positions.items()
+                    if lot.qty < -1e-9
+                )
+                unencumbered_cash = max(0.0, state.cash - short_notional)
+                if unencumbered_cash > 0.0:
+                    cash_yield = unencumbered_cash * pit_cash_apr * day_frac
+                    state.cash += cash_yield
+                    state.total_cash_yield_usd += cash_yield
+
+        return pit_rf_apr * day_frac
+
+    def _close_lot_full(
+        self,
+        *,
+        state: _SimState,
+        sym: str,
+        lot: _PositionLot,
+        trigger_px: float,
+        ts: datetime,
+        exit_reason: str,
+        bt_cfg: BacktestConfig,
+        count_as_stop: bool = False,
+    ) -> None:
+        slip_rate = self._slippage_rate(sym)
+        if lot.qty > 1e-9:
+            fill_px = trigger_px * (1.0 - slip_rate)
+            qty = lot.qty
+            slip_usd = qty * (trigger_px - fill_px)
+            sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
+            state.cash += qty * fill_px - sec_fee
+            gross_pnl = (fill_px - lot.avg_entry_price) * qty
+            net_pnl = gross_pnl - sec_fee - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
+            side = "long"
+        else:
+            fill_px = trigger_px * (1.0 + slip_rate)
+            qty = abs(lot.qty)
+            slip_usd = qty * (fill_px - trigger_px)
+            sec_fee = 0.0
+            state.cash -= qty * fill_px
+            gross_pnl = (lot.avg_entry_price - fill_px) * qty
+            net_pnl = gross_pnl - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
+            side = "short"
+
+        state.total_traded_notional += qty * fill_px
+        state.total_orders_filled += 1
+        if count_as_stop:
+            state.stop_loss_exits += 1
+        state.total_slippage_usd += slip_usd
+        state.total_sec_fees_usd += sec_fee
+        state.trades.append(
+            SimulatedTrade(
+                symbol=sym,
+                side=side,
+                entry_time=lot.entry_time,
+                exit_time=ts,
+                qty=qty,
+                entry_price=round(lot.avg_entry_price, 6),
+                exit_price=round(fill_px, 6),
+                gross_pnl=round(gross_pnl, 4),
+                net_pnl=round(net_pnl, 4),
+                holding_days=max(0.0, (ts - lot.entry_time).total_seconds() / 86400.0),
+                exit_reason=exit_reason,
+            )
+        )
+        del state.positions[sym]
+
+    def _check_stop_losses(
+        self,
+        *,
+        state: _SimState,
+        ts: datetime,
+        bar_lookup: Mapping[str, Mapping[datetime, tuple[float, float, float, float]]],
+        mode: Literal["open_gap", "intraday"],
+        bt_cfg: BacktestConfig,
+    ) -> set[str]:
+        stopped_syms: set[str] = set()
+        for sym in list(state.positions.keys()):
+            lot = state.positions[sym]
+            if lot.stop_loss_price is None:
+                continue
+            bar = bar_lookup.get(sym, {}).get(ts)
+            if bar is None:
+                continue
+            bar_open, bar_high, bar_low, _ = bar
+            trigger_px: float | None = None
+            if mode == "open_gap":
+                if (lot.qty > 1e-9 and bar_open <= lot.stop_loss_price) or (
+                    lot.qty < -1e-9 and bar_open >= lot.stop_loss_price
+                ):
+                    trigger_px = bar_open
+                reason = "stop_loss_open_gap"
+            else:
+                if lot.qty > 1e-9 and bar_low <= lot.stop_loss_price:
+                    trigger_px = min(bar_open, lot.stop_loss_price)
+                elif lot.qty < -1e-9 and bar_high >= lot.stop_loss_price:
+                    trigger_px = max(bar_open, lot.stop_loss_price)
+                reason = "stop_loss_intraday"
+
+            if trigger_px is not None:
+                self._close_lot_full(
+                    state=state,
+                    sym=sym,
+                    lot=lot,
+                    trigger_px=trigger_px,
+                    ts=ts,
+                    exit_reason=reason,
+                    bt_cfg=bt_cfg,
+                    count_as_stop=True,
+                )
+                stopped_syms.add(sym)
+        return stopped_syms
+
+    def _liquidate_positions_at_end(
+        self,
+        *,
+        state: _SimState,
+        ts: datetime,
+        mtm_prices: dict[str, float],
+        bt_cfg: BacktestConfig,
+    ) -> None:
+        for sym in list(state.positions.keys()):
+            lot = state.positions[sym]
+            px = mtm_prices.get(sym, lot.avg_entry_price)
+            self._close_lot_full(
+                state=state,
+                sym=sym,
+                lot=lot,
+                trigger_px=px,
+                ts=ts,
+                exit_reason="end_of_window",
+                bt_cfg=bt_cfg,
+                count_as_stop=False,
+            )
+
+    def _execute_order_batch(
+        self,
+        *,
+        state: _SimState,
+        items: Sequence[_PendingExecution],
+        ts: datetime,
+        bar_lookup: Mapping[str, Mapping[datetime, tuple[float, float, float, float]]],
+        exec_price_idx: int,
+        marks: Mapping[str, float],
+        strat_cfg: StrategyConfig,
+        risk_cfg: RiskConfig,
+        bt_cfg: BacktestConfig,
+        exposure_multiplier: float,
+        skip_symbols: set[str],
+        check_stop_gap: bool,
+    ) -> list[_PendingExecution]:
+        ordered = sorted(
+            items,
+            key=lambda item: 0 if item.verdict.order.is_risk_reducing else 1,
+        )
+        carried_exits: list[_PendingExecution] = []
+
+        for item in ordered:
+            verdict = item.verdict
+            order = verdict.order
+            sym = order.symbol
+            if sym in skip_symbols:
+                continue
+            bar = bar_lookup.get(sym, {}).get(ts)
+            if bar is None or not math.isfinite(bar[exec_price_idx]) or bar[exec_price_idx] <= 0.0:
+                if order.is_risk_reducing and sym in state.positions:
+                    carried_exits.append(item)
+                continue
+            exec_px = bar[exec_price_idx]
+
+            qty = verdict.adjusted_qty
+            if qty <= 1e-9:
+                continue
+
+            existing = state.positions.get(sym)
+            slip_rate = self._slippage_rate(sym)
+            is_reducing = False
+
+            if order.is_risk_reducing:
+                if existing is None:
+                    continue
+                if existing.qty > 0.0 and order.side != OrderSide.sell:
+                    continue
+                if existing.qty < 0.0 and order.side != OrderSide.buy:
+                    continue
+                qty = min(qty, abs(existing.qty))
+                if qty <= 1e-9:
+                    continue
+                is_reducing = True
+            else:
+                is_short_entry = order.side == OrderSide.sell and (
+                    existing is None or existing.qty <= 1e-9
+                )
+                if check_stop_gap and verdict.stop_loss_price is not None:
+                    if not is_short_entry and exec_px <= verdict.stop_loss_price:
+                        state.risk_rejections += 1
                         continue
-                    bar = bar_lookup.get(sym, {}).get(ts)
-                    if bar is None or not math.isfinite(bar[0]) or bar[0] <= 0.0:
-                        # Carry forward Pass 1 risk-reducing exits if bar is temporarily missing!
-                        if order.is_risk_reducing and sym in positions:
-                            carried_exits.append(item)
-                        continue
-                    bar_open = bar[0]
-
-                    qty = verdict.adjusted_qty
-                    if qty <= 1e-9:
+                    if is_short_entry and exec_px >= verdict.stop_loss_price:
+                        state.risk_rejections += 1
                         continue
 
-                    existing = positions.get(sym)
-                    slip_rate = self._slippage_rate(sym)
-                    is_reducing = False
+                live_equity = state.cash + sum(
+                    lot.qty * marks.get(s, lot.avg_entry_price)
+                    for s, lot in state.positions.items()
+                )
+                if live_equity <= 0.0:
+                    state.risk_rejections += 1
+                    continue
 
-                    if order.is_risk_reducing:
-                        if existing is None:
-                            continue
-                        if existing.qty > 0.0 and order.side != OrderSide.sell:
-                            continue
-                        if existing.qty < 0.0 and order.side != OrderSide.buy:
-                            continue
-                        qty = min(qty, abs(existing.qty))
-                        if qty <= 1e-9:
-                            continue
-                        is_reducing = True
-                    else:
-                        # Guard Pass 2 entries against overnight gaps & cash/exposure breaches!
-                        is_short_entry = order.side == OrderSide.sell and (
-                            existing is None or existing.qty <= 1e-9
-                        )
+                est_fill_px = (
+                    exec_px * (1.0 + slip_rate)
+                    if order.side == OrderSide.buy
+                    else exec_px * (1.0 - slip_rate)
+                )
+                cur_gross = sum(
+                    abs(lot.qty * marks.get(s, lot.avg_entry_price))
+                    for s, lot in state.positions.items()
+                )
+                cur_net = sum(
+                    lot.qty * marks.get(s, lot.avg_entry_price)
+                    for s, lot in state.positions.items()
+                )
+                eff_gross_cap = (
+                    risk_cfg.max_gross_exposure * min(1.0, max(0.0, exposure_multiplier))
+                ) * live_equity
+                gross_headroom = max(0.0, eff_gross_cap - cur_gross)
+                if is_short_entry:
+                    net_headroom = max(0.0, cur_net - risk_cfg.min_net_exposure * live_equity)
+                    pos_cap = risk_cfg.max_short_position_pct * live_equity
+                else:
+                    net_headroom = max(0.0, risk_cfg.max_net_exposure * live_equity - cur_net)
+                    pos_cap = risk_cfg.max_long_position_pct * live_equity
 
-                        # (a) Cancel Pass 2 entry if bar_open already gapped past its planned stop
-                        if verdict.stop_loss_price is not None:
-                            if not is_short_entry and bar_open <= verdict.stop_loss_price:
-                                risk_rejections += 1
-                                continue
-                            if is_short_entry and bar_open >= verdict.stop_loss_price:
-                                risk_rejections += 1
-                                continue
+                cur_pos_val = abs(existing.qty) * exec_px if existing is not None else 0.0
+                pos_headroom = max(0.0, pos_cap - cur_pos_val)
+                sym_meta = self.universe_meta.get(sym)
+                if sym_meta is not None:
+                    cur_sector_gross = sum(
+                        abs(lot.qty * marks.get(s, lot.avg_entry_price))
+                        for s, lot in state.positions.items()
+                        if (m := self.universe_meta.get(s)) is not None
+                        and m.sector == sym_meta.sector
+                    )
+                    sector_headroom = max(
+                        0.0, risk_cfg.max_sector_gross_pct * live_equity - cur_sector_gross
+                    )
+                else:
+                    sector_headroom = float("inf")
+                cash_headroom = (
+                    max(0.0, state.cash) if order.side == OrderSide.buy else float("inf")
+                )
+                sizing_px = max(exec_px, est_fill_px) if is_short_entry else est_fill_px
 
-                        # (b) Re-check live open equity, cash, gross, net & position headroom
-                        open_equity = cash + sum(
-                            lot.qty * open_marks.get(s, lot.avg_entry_price)
-                            for s, lot in positions.items()
-                        )
-                        if open_equity <= 0.0:
-                            risk_rejections += 1
-                            continue
+                max_notional = min(
+                    qty * sizing_px,
+                    gross_headroom,
+                    net_headroom,
+                    pos_headroom,
+                    sector_headroom,
+                    cash_headroom,
+                )
+                if max_notional <= 1e-6:
+                    state.risk_rejections += 1
+                    continue
 
-                        est_fill_px = (
-                            bar_open * (1.0 + slip_rate)
-                            if order.side == OrderSide.buy
-                            else bar_open * (1.0 - slip_rate)
-                        )
-                        cur_gross = sum(
-                            abs(lot.qty * open_marks.get(s, lot.avg_entry_price))
-                            for s, lot in positions.items()
-                        )
-                        cur_net = sum(
-                            lot.qty * open_marks.get(s, lot.avg_entry_price)
-                            for s, lot in positions.items()
-                        )
-                        eff_gross_cap = (
-                            risk_cfg.max_gross_exposure * min(1.0, max(0.0, exposure_multiplier))
-                        ) * open_equity
-                        gross_headroom = max(0.0, eff_gross_cap - cur_gross)
-                        if is_short_entry:
-                            net_headroom = max(0.0, cur_net - risk_cfg.min_net_exposure * open_equity)
-                            pos_cap = risk_cfg.max_short_position_pct * open_equity
+                if is_short_entry or not strat_cfg.allow_fractional_longs:
+                    qty = float(math.floor(max_notional / sizing_px + 1e-12))
+                    if qty < 1.0:
+                        state.risk_rejections += 1
+                        continue
+                else:
+                    qty = math.floor((max_notional / sizing_px) * 1e6) / 1e6
+                    if qty <= 1e-6:
+                        state.risk_rejections += 1
+                        continue
+
+            if order.side == OrderSide.buy:
+                fill_px = exec_px * (1.0 + slip_rate)
+                slip_usd = qty * (fill_px - exec_px)
+                sec_fee = 0.0
+                state.cash -= qty * fill_px
+            else:
+                fill_px = exec_px * (1.0 - slip_rate)
+                slip_usd = qty * (exec_px - fill_px)
+                sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
+                state.cash += qty * fill_px - sec_fee
+
+            state.total_traded_notional += qty * fill_px
+            state.total_orders_filled += 1
+            state.total_slippage_usd += slip_usd
+            state.total_sec_fees_usd += sec_fee
+
+            delta_signed = qty if order.side == OrderSide.buy else -qty
+            if existing is None:
+                new_stop = self._reanchor_stop(
+                    fill_px=fill_px,
+                    is_short=(delta_signed < 0.0),
+                    dist_pct=item.stop_loss_dist_pct,
+                    fallback_stop=verdict.stop_loss_price,
+                )
+                state.positions[sym] = _PositionLot(
+                    symbol=sym,
+                    qty=delta_signed,
+                    avg_entry_price=fill_px,
+                    entry_time=ts,
+                    stop_loss_price=new_stop,
+                    accrued_borrow_usd=0.0,
+                    accrued_sec_fee_usd=sec_fee,
+                )
+            else:
+                same_sign = (existing.qty > 0.0 and delta_signed > 0.0) or (
+                    existing.qty < 0.0 and delta_signed < 0.0
+                )
+                if same_sign:
+                    old_abs = abs(existing.qty)
+                    add_abs = abs(delta_signed)
+                    new_abs = old_abs + add_abs
+                    existing.avg_entry_price = (
+                        existing.avg_entry_price * old_abs + fill_px * add_abs
+                    ) / new_abs
+                    existing.qty += delta_signed
+                    existing.accrued_sec_fee_usd += sec_fee
+                    new_stop = self._reanchor_stop(
+                        fill_px=fill_px,
+                        is_short=(existing.qty < 0.0),
+                        dist_pct=item.stop_loss_dist_pct,
+                        fallback_stop=verdict.stop_loss_price,
+                    )
+                    if new_stop is not None:
+                        if existing.stop_loss_price is None:
+                            existing.stop_loss_price = new_stop
+                        elif existing.qty > 0.0:
+                            existing.stop_loss_price = max(existing.stop_loss_price, new_stop)
                         else:
-                            net_headroom = max(0.0, risk_cfg.max_net_exposure * open_equity - cur_net)
-                            pos_cap = risk_cfg.max_long_position_pct * open_equity
+                            existing.stop_loss_price = min(existing.stop_loss_price, new_stop)
+                else:
+                    old_abs = abs(existing.qty)
+                    close_abs = min(old_abs, abs(delta_signed))
+                    frac_closed = close_abs / max(old_abs, 1e-12)
+                    pro_rata_borrow = existing.accrued_borrow_usd * frac_closed
+                    pro_rata_entry_sec = existing.accrued_sec_fee_usd * frac_closed
+                    existing.accrued_borrow_usd -= pro_rata_borrow
+                    existing.accrued_sec_fee_usd -= pro_rata_entry_sec
 
-                        cur_pos_val = abs(existing.qty) * bar_open if existing is not None else 0.0
-                        pos_headroom = max(0.0, pos_cap - cur_pos_val)
-
-                        # Prevent unmodeled free margin loans on longs (cash must stay >= 0)
-                        cash_headroom = (
-                            max(0.0, cash) if order.side == OrderSide.buy else float("inf")
-                        )
-
-                        max_notional = min(
-                            qty * est_fill_px,
-                            gross_headroom,
-                            net_headroom,
-                            pos_headroom,
-                            cash_headroom,
-                        )
-                        if max_notional <= 1e-6:
-                            risk_rejections += 1
-                            continue
-
-                        if is_short_entry or not strat_cfg.allow_fractional_longs:
-                            qty = float(math.floor(max_notional / est_fill_px + 1e-12))
-                            if qty < 1.0:
-                                risk_rejections += 1
-                                continue
-                        else:
-                            qty = math.floor((max_notional / est_fill_px) * 1e6) / 1e6
-                            if qty <= 1e-6:
-                                risk_rejections += 1
-                                continue
-
-                    if order.side == OrderSide.buy:
-                        fill_px = bar_open * (1.0 + slip_rate)
-                        slip_usd = qty * (fill_px - bar_open)
-                        sec_fee = 0.0
-                        cash -= qty * fill_px
+                    if existing.qty > 0.0:
+                        gross_pnl = (fill_px - existing.avg_entry_price) * close_abs
+                        trade_side = "long"
                     else:
-                        fill_px = bar_open * (1.0 - slip_rate)
-                        slip_usd = qty * (bar_open - fill_px)
-                        sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
-                        cash += qty * fill_px - sec_fee
+                        gross_pnl = (existing.avg_entry_price - fill_px) * close_abs
+                        trade_side = "short"
+                    net_pnl = gross_pnl - sec_fee - pro_rata_entry_sec - pro_rata_borrow
 
-                    total_traded_notional += qty * fill_px
-                    total_orders_filled += 1
-                    total_slippage_usd += slip_usd
-                    total_sec_fees_usd += sec_fee
-
-                    delta_signed = qty if order.side == OrderSide.buy else -qty
-                    if existing is None:
-                        new_stop = self._reanchor_stop(
-                            fill_px=fill_px,
-                            is_short=(delta_signed < 0.0),
-                            dist_pct=item.stop_loss_dist_pct,
-                            fallback_stop=verdict.stop_loss_price,
-                        )
-                        positions[sym] = _PositionLot(
+                    state.trades.append(
+                        SimulatedTrade(
                             symbol=sym,
-                            qty=delta_signed,
-                            avg_entry_price=fill_px,
-                            entry_time=ts,
-                            stop_loss_price=new_stop,
-                            accrued_borrow_usd=0.0,
-                            accrued_sec_fee_usd=sec_fee,
+                            side=trade_side,
+                            entry_time=existing.entry_time,
+                            exit_time=ts,
+                            qty=close_abs,
+                            entry_price=round(existing.avg_entry_price, 6),
+                            exit_price=round(fill_px, 6),
+                            gross_pnl=round(gross_pnl, 4),
+                            net_pnl=round(net_pnl, 4),
+                            holding_days=max(
+                                0.0, (ts - existing.entry_time).total_seconds() / 86400.0
+                            ),
+                            exit_reason=order.reason
+                            or ("rebalance_exit" if is_reducing else "rebalance_reduce"),
                         )
+                    )
+                    new_q = existing.qty + delta_signed
+                    if (
+                        abs(new_q) <= 1e-9
+                        or (existing.qty > 0.0 and new_q < 0.0)
+                        or (existing.qty < 0.0 and new_q > 0.0)
+                    ):
+                        del state.positions[sym]
                     else:
-                        same_sign = (existing.qty > 0.0 and delta_signed > 0.0) or (
-                            existing.qty < 0.0 and delta_signed < 0.0
-                        )
-                        if same_sign:
-                            old_abs = abs(existing.qty)
-                            add_abs = abs(delta_signed)
-                            new_abs = old_abs + add_abs
-                            existing.avg_entry_price = (
-                                existing.avg_entry_price * old_abs + fill_px * add_abs
-                            ) / new_abs
-                            existing.qty += delta_signed
-                            existing.accrued_sec_fee_usd += sec_fee
-                            new_stop = self._reanchor_stop(
-                                fill_px=fill_px,
-                                is_short=(existing.qty < 0.0),
-                                dist_pct=item.stop_loss_dist_pct,
-                                fallback_stop=verdict.stop_loss_price,
-                            )
-                            if new_stop is not None:
-                                if existing.stop_loss_price is None:
-                                    existing.stop_loss_price = new_stop
-                                elif existing.qty > 0.0:
-                                    existing.stop_loss_price = max(
-                                        existing.stop_loss_price, new_stop
-                                    )
-                                else:
-                                    existing.stop_loss_price = min(
-                                        existing.stop_loss_price, new_stop
-                                    )
-                        else:
-                            # Guard against accidental sign crossing
-                            old_abs = abs(existing.qty)
-                            close_abs = min(old_abs, abs(delta_signed))
-                            frac_closed = close_abs / max(old_abs, 1e-12)
-                            pro_rata_borrow = existing.accrued_borrow_usd * frac_closed
-                            pro_rata_entry_sec = existing.accrued_sec_fee_usd * frac_closed
-                            existing.accrued_borrow_usd -= pro_rata_borrow
-                            existing.accrued_sec_fee_usd -= pro_rata_entry_sec
+                        existing.qty = new_q
 
-                            if existing.qty > 0.0:
-                                gross_pnl = (fill_px - existing.avg_entry_price) * close_abs
-                                trade_side = "long"
-                            else:
-                                gross_pnl = (existing.avg_entry_price - fill_px) * close_abs
-                                trade_side = "short"
-                            net_pnl = gross_pnl - sec_fee - pro_rata_entry_sec - pro_rata_borrow
+        return carried_exits
 
-                            trades.append(
-                                SimulatedTrade(
-                                    symbol=sym,
-                                    side=trade_side,
-                                    entry_time=existing.entry_time,
-                                    exit_time=ts,
-                                    qty=close_abs,
-                                    entry_price=round(existing.avg_entry_price, 6),
-                                    exit_price=round(fill_px, 6),
-                                    gross_pnl=round(gross_pnl, 4),
-                                    net_pnl=round(net_pnl, 4),
-                                    holding_days=max(
-                                        0.0, (ts - existing.entry_time).total_seconds() / 86400.0
-                                    ),
-                                    exit_reason=order.reason or (
-                                        "rebalance_exit" if is_reducing else "rebalance_reduce"
-                                    ),
-                                )
-                            )
-                            new_q = existing.qty + delta_signed
-                            if abs(new_q) <= 1e-9 or (
-                                existing.qty > 0.0 and new_q < 0.0
-                            ) or (existing.qty < 0.0 and new_q > 0.0):
-                                del positions[sym]
-                            else:
-                                existing.qty = new_q
+    def _generate_signals_and_verdicts(
+        self,
+        *,
+        ts: datetime,
+        sorted_bars: Mapping[str, pd.DataFrame],
+        ts_arrays: Mapping[str, np.ndarray],
+        last_bar_ts: Mapping[str, datetime],
+        news_sorted: Mapping[str, list[NewsArticle]],
+        news_ts_sorted: Mapping[str, list[datetime]],
+        sec_sorted: Mapping[str, list[SecFilingEvent]],
+        sec_ts_sorted: Mapping[str, list[datetime]],
+        macro_points: Sequence[MacroPoint] | None,
+        earnings_by_symbol: Mapping[str, Sequence[date]] | None,
+        feature_engine: FeatureEngine,
+        portfolio_ctor: PortfolioConstructor,
+        risk_engine: HardRiskEngine,
+        strat_cfg: StrategyConfig,
+        risk_cfg: RiskConfig,
+        bt_cfg: BacktestConfig,
+        state: _SimState,
+        mtm_prices: dict[str, float],
+        equity: float,
+        daily_pnl_pct: float,
+        drawdown_pct: float,
+        allow_shorting: bool,
+        use_news: bool,
+        exposure_multiplier: float,
+        label: str,
+        carried_symbols: set[str],
+    ) -> list[_PendingExecution]:
+        ts_ns = int(pd.Timestamp(ts).as_unit("ns").value)
+        pit_bars: dict[str, pd.DataFrame] = {}
+        fresh_bar_ages: list[float] = []
 
-            # 4. Intra-bar stop-loss checks on all open positions (bar t high/low)
-            if not bankrupt:
-                for sym in list(positions.keys()):
-                    lot = positions[sym]
-                    if lot.stop_loss_price is None:
-                        continue
-                    bar = bar_lookup.get(sym, {}).get(ts)
-                    if bar is None:
-                        continue
-                    bar_open, bar_high, bar_low, _ = bar
-                    slip_rate = self._slippage_rate(sym)
-                    if lot.qty > 1e-9 and bar_low <= lot.stop_loss_price:
-                        trigger_px = min(bar_open, lot.stop_loss_price)
-                        fill_px = trigger_px * (1.0 - slip_rate)
-                        qty = lot.qty
-                        slip_usd = qty * (trigger_px - fill_px)
-                        sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
-                        cash += qty * fill_px - sec_fee
-                        total_traded_notional += qty * fill_px
-                        total_orders_filled += 1
-                        stop_loss_exits += 1
-                        total_slippage_usd += slip_usd
-                        total_sec_fees_usd += sec_fee
-                        gross_pnl = (fill_px - lot.avg_entry_price) * qty
-                        net_pnl = (
-                            gross_pnl - sec_fee - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
-                        )
-                        trades.append(
-                            SimulatedTrade(
-                                symbol=sym,
-                                side="long",
-                                entry_time=lot.entry_time,
-                                exit_time=ts,
-                                qty=qty,
-                                entry_price=round(lot.avg_entry_price, 6),
-                                exit_price=round(fill_px, 6),
-                                gross_pnl=round(gross_pnl, 4),
-                                net_pnl=round(net_pnl, 4),
-                                holding_days=max(
-                                    0.0, (ts - lot.entry_time).total_seconds() / 86400.0
-                                ),
-                                exit_reason="stop_loss_intraday",
-                            )
-                        )
-                        del positions[sym]
-                    elif lot.qty < -1e-9 and bar_high >= lot.stop_loss_price:
-                        trigger_px = max(bar_open, lot.stop_loss_price)
-                        fill_px = trigger_px * (1.0 + slip_rate)
-                        qty = abs(lot.qty)
-                        slip_usd = qty * (fill_px - trigger_px)
-                        cash -= qty * fill_px
-                        total_traded_notional += qty * fill_px
-                        total_orders_filled += 1
-                        stop_loss_exits += 1
-                        total_slippage_usd += slip_usd
-                        gross_pnl = (lot.avg_entry_price - fill_px) * qty
-                        net_pnl = gross_pnl - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
-                        trades.append(
-                            SimulatedTrade(
-                                symbol=sym,
-                                side="short",
-                                entry_time=lot.entry_time,
-                                exit_time=ts,
-                                qty=qty,
-                                entry_price=round(lot.avg_entry_price, 6),
-                                exit_price=round(fill_px, 6),
-                                gross_pnl=round(gross_pnl, 4),
-                                net_pnl=round(net_pnl, 4),
-                                holding_days=max(
-                                    0.0, (ts - lot.entry_time).total_seconds() / 86400.0
-                                ),
-                                exit_reason="stop_loss_intraday",
-                            )
-                        )
-                        del positions[sym]
+        feature_lb = max(_FEATURE_LOOKBACK_BARS, strat_cfg.m2_long_lookback + 48)
+        for sym, df in sorted_bars.items():
+            sym_last_ts = last_bar_ts.get(sym)
+            if sym_last_ts is None:
+                continue
+            age_min = (ts - sym_last_ts).total_seconds() / 60.0
+            if age_min > risk_cfg.max_data_staleness_minutes:
+                continue
+            end_idx = int(np.searchsorted(ts_arrays[sym], ts_ns, side="right"))
+            if end_idx >= MIN_HISTORY_BARS:
+                start_idx = max(0, end_idx - feature_lb)
+                pit_bars[sym] = df.iloc[start_idx:end_idx]
+                fresh_bar_ages.append(max(0.0, age_min))
 
-            # 5. Mark-to-market at bar t close (distinguish live bars vs carried marks!)
-            live_close_prices: dict[str, float] = {}
-            mtm_prices: dict[str, float] = {}
-            for sym, sym_bars in bar_lookup.items():
-                bar = sym_bars.get(ts)
-                if bar is not None:
-                    last_known_close[sym] = bar[3]
-                    last_bar_ts[sym] = ts
-                    live_close_prices[sym] = bar[3]
-                    mtm_prices[sym] = bar[3]
-                elif sym in last_known_close:
-                    mtm_prices[sym] = last_known_close[sym]
+        latest_age_min = (
+            max(fresh_bar_ages)
+            if fresh_bar_ages
+            else float(risk_cfg.max_data_staleness_minutes + 1)
+        )
 
-            # Optional end-of-window mark-to-close liquidation for exact trade reconciliation
-            if close_open_positions_at_end and ts == sim_timestamps[-1] and positions and not bankrupt:
-                for sym in list(positions.keys()):
-                    lot = positions[sym]
-                    px = mtm_prices.get(sym, lot.avg_entry_price)
-                    slip_rate = self._slippage_rate(sym)
-                    if lot.qty > 1e-9:
-                        fill_px = px * (1.0 - slip_rate)
-                        qty = lot.qty
-                        slip_usd = qty * (px - fill_px)
-                        sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
-                        cash += qty * fill_px - sec_fee
-                        total_traded_notional += qty * fill_px
-                        total_orders_filled += 1
-                        total_slippage_usd += slip_usd
-                        total_sec_fees_usd += sec_fee
-                        gross_pnl = (fill_px - lot.avg_entry_price) * qty
-                        net_pnl = (
-                            gross_pnl - sec_fee - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
-                        )
-                        trades.append(
-                            SimulatedTrade(
-                                symbol=sym,
-                                side="long",
-                                entry_time=lot.entry_time,
-                                exit_time=ts,
-                                qty=qty,
-                                entry_price=round(lot.avg_entry_price, 6),
-                                exit_price=round(fill_px, 6),
-                                gross_pnl=round(gross_pnl, 4),
-                                net_pnl=round(net_pnl, 4),
-                                holding_days=max(
-                                    0.0, (ts - lot.entry_time).total_seconds() / 86400.0
-                                ),
-                                exit_reason="end_of_window",
-                            )
-                        )
-                    else:
-                        fill_px = px * (1.0 + slip_rate)
-                        qty = abs(lot.qty)
-                        slip_usd = qty * (fill_px - px)
-                        cash -= qty * fill_px
-                        total_traded_notional += qty * fill_px
-                        total_orders_filled += 1
-                        total_slippage_usd += slip_usd
-                        gross_pnl = (lot.avg_entry_price - fill_px) * qty
-                        net_pnl = gross_pnl - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
-                        trades.append(
-                            SimulatedTrade(
-                                symbol=sym,
-                                side="short",
-                                entry_time=lot.entry_time,
-                                exit_time=ts,
-                                qty=qty,
-                                entry_price=round(lot.avg_entry_price, 6),
-                                exit_price=round(fill_px, 6),
-                                gross_pnl=round(gross_pnl, 4),
-                                net_pnl=round(net_pnl, 4),
-                                holding_days=max(
-                                    0.0, (ts - lot.entry_time).total_seconds() / 86400.0
-                                ),
-                                exit_reason="end_of_window",
-                            )
-                        )
-                    del positions[sym]
+        pit_news: dict[str, list[NewsArticle]] = {}
+        if use_news and news_sorted:
+            win_lo = ts - timedelta(days=30)
+            for sym, arts in news_sorted.items():
+                if sym not in pit_bars:
+                    continue
+                ts_list = news_ts_sorted[sym]
+                hi_i = bisect.bisect_right(ts_list, ts)
+                lo_i = bisect.bisect_left(ts_list, win_lo, 0, hi_i)
+                if hi_i > lo_i:
+                    pit_news[sym] = arts[lo_i:hi_i]
 
-            mtm_value = 0.0
-            gross_notional = 0.0
-            net_notional = 0.0
-            for sym, lot in positions.items():
-                px = mtm_prices.get(sym, lot.avg_entry_price)
-                val = lot.qty * px
-                mtm_value += val
-                gross_notional += abs(val)
-                net_notional += val
-
-            equity = cash + mtm_value
-            if equity <= 0.0:
-                bankrupt = True
-                equity = 0.0
-                positions.clear()
-                carried_exits.clear()
-
-            high_water_mark = max(high_water_mark, equity)
-            drawdown_pct = (
-                (equity - high_water_mark) / high_water_mark if high_water_mark > 1e-9 else 0.0
+        pit_sec: dict[str, list[SecFilingEvent]] = {}
+        if sec_sorted:
+            sec_lookback = max(
+                strat_cfg.insider_lookback_days,
+                risk_cfg.restatement_blackout_days * 2 + 14,
             )
-            daily_pnl_pct = (
-                (equity - prev_day_equity) / prev_day_equity if prev_day_equity > 1e-9 else 0.0
-            )
-            gross_exp = gross_notional / equity if equity > 1e-9 else 0.0
-            net_exp = net_notional / equity if equity > 1e-9 else 0.0
+            sec_win_lo = ts - timedelta(days=sec_lookback)
+            for sym, evs in sec_sorted.items():
+                if sym not in pit_bars:
+                    continue
+                ts_list = sec_ts_sorted[sym]
+                hi_i = bisect.bisect_right(ts_list, ts)
+                lo_i = bisect.bisect_left(ts_list, sec_win_lo, 0, hi_i)
+                if hi_i > lo_i:
+                    pit_sec[sym] = evs[lo_i:hi_i]
 
-            equity_curve.append(
-                EquityPoint(
-                    timestamp=ts,
-                    equity=round(equity, 2),
-                    cash=round(cash, 2),
-                    gross_exposure=round(gross_exp, 4),
-                    net_exposure=round(net_exp, 4),
-                    daily_pnl_pct=round(daily_pnl_pct, 6),
-                    drawdown_pct=round(min(0.0, drawdown_pct), 6),
-                )
-            )
-            # Only append genuine live benchmark bars (never carry forward stale SPY closes!)
-            if bt_cfg.benchmark_symbol in live_close_prices:
-                benchmark_closes.append(live_close_prices[bt_cfg.benchmark_symbol])
-
-            # 6. Compute strictly point-in-time signals & queue approved orders for bar t+1 open
-            pending_queue = list(carried_exits)
-            carried_symbols = {item.verdict.order.symbol for item in carried_exits}
-            is_rebalance_day = (bar_idx % strat_cfg.rebalance_every_n_days) == 0
-
-            if is_rebalance_day and ts != sim_timestamps[-1] and not bankrupt and equity > 0.0:
-                ts_ns = int(pd.Timestamp(ts).as_unit("ns").value)
-                pit_bars: dict[str, pd.DataFrame] = {}
-                fresh_bar_ages: list[float] = []
-
-                feature_lb = max(_FEATURE_LOOKBACK_BARS, strat_cfg.m2_long_lookback + 48)
-                for sym, df in sorted_bars.items():
-                    # Exclude stale/halted symbols that lack a fresh bar at ts!
-                    sym_last_ts = last_bar_ts.get(sym)
-                    if sym_last_ts is None:
-                        continue
-                    age_min = (ts - sym_last_ts).total_seconds() / 60.0
-                    if age_min > risk_cfg.max_data_staleness_minutes:
-                        continue
-                    end_idx = int(np.searchsorted(ts_arrays[sym], ts_ns, side="right"))
-                    if end_idx >= MIN_HISTORY_BARS:
-                        start_idx = max(0, end_idx - feature_lb)
-                        pit_bars[sym] = df.iloc[start_idx:end_idx]
-                        fresh_bar_ages.append(max(0.0, age_min))
-
-                # Real bar-age calculation (or stale sentinel if no fresh bars exist)
-                latest_age_min = (
-                    max(fresh_bar_ages)
-                    if fresh_bar_ages
-                    else float(risk_cfg.max_data_staleness_minutes + 1)
-                )
-
-                pit_news: dict[str, list[NewsArticle]] = {}
-                if use_news and news_sorted:
-                    win_lo = ts - timedelta(days=30)
-                    for sym, arts in news_sorted.items():
-                        if sym not in pit_bars:
-                            continue
-                        ts_list = news_ts_sorted[sym]
-                        hi_i = bisect.bisect_right(ts_list, ts)
-                        lo_i = bisect.bisect_left(ts_list, win_lo, 0, hi_i)
-                        if hi_i > lo_i:
-                            pit_news[sym] = arts[lo_i:hi_i]
-
-                signals = feature_engine.build_signals(
-                    as_of=ts,
-                    bars_by_symbol=pit_bars,
-                    news_by_symbol=pit_news if use_news else None,
-                    macro_points=macro_points,
-                    benchmark_symbol=bt_cfg.benchmark_symbol,
-                )
-
-                dials = ControlDials(
-                    pause_new_entries=False,
-                    exposure_multiplier=exposure_multiplier,
-                    allow_shorting=allow_shorting,
-                    updated_by="backtest",
-                    reason=label,
-                    updated_at=ts,
-                )
-                signed_pos = {sym: lot.qty for sym, lot in positions.items()}
-                proposed = portfolio_ctor.build_proposed_orders(
-                    signals=signals,
-                    current_positions=signed_pos,
-                    prices=mtm_prices,
-                    equity=equity,
-                    dials=dials,
-                    as_of=ts,
-                    universe_meta=self.universe_meta,
-                )
-                # Avoid duplicate orders for symbols that already have a carried Pass 1 exit
-                proposed = [o for o in proposed if o.symbol not in carried_symbols]
-
-                risk_state = PortfolioRiskState(
-                    as_of=ts,
-                    equity=equity,
-                    daily_pnl_pct=daily_pnl_pct,
-                    drawdown_pct=min(0.0, drawdown_pct),
-                    positions=signed_pos,
-                    prices=mtm_prices,
-                    latest_bar_age_minutes=latest_age_min,
-                )
-                verdicts = risk_engine.evaluate_batch(
-                    orders=proposed,
-                    state=risk_state,
-                    dials=dials,
-                    universe_meta=self.universe_meta,
-                    signals_by_symbol={s.symbol: s for s in signals},
-                    earnings_by_symbol=earnings_by_symbol,
-                )
-
-                for v in verdicts:
-                    if v.approved and v.adjusted_qty > 0.0:
-                        dist_pct: float | None = None
-                        if v.stop_loss_price is not None and v.order.reference_price > 0.0:
-                            dist_pct = (
-                                abs(v.stop_loss_price - v.order.reference_price)
-                                / v.order.reference_price
-                            )
-                        pending_queue.append(
-                            _PendingExecution(verdict=v, stop_loss_dist_pct=dist_pct)
-                        )
-                    else:
-                        risk_rejections += 1
-
-            prev_day_equity = equity
-            prev_ts = ts
-
-        metrics = compute_backtest_metrics(
-            label=label,
-            equity_curve=equity_curve,
-            trades=trades,
-            initial_capital=bt_cfg.initial_capital,
-            total_traded_notional=total_traded_notional,
-            total_orders_filled=total_orders_filled,
-            stop_loss_exits=stop_loss_exits,
-            risk_rejections=risk_rejections,
-            total_slippage_usd=total_slippage_usd,
-            total_borrow_cost_usd=total_borrow_cost_usd,
-            total_sec_fees_usd=total_sec_fees_usd,
+        signals = feature_engine.build_signals(
+            as_of=ts,
+            bars_by_symbol=pit_bars,
+            news_by_symbol=pit_news if use_news else None,
+            macro_points=macro_points,
             benchmark_symbol=bt_cfg.benchmark_symbol,
-            benchmark_closes=benchmark_closes,
+            fallback_rf_apr=bt_cfg.risk_free_rate_apr,
+            sec_filings_by_symbol=pit_sec if pit_sec else None,
+            restatement_blackout_days=risk_cfg.restatement_blackout_days,
         )
-        return BacktestResult(
-            metrics=metrics,
-            equity_curve=equity_curve,
-            trades=trades,
-            config_snapshot={
-                "label": label,
-                "allow_shorting": allow_shorting,
-                "use_news": use_news,
-                "exposure_multiplier": exposure_multiplier,
-            },
+
+        dials = ControlDials(
+            pause_new_entries=False,
+            exposure_multiplier=exposure_multiplier,
+            allow_shorting=allow_shorting,
+            updated_by="backtest",
+            reason=label,
+            updated_at=ts,
         )
+        signed_pos = {sym: lot.qty for sym, lot in state.positions.items()}
+        proposed = portfolio_ctor.build_proposed_orders(
+            signals=signals,
+            current_positions=signed_pos,
+            prices=mtm_prices,
+            equity=equity,
+            dials=dials,
+            as_of=ts,
+            universe_meta=self.universe_meta,
+        )
+        proposed = [o for o in proposed if o.symbol not in carried_symbols]
+
+        risk_state = PortfolioRiskState(
+            as_of=ts,
+            equity=equity,
+            daily_pnl_pct=daily_pnl_pct,
+            drawdown_pct=min(0.0, drawdown_pct),
+            positions=signed_pos,
+            prices=mtm_prices,
+            latest_bar_age_minutes=latest_age_min,
+        )
+        verdicts = risk_engine.evaluate_batch(
+            orders=proposed,
+            state=risk_state,
+            dials=dials,
+            universe_meta=self.universe_meta,
+            signals_by_symbol={s.symbol: s for s in signals},
+            earnings_by_symbol=earnings_by_symbol,
+        )
+
+        approved_items: list[_PendingExecution] = []
+        for v in verdicts:
+            if v.approved and v.adjusted_qty > 0.0:
+                dist_pct: float | None = None
+                if v.stop_loss_price is not None and v.order.reference_price > 0.0:
+                    dist_pct = abs(v.stop_loss_price - v.order.reference_price) / v.order.reference_price
+                approved_items.append(_PendingExecution(verdict=v, stop_loss_dist_pct=dist_pct))
+            else:
+                state.risk_rejections += 1
+        return approved_items
 
     def run_ablation(
         self,
@@ -907,8 +1217,11 @@ class BacktestEngine:
         news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
         macro_points: Sequence[MacroPoint] | None = None,
         earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
+        execution_timing: Literal["same_close", "next_open"] | None = None,
+        n_trials: int = 1,
     ) -> list[BacktestResult]:
         """Run the 4-way A/B ablation matrix on identical market data."""
         variants = [
@@ -923,28 +1236,21 @@ class BacktestEngine:
                 news_by_symbol=news_by_symbol,
                 macro_points=macro_points,
                 earnings_by_symbol=earnings_by_symbol,
+                sec_filings_by_symbol=sec_filings_by_symbol,
                 start_date=start_date,
                 end_date=end_date,
                 label=label,
                 allow_shorting=allow_short,
                 use_news=use_news,
+                execution_timing=execution_timing,
+                n_trials=n_trials,
             )
             for label, allow_short, use_news in variants
         ]
 
-    def run_walk_forward(
-        self,
-        bars_by_symbol: Mapping[str, pd.DataFrame],
-        *,
-        news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
-        macro_points: Sequence[MacroPoint] | None = None,
-        earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
-        n_folds: int = 3,
-        allow_shorting: bool = True,
-        use_news: bool = True,
-    ) -> list[BacktestMetrics]:
-        """Evaluate strategy across sequential out-of-sample calendar folds."""
-        all_dates: list[date] = sorted(
+    @staticmethod
+    def _extract_sorted_dates(bars_by_symbol: Mapping[str, pd.DataFrame]) -> list[date]:
+        return sorted(
             {
                 ensure_utc(pd.Timestamp(ts).tz_convert("UTC").to_pydatetime()).date()
                 if pd.Timestamp(ts).tzinfo is not None
@@ -954,6 +1260,22 @@ class BacktestEngine:
                 for ts in df["timestamp"]
             }
         )
+
+    def run_walk_forward(
+        self,
+        bars_by_symbol: Mapping[str, pd.DataFrame],
+        *,
+        news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
+        macro_points: Sequence[MacroPoint] | None = None,
+        earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        n_folds: int = 3,
+        allow_shorting: bool = True,
+        use_news: bool = True,
+        execution_timing: Literal["same_close", "next_open"] | None = None,
+    ) -> list[BacktestMetrics]:
+        """Evaluate fixed-parameter strategy across chronological out-of-sample calendar folds."""
+        all_dates = self._extract_sorted_dates(bars_by_symbol)
         if len(all_dates) <= MIN_HISTORY_BARS + max(n_folds, 1) * 20:
             return []
 
@@ -968,14 +1290,261 @@ class BacktestEngine:
                 news_by_symbol=news_by_symbol,
                 macro_points=macro_points,
                 earnings_by_symbol=earnings_by_symbol,
+                sec_filings_by_symbol=sec_filings_by_symbol,
                 start_date=eval_dates[lo],
                 end_date=eval_dates[hi],
                 label=f"Fold {f_idx + 1}",
                 allow_shorting=allow_shorting,
                 use_news=use_news,
+                execution_timing=execution_timing,
             )
             fold_metrics.append(res.metrics)
         return fold_metrics
+
+    def run_cpcv(
+        self,
+        bars_by_symbol: Mapping[str, pd.DataFrame],
+        *,
+        news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
+        macro_points: Sequence[MacroPoint] | None = None,
+        earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        n_groups: int = 6,
+        k_test_groups: int = 2,
+        purge_days: int = 21,
+        embargo_days: int = 5,
+        allow_shorting: bool = True,
+        use_news: bool = True,
+        execution_timing: Literal["same_close", "next_open"] | None = None,
+    ) -> CPCVSummary:
+        """Combinatorial Purged Cross-Validation (CPCV) across C(n_groups, k_test_groups) paths.
+
+        Partitions evaluable dates into ``n_groups`` contiguous blocks and evaluates every
+        combination of ``k_test_groups`` blocks with ``purge_days`` / ``embargo_days`` boundary
+        exclusions where test blocks border non-test blocks. Each contiguous test span runs
+        independently from ``initial_capital`` with full prior warm-up history.
+        """
+        if n_groups < 2:
+            raise ValueError("n_groups must be >= 2")
+        if k_test_groups < 1 or k_test_groups >= n_groups:
+            raise ValueError("k_test_groups must satisfy 1 <= k_test_groups < n_groups")
+        if purge_days < 0 or embargo_days < 0:
+            raise ValueError("purge_days and embargo_days must be >= 0")
+
+        all_dates = self._extract_sorted_dates(bars_by_symbol)
+        eval_dates = all_dates[MIN_HISTORY_BARS:] if len(all_dates) > MIN_HISTORY_BARS else []
+        if len(eval_dates) < n_groups * 2:
+            return CPCVSummary(
+                n_groups=n_groups,
+                k_test_groups=k_test_groups,
+                purge_days=purge_days,
+                embargo_days=embargo_days,
+                n_paths=0,
+                median_sharpe=0.0,
+                mean_sharpe=0.0,
+                p25_sharpe=0.0,
+                p75_sharpe=0.0,
+                min_sharpe=0.0,
+                max_sharpe=0.0,
+                pct_positive_paths=0.0,
+                median_excess_sharpe=0.0,
+                fold_metrics=[],
+            )
+
+        # Partition eval_dates into n_groups contiguous (start_idx, end_idx) index ranges
+        group_indices = np.array_split(np.arange(len(eval_dates)), n_groups)
+        group_bounds = [(int(arr[0]), int(arr[-1])) for arr in group_indices if arr.size > 0]
+
+        span_cache: dict[
+            tuple[int, int], tuple[BacktestResult, list[float], list[float], list[float]]
+        ] = {}
+        eff_timing: Literal["same_close", "next_open"] = (
+            execution_timing
+            if execution_timing is not None
+            else self.config.backtest.execution_timing
+        )
+
+        fold_metrics: list[BacktestMetrics] = []
+        for path_idx, combo in enumerate(itertools.combinations(range(len(group_bounds)), k_test_groups), start=1):
+            # Merge adjacent test groups into contiguous spans before applying boundary purge/embargo
+            merged_spans: list[tuple[int, int]] = []
+            for grp_i in combo:
+                lo, hi = group_bounds[grp_i]
+                if merged_spans and lo == merged_spans[-1][1] + 1:
+                    merged_spans[-1] = (merged_spans[-1][0], hi)
+                else:
+                    merged_spans.append((lo, hi))
+
+            span_runs: list[tuple[BacktestResult, list[float], list[float], list[float]]] = []
+            path_valid = True
+            for raw_lo, raw_hi in merged_spans:
+                eff_lo = raw_lo + purge_days if raw_lo > 0 else raw_lo
+                eff_hi = raw_hi - embargo_days if raw_hi < len(eval_dates) - 1 else raw_hi
+                if eff_hi - eff_lo < 1:
+                    path_valid = False
+                    break
+                cache_key = (eff_lo, eff_hi)
+                if cache_key not in span_cache:
+                    span_cache[cache_key] = self._run_with_series(
+                        bars_by_symbol,
+                        news_by_symbol=news_by_symbol,
+                        macro_points=macro_points,
+                        earnings_by_symbol=earnings_by_symbol,
+                        sec_filings_by_symbol=sec_filings_by_symbol,
+                        start_date=eval_dates[eff_lo],
+                        end_date=eval_dates[eff_hi],
+                        label=f"Span {eff_lo}..{eff_hi}",
+                        allow_shorting=allow_shorting,
+                        use_news=use_news,
+                        execution_timing=eff_timing,
+                    )
+                span_runs.append(span_cache[cache_key])
+
+            if not path_valid or not span_runs:
+                continue
+
+            combo_tag = "+".join(f"G{g + 1}" for g in combo)
+            path_label = f"Path {path_idx} ({combo_tag})"
+            path_metrics = self._combine_cpcv_spans(
+                span_runs=span_runs,
+                label=path_label,
+                initial_capital=self.config.backtest.initial_capital,
+                benchmark_symbol=self.config.backtest.benchmark_symbol,
+                execution_timing=eff_timing,
+            )
+            fold_metrics.append(path_metrics)
+
+        if not fold_metrics:
+            return CPCVSummary(
+                n_groups=n_groups,
+                k_test_groups=k_test_groups,
+                purge_days=purge_days,
+                embargo_days=embargo_days,
+                n_paths=0,
+                median_sharpe=0.0,
+                mean_sharpe=0.0,
+                p25_sharpe=0.0,
+                p75_sharpe=0.0,
+                min_sharpe=0.0,
+                max_sharpe=0.0,
+                pct_positive_paths=0.0,
+                median_excess_sharpe=0.0,
+                fold_metrics=[],
+            )
+
+        sharpes = [m.sharpe_ratio for m in fold_metrics]
+        ex_sharpes = [m.excess_sharpe_ratio for m in fold_metrics]
+        return CPCVSummary(
+            n_groups=n_groups,
+            k_test_groups=k_test_groups,
+            purge_days=purge_days,
+            embargo_days=embargo_days,
+            n_paths=len(fold_metrics),
+            median_sharpe=round(float(np.median(sharpes)), 3),
+            mean_sharpe=round(float(np.mean(sharpes)), 3),
+            p25_sharpe=round(float(np.percentile(sharpes, 25)), 3),
+            p75_sharpe=round(float(np.percentile(sharpes, 75)), 3),
+            min_sharpe=round(float(np.min(sharpes)), 3),
+            max_sharpe=round(float(np.max(sharpes)), 3),
+            pct_positive_paths=round(sum(1 for s in sharpes if s > 0.0) / len(sharpes) * 100.0, 2),
+            median_excess_sharpe=round(float(np.median(ex_sharpes)), 3),
+            fold_metrics=fold_metrics,
+        )
+
+    @staticmethod
+    def _combine_cpcv_spans(
+        *,
+        span_runs: Sequence[tuple[BacktestResult, list[float], list[float], list[float]]],
+        label: str,
+        initial_capital: float,
+        benchmark_symbol: str,
+        execution_timing: str,
+    ) -> BacktestMetrics:
+        if len(span_runs) == 1:
+            return span_runs[0][0].metrics.model_copy(update={"label": label})
+
+        stitched_curve: list[EquityPoint] = []
+        stitched_rf: list[float] = [0.0]
+        stitched_bm: list[float] = []
+        stitched_ew: list[float] = []
+
+        cur_eq = float(initial_capital)
+        cur_bm = 100.0
+        cur_ew = float(initial_capital)
+
+        first_res = span_runs[0][0]
+        if first_res.equity_curve:
+            p0 = first_res.equity_curve[0]
+            stitched_curve.append(
+                p0.model_copy(update={"equity": round(cur_eq, 2)})
+            )
+        stitched_bm.append(cur_bm)
+        stitched_ew.append(cur_ew)
+
+        all_trades: list[SimulatedTrade] = []
+        total_traded_notional = 0.0
+        total_orders_filled = 0
+        stop_loss_exits = 0
+        risk_rejections = 0
+        total_slippage_usd = 0.0
+        total_borrow_cost_usd = 0.0
+        total_sec_fees_usd = 0.0
+        total_cash_yield_usd = 0.0
+
+        for res, rf_rates, bm_closes, ew_equities in span_runs:
+            all_trades.extend(res.trades)
+            m = res.metrics
+            total_orders_filled += m.total_orders_filled
+            stop_loss_exits += m.stop_loss_exits
+            risk_rejections += m.risk_rejections
+            total_slippage_usd += m.total_slippage_usd
+            total_borrow_cost_usd += m.total_borrow_cost_usd
+            total_sec_fees_usd += m.total_sec_fees_usd
+            total_cash_yield_usd += m.total_cash_yield_usd
+            if m.trading_days > 0 and res.equity_curve:
+                avg_eq = float(np.mean([pt.equity for pt in res.equity_curve]))
+                years = max(m.trading_days / 252.0, 1.0 / 252.0)
+                total_traded_notional += m.annual_turnover * 2.0 * avg_eq * years
+
+            for k in range(1, len(res.equity_curve)):
+                prev_e = res.equity_curve[k - 1].equity
+                cur_e = res.equity_curve[k].equity
+                ret = (cur_e / prev_e) - 1.0 if prev_e > 0.0 else 0.0
+                cur_eq = max(0.0, cur_eq * (1.0 + ret))
+                pt = res.equity_curve[k]
+                stitched_curve.append(pt.model_copy(update={"equity": round(cur_eq, 2)}))
+                stitched_rf.append(rf_rates[k] if k < len(rf_rates) else 0.0)
+
+            for k in range(1, len(bm_closes)):
+                if bm_closes[k - 1] > 0.0:
+                    cur_bm = max(0.0, cur_bm * (bm_closes[k] / bm_closes[k - 1]))
+                    stitched_bm.append(cur_bm)
+
+            for k in range(1, len(ew_equities)):
+                if ew_equities[k - 1] > 0.0:
+                    cur_ew = max(0.0, cur_ew * (ew_equities[k] / ew_equities[k - 1]))
+                    stitched_ew.append(cur_ew)
+
+        return compute_backtest_metrics(
+            label=label,
+            equity_curve=stitched_curve,
+            trades=all_trades,
+            initial_capital=initial_capital,
+            total_traded_notional=total_traded_notional,
+            total_orders_filled=total_orders_filled,
+            stop_loss_exits=stop_loss_exits,
+            risk_rejections=risk_rejections,
+            total_slippage_usd=total_slippage_usd,
+            total_borrow_cost_usd=total_borrow_cost_usd,
+            total_sec_fees_usd=total_sec_fees_usd,
+            total_cash_yield_usd=total_cash_yield_usd,
+            benchmark_symbol=benchmark_symbol,
+            benchmark_closes=stitched_bm,
+            daily_rf_rates=stitched_rf,
+            ew_universe_equities=stitched_ew,
+            n_trials=1,
+            execution_timing=execution_timing,
+        )
 
     def _slippage_rate(self, symbol: str) -> float:
         meta = self.universe_meta.get(symbol)

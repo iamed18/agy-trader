@@ -9,6 +9,11 @@ from typing import Any
 import httpx
 
 from agy_trader.core.models import NewsArticle, ensure_utc
+from agy_trader.data.news_filters import (
+    canonicalize_article_symbols,
+    expand_query_symbols,
+    is_institutional_noise_headline,
+)
 from agy_trader.data.providers import NewsProvider
 
 logger = logging.getLogger(__name__)
@@ -140,7 +145,8 @@ class AlpacaNewsProvider(NewsProvider):
             dict.fromkeys(sym.strip().upper() for sym in symbols if sym.strip())
         )
         requested_set = set(requested_symbols)
-        if not requested_symbols:
+        query_symbols = expand_query_symbols(requested_symbols)
+        if not query_symbols:
             return []
 
         articles_by_id: dict[str, NewsArticle] = {}
@@ -148,8 +154,8 @@ class AlpacaNewsProvider(NewsProvider):
         client = self._external_client or httpx.Client(timeout=self._timeout)
 
         try:
-            for idx in range(0, len(requested_symbols), self.batch_size):
-                batch = requested_symbols[idx : idx + self.batch_size]
+            for idx in range(0, len(query_symbols), self.batch_size):
+                batch = query_symbols[idx : idx + self.batch_size]
                 page_token: str | None = None
                 while True:
                     params: dict[str, Any] = {
@@ -177,21 +183,22 @@ class AlpacaNewsProvider(NewsProvider):
                         created_raw = item.get("created_at") or item.get("updated_at")
                         if not raw_id or not headline or not created_raw:
                             continue
+                        if is_institutional_noise_headline(headline):
+                            continue
 
-                        published_at = _parse_utc_timestamp(str(created_raw))
+                        try:
+                            published_at = _parse_utc_timestamp(str(created_raw))
+                        except ValueError:
+                            continue
                         if published_at < start_utc or published_at > end_utc:
                             continue
 
                         raw_syms = [
-                            str(s).strip().upper()
+                            str(s)
                             for s in (item.get("symbols") or [])
                             if s is not None and str(s).strip()
                         ]
-                        filtered_syms = (
-                            [s for s in dict.fromkeys(raw_syms) if s in requested_set]
-                            if requested_set
-                            else list(dict.fromkeys(raw_syms))
-                        )
+                        filtered_syms = canonicalize_article_symbols(raw_syms, requested_set)
 
                         article = NewsArticle(
                             article_id=raw_id,

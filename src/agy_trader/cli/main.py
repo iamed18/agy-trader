@@ -6,7 +6,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import typer
 import yaml
@@ -15,7 +15,12 @@ from rich.console import Console
 from rich.table import Table
 
 from agy_trader.backtest.engine import BacktestEngine
-from agy_trader.backtest.metrics import BacktestMetrics, BacktestResult, render_ablation_markdown
+from agy_trader.backtest.metrics import (
+    BacktestMetrics,
+    BacktestResult,
+    CPCVSummary,
+    render_ablation_markdown,
+)
 from agy_trader.core.config import (
     AppConfig,
     EnvSettings,
@@ -23,14 +28,18 @@ from agy_trader.core.config import (
     load_universe,
 )
 from agy_trader.core.control_plane import ControlPlane, ControlPlaneError
-from agy_trader.core.models import MacroPoint, NewsArticle
+from agy_trader.core.models import AssetType, MacroPoint, NewsArticle
 from agy_trader.data.alpaca_market import AlpacaMarketDataProvider
 from agy_trader.data.alpaca_news import AlpacaNewsProvider
+from agy_trader.data.feeds import collect_official_rss_feeds, collect_yfinance_news
+from agy_trader.data.finnhub_news import FinnhubNewsProvider
 from agy_trader.data.macro_and_calendar import (
     FRED_SERIES_IDS,
     FREDMacroProvider,
     YFinanceEarningsProvider,
 )
+from agy_trader.data.news_filters import is_forward_only_source
+from agy_trader.data.sec_edgar import SecEdgarProvider
 from agy_trader.data.synthetic import generate_synthetic_dataset
 from agy_trader.nlp.sentiment import SentimentScorer, create_sentiment_scorer
 from agy_trader.storage.db import StateDB
@@ -131,6 +140,22 @@ def _parse_bool_flag(raw: str) -> bool:
     raise ValueError(f"Invalid boolean value {raw!r}: expected true or false")
 
 
+def _parse_backfill_news_sources(raw: str) -> list[str]:
+    allowed = {"alpaca", "finnhub"}
+    parsed: list[str] = []
+    for part in raw.split(","):
+        cleaned = part.strip().lower()
+        if not cleaned:
+            continue
+        if cleaned not in allowed:
+            raise ValueError(
+                f"Invalid news source {cleaned!r}: expected comma-separated subset of 'alpaca,finnhub'"
+            )
+        if cleaned not in parsed:
+            parsed.append(cleaned)
+    return parsed
+
+
 @app.callback()
 def main_callback(
     ctx: typer.Context,
@@ -154,6 +179,11 @@ def backfill_cmd(
     seed: Annotated[int, typer.Option("--seed", help="Random seed for synthetic generation")] = 42,
     allow_overwrite: Annotated[bool, typer.Option("--allow-overwrite", help="Allow overwriting overlapping Parquet bars")] = False,
     skip_news: Annotated[bool, typer.Option("--skip-news", help="Skip fetching and scoring news articles")] = False,
+    news_sources: Annotated[
+        str,
+        typer.Option("--news-sources", help="Comma-separated news sources to fetch: alpaca,finnhub"),
+    ] = "alpaca,finnhub",
+    skip_sec: Annotated[bool, typer.Option("--skip-sec", help="Skip fetching SEC EDGAR Form 4 / 8-K filings")] = False,
     score_backend: Annotated[
         str | None,
         typer.Option(
@@ -165,7 +195,7 @@ def backfill_cmd(
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
 ) -> None:
-    """Backfill market bars, news, macro series, and earnings calendar."""
+    """Backfill market bars, news, SEC EDGAR filings, macro series, and earnings calendar."""
     settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
     effective_backend = (
         score_backend
@@ -177,6 +207,7 @@ def backfill_cmd(
         _ = load_app_config(resolved_config)
         universe = load_universe(resolved_config)
         scorer = create_sentiment_scorer(effective_backend)
+        selected_news_sources = _parse_backfill_news_sources(news_sources)
     except (FileNotFoundError, OSError, TypeError, ValueError, ValidationError, yaml.YAMLError) as exc:
         _fail(str(exc), json_output=json_output)
         return
@@ -198,6 +229,7 @@ def backfill_cmd(
             "seed": seed,
             "score_backend": scorer.model_name,
             **summary,
+            "sec_saved": 0,
             "news_scored": news_scored,
         }
     else:
@@ -233,15 +265,21 @@ def backfill_cmd(
                     allow_overwrite=allow_overwrite,
                 )
 
-        if skip_news:
-            news_saved = 0
-        else:
-            news_provider = AlpacaNewsProvider(
-                api_key=settings.alpaca_api_key,
-                secret_key=settings.alpaca_secret_key,
-            )
-            articles = news_provider.fetch_news(symbols=symbols, start=start_utc, end=now_utc)
-            news_saved = db.upsert_news_articles(articles)
+        news_saved = 0
+        if not skip_news:
+            if "alpaca" in selected_news_sources:
+                news_provider = AlpacaNewsProvider(
+                    api_key=settings.alpaca_api_key,
+                    secret_key=settings.alpaca_secret_key,
+                )
+                articles = news_provider.fetch_news(symbols=symbols, start=start_utc, end=now_utc)
+                news_saved += db.upsert_news_articles(articles)
+            if "finnhub" in selected_news_sources and settings.finnhub_api_key.strip():
+                finnhub_provider = FinnhubNewsProvider(api_key=settings.finnhub_api_key)
+                fh_articles = finnhub_provider.fetch_news(
+                    symbols=symbols, start=start_utc, end=now_utc
+                )
+                news_saved += db.upsert_news_articles(fh_articles)
 
         macro_saved = 0
         if settings.fred_api_key.strip():
@@ -256,6 +294,17 @@ def backfill_cmd(
         earnings_events = earnings_provider.fetch_earnings(symbols)
         earnings_saved = db.upsert_earnings(earnings_events)
 
+        sec_saved = 0
+        if not skip_sec and settings.sec_edgar_user_agent.strip():
+            sec_provider = SecEdgarProvider(
+                user_agent=settings.sec_edgar_user_agent,
+                cache_dir=resolved_data / "sec_cache",
+            )
+            sec_events = sec_provider.fetch_filings(
+                symbols=symbols, start=start_utc, end=now_utc
+            )
+            sec_saved = db.upsert_sec_filings(sec_events)
+
         try:
             news_scored = 0 if skip_news else _score_unscored_news(db, scorer)
         except RuntimeError as exc:
@@ -268,6 +317,7 @@ def backfill_cmd(
             "symbols": len(symbols),
             "bars_saved": bars_saved,
             "news_saved": news_saved,
+            "sec_saved": sec_saved,
             "earnings_saved": earnings_saved,
             "macro_saved": macro_saved,
             "news_scored": news_scored,
@@ -280,8 +330,102 @@ def backfill_cmd(
     table = Table(title=f"Backfill Complete ({result_payload['mode']})")
     table.add_column("Metric", style="cyan")
     table.add_column("Value", justify="right")
-    for key in ("symbols", "bars_saved", "news_saved", "news_scored", "earnings_saved", "macro_saved"):
+    for key in (
+        "symbols",
+        "bars_saved",
+        "news_saved",
+        "news_scored",
+        "sec_saved",
+        "earnings_saved",
+        "macro_saved",
+    ):
         table.add_row(key, str(result_payload[key]))
+    console.print(table)
+
+
+@app.command("collect-feeds")
+def collect_feeds_cmd(
+    ctx: typer.Context,
+    all_symbols: Annotated[
+        bool,
+        typer.Option("--all-symbols", help="Collect yfinance news for all universe symbols instead of ETFs only"),
+    ] = False,
+    max_per_symbol: Annotated[int, typer.Option("--max-per-symbol", min=1, help="Max yfinance items per symbol")] = 10,
+    skip_rss: Annotated[bool, typer.Option("--skip-rss", help="Skip official Fed/EIA/FDA RSS feeds")] = False,
+    skip_yfinance: Annotated[bool, typer.Option("--skip-yfinance", help="Skip yfinance news collection")] = False,
+    score: Annotated[bool, typer.Option("--score", help="Score collected/unscored articles")] = False,
+    score_backend: Annotated[
+        str | None,
+        typer.Option("--score-backend", help="Sentiment backend: lexicon|finbert (default: NLP_BACKEND)"),
+    ] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
+    config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Collect forward-only official RSS (Fed/EIA/FDA) and yfinance ETF news into SQLite."""
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+    effective_backend = score_backend if score_backend is not None else settings.nlp_backend
+
+    try:
+        universe = load_universe(resolved_config)
+        scorer = create_sentiment_scorer(effective_backend) if score else None
+    except (FileNotFoundError, OSError, TypeError, ValueError, ValidationError, yaml.YAMLError) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    db, _ = _open_stores(resolved_data)
+    target_symbols = (
+        [u.symbol for u in universe]
+        if all_symbols
+        else [u.symbol for u in universe if u.asset_type == AssetType.etf]
+    )
+
+    rss_articles = [] if skip_rss else collect_official_rss_feeds()
+    yf_articles = (
+        []
+        if skip_yfinance
+        else collect_yfinance_news(target_symbols, max_per_symbol=max_per_symbol)
+    )
+
+    rss_saved = db.upsert_news_articles(rss_articles)
+    yf_saved = db.upsert_news_articles(yf_articles)
+
+    news_scored = 0
+    if scorer is not None:
+        try:
+            news_scored = _score_unscored_news(db, scorer)
+        except RuntimeError as exc:
+            _fail(str(exc), json_output=json_output)
+            return
+
+    payload = {
+        "rss_fetched": len(rss_articles),
+        "rss_saved": rss_saved,
+        "yfinance_symbols": len(target_symbols) if not skip_yfinance else 0,
+        "yfinance_fetched": len(yf_articles),
+        "yfinance_saved": yf_saved,
+        "total_saved": rss_saved + yf_saved,
+        "scored": score,
+        "score_backend": scorer.model_name if scorer is not None else None,
+        "news_scored": news_scored,
+    }
+    if json_output:
+        _emit_json(payload)
+        return
+
+    table = Table(title="Ops Intelligence Feeds Collected")
+    table.add_column("Metric", style="cyan")
+    table.add_column("Value", justify="right")
+    for key in (
+        "rss_fetched",
+        "rss_saved",
+        "yfinance_symbols",
+        "yfinance_fetched",
+        "yfinance_saved",
+        "total_saved",
+        "news_scored",
+    ):
+        table.add_row(key, str(payload[key]))
     console.print(table)
 
 
@@ -332,8 +476,18 @@ def backtest_cmd(
     ablate: Annotated[bool, typer.Option("--ablate", help="Run 4-way A/B ablation matrix")] = False,
     walk_forward: Annotated[bool, typer.Option("--walk-forward", help="Run walk-forward OOS folds")] = False,
     folds: Annotated[int, typer.Option("--folds", min=1, help="Number of walk-forward folds")] = 3,
+    cpcv: Annotated[bool, typer.Option("--cpcv", help="Run Combinatorial Purged Cross-Validation (CPCV)")] = False,
+    n_trials: Annotated[int, typer.Option("--n-trials", min=1, help="Assumed number of trials for Deflated Sharpe Ratio (DSR)")] = 1,
+    execution_timing: Annotated[
+        str | None,
+        typer.Option("--execution-timing", help="Override execution timing: same_close|next_open"),
+    ] = None,
     allow_shorting: Annotated[bool, typer.Option("--allow-shorting/--no-shorting", help="Enable/disable shorting in single run")] = True,
     use_news: Annotated[bool, typer.Option("--use-news/--no-news", help="Enable/disable news signal in single run")] = True,
+    sources: Annotated[
+        str | None,
+        typer.Option("--sources", help="Optional comma-separated news sources allowlist override"),
+    ] = None,
     start: Annotated[str | None, typer.Option("--start", help="Optional start date (YYYY-MM-DD)")] = None,
     end: Annotated[str | None, typer.Option("--end", help="Optional end date (YYYY-MM-DD)")] = None,
     report_dir: Annotated[Path, typer.Option("--report-dir", help="Directory to write Markdown report")] = Path("reports/backtests"),
@@ -341,16 +495,40 @@ def backtest_cmd(
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
 ) -> None:
-    """Run event-driven backtest, 4-way ablation, and/or walk-forward validation."""
-    _, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+    """Run event-driven backtest, 4-way ablation, walk-forward, and/or CPCV validation."""
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
 
+    eff_timing: Literal["same_close", "next_open"] | None = None
     try:
         start_dt = _parse_iso_date(start, "start")
         end_dt = _parse_iso_date(end, "end")
         if start_dt is not None and end_dt is not None and end_dt < start_dt:
             raise ValueError("end date must be >= start date")
+        if execution_timing is not None:
+            cleaned_timing = execution_timing.strip().lower()
+            if cleaned_timing not in {"same_close", "next_open"}:
+                raise ValueError(
+                    f"Invalid execution timing {execution_timing!r}: expected 'same_close' or 'next_open'"
+                )
+            eff_timing = "same_close" if cleaned_timing == "same_close" else "next_open"
         app_cfg: AppConfig = load_app_config(resolved_config)
         universe = load_universe(resolved_config)
+        effective_sources: list[str] | None = app_cfg.strategy.model_news_sources
+        if sources is not None:
+            parsed_sources = [s.strip().lower() for s in sources.split(",") if s.strip()]
+            forward_requested = [s for s in parsed_sources if is_forward_only_source(s)]
+            if forward_requested:
+                raise ValueError(
+                    f"Forward-only sources cannot be used in backtest: {', '.join(forward_requested)}"
+                )
+            app_cfg = app_cfg.model_copy(
+                update={
+                    "strategy": app_cfg.strategy.model_copy(
+                        update={"model_news_sources": parsed_sources}
+                    )
+                }
+            )
+            effective_sources = parsed_sources
     except (FileNotFoundError, OSError, TypeError, ValueError, ValidationError, yaml.YAMLError) as exc:
         _fail(str(exc), json_output=json_output)
         return
@@ -366,7 +544,17 @@ def backtest_cmd(
         )
         return
 
-    scored_news = db.get_all_scored_news()
+    scored_news = db.get_all_scored_news(sources=effective_sources)
+    distinct_models = {art.scorer_model for art in scored_news if art.scorer_model}
+    if len(distinct_models) > 1:
+        preferred_model = "ProsusAI/finbert" if settings.nlp_backend == "finbert" else "lexicon-v1"
+        preferred = db.get_all_scored_news(
+            scorer_model=preferred_model,
+            sources=effective_sources,
+        )
+        if preferred:
+            scored_news = preferred
+
     news_by_symbol: dict[str, list[NewsArticle]] = defaultdict(list)
     for art in scored_news:
         for sym in art.symbols:
@@ -377,6 +565,7 @@ def backtest_cmd(
         macro_points.extend(db.get_macro_series(series_id))
 
     earnings_by_symbol = db.get_all_earnings_map()
+    sec_filings_by_symbol = db.get_sec_filings_map()
     engine = BacktestEngine(app_cfg, universe)
 
     results: list[BacktestResult]
@@ -386,8 +575,11 @@ def backtest_cmd(
             news_by_symbol=news_by_symbol,
             macro_points=macro_points,
             earnings_by_symbol=earnings_by_symbol,
+            sec_filings_by_symbol=sec_filings_by_symbol,
             start_date=start_dt,
             end_date=end_dt,
+            execution_timing=eff_timing,
+            n_trials=n_trials,
         )
     else:
         variant_label = (
@@ -400,11 +592,14 @@ def backtest_cmd(
                 news_by_symbol=news_by_symbol,
                 macro_points=macro_points,
                 earnings_by_symbol=earnings_by_symbol,
+                sec_filings_by_symbol=sec_filings_by_symbol,
                 start_date=start_dt,
                 end_date=end_dt,
                 label=variant_label,
                 allow_shorting=allow_shorting,
                 use_news=use_news,
+                execution_timing=eff_timing,
+                n_trials=n_trials,
             )
         ]
 
@@ -422,9 +617,24 @@ def backtest_cmd(
             news_by_symbol=news_by_symbol,
             macro_points=macro_points,
             earnings_by_symbol=earnings_by_symbol,
+            sec_filings_by_symbol=sec_filings_by_symbol,
             n_folds=folds,
             allow_shorting=allow_shorting,
             use_news=use_news,
+            execution_timing=eff_timing,
+        )
+
+    cpcv_summary: CPCVSummary | None = None
+    if cpcv:
+        cpcv_summary = engine.run_cpcv(
+            bars_by_symbol,
+            news_by_symbol=news_by_symbol,
+            macro_points=macro_points,
+            earnings_by_symbol=earnings_by_symbol,
+            sec_filings_by_symbol=sec_filings_by_symbol,
+            allow_shorting=allow_shorting,
+            use_news=use_news,
+            execution_timing=eff_timing,
         )
 
     batch_stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -442,6 +652,7 @@ def backtest_cmd(
                     "ablate": ablate,
                     "walk_forward": walk_forward,
                     "folds": folds if walk_forward else 0,
+                    "cpcv": cpcv,
                 }
             ),
             metrics_json=res.metrics.model_dump_json(),
@@ -452,6 +663,7 @@ def backtest_cmd(
     report_md = render_ablation_markdown(
         results,
         walk_forward_folds=walk_forward_folds or None,
+        cpcv_summary=cpcv_summary,
     )
     report_path.write_text(report_md, encoding="utf-8")
 
@@ -460,6 +672,7 @@ def backtest_cmd(
             {
                 "results": [res.metrics.model_dump() for res in results],
                 "walk_forward_folds": [fm.model_dump() for fm in walk_forward_folds],
+                "cpcv_summary": cpcv_summary.model_dump() if cpcv_summary is not None else None,
                 "report_path": str(report_path),
             }
         )
@@ -471,17 +684,22 @@ def backtest_cmd(
     table.add_column("Total Ret", justify="right")
     table.add_column("CAGR", justify="right")
     table.add_column("Sharpe", justify="right")
+    table.add_column("Excess Sharpe", justify="right")
+    table.add_column("DSR", justify="right")
     table.add_column("Max DD", justify="right")
     table.add_column("Trades", justify="right")
     table.add_column("Win Rate", justify="right")
     for res in results:
         m = res.metrics
+        dsr_str = f"{m.deflated_sharpe_prob:.3f}" if m.deflated_sharpe_prob is not None else "N/A"
         table.add_row(
             m.label,
             f"${m.final_equity:,.2f}",
             f"{m.total_return_pct:+.2f}%",
             f"{m.cagr_pct:+.2f}%",
             f"{m.sharpe_ratio:.3f}",
+            f"{m.excess_sharpe_ratio:.3f}",
+            dsr_str,
             f"{m.max_drawdown_pct:.2f}%",
             str(m.closed_trades),
             f"{m.win_rate_pct:.1f}%",
@@ -506,6 +724,20 @@ def backtest_cmd(
                 str(fm.closed_trades),
             )
         console.print(wf_table)
+
+    if cpcv_summary is not None:
+        cpcv_table = Table(
+            title=f"CPCV Summary ({cpcv_summary.n_paths} paths, N={cpcv_summary.n_groups}, k={cpcv_summary.k_test_groups})"
+        )
+        cpcv_table.add_column("Metric", style="cyan")
+        cpcv_table.add_column("Value", justify="right")
+        cpcv_table.add_row("Median Sharpe", f"{cpcv_summary.median_sharpe:.3f}")
+        cpcv_table.add_row("Mean Sharpe", f"{cpcv_summary.mean_sharpe:.3f}")
+        cpcv_table.add_row("IQR (P25..P75)", f"{cpcv_summary.p25_sharpe:.3f} .. {cpcv_summary.p75_sharpe:.3f}")
+        cpcv_table.add_row("Min..Max Sharpe", f"{cpcv_summary.min_sharpe:.3f} .. {cpcv_summary.max_sharpe:.3f}")
+        cpcv_table.add_row("Positive Paths", f"{cpcv_summary.pct_positive_paths:.1f}%")
+        cpcv_table.add_row("Median Excess Sharpe", f"{cpcv_summary.median_excess_sharpe:.3f}")
+        console.print(cpcv_table)
 
     console.print(f"Markdown report saved to [green]{report_path}[/green]")
 

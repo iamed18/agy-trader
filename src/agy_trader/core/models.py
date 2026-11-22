@@ -5,7 +5,7 @@ import math
 import re
 from datetime import UTC, date, datetime
 from enum import StrEnum
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo
 
 from pydantic import (
@@ -161,6 +161,38 @@ class EarningsEvent(_StrictModel):
         return _clean_symbol(v)
 
 
+class SecFilingEvent(_StrictModel):
+    accession_number: str
+    symbol: str
+    cik: str
+    form_type: Literal["4", "8-K"]
+    accepted_at: UtcDatetime
+    items: list[str] = Field(default_factory=list)
+    net_insider_buy_usd: float = 0.0
+    insider_buyer_count: int = Field(default=0, ge=0)
+    insider_seller_count: int = Field(default=0, ge=0)
+
+    @field_validator("accession_number", "cik")
+    @classmethod
+    def _validate_non_empty(cls, v: str) -> str:
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("Field must not be empty")
+        return cleaned
+
+    @field_validator("symbol")
+    @classmethod
+    def _validate_symbol(cls, v: str) -> str:
+        return _clean_symbol(v)
+
+    @field_validator("items", mode="before")
+    @classmethod
+    def _normalize_items(cls, v: Any) -> Any:
+        if not isinstance(v, list):
+            return v
+        return [str(item).strip() for item in v if item is not None and str(item).strip()]
+
+
 class MacroPoint(_StrictModel):
     as_of_date: date
     series_id: str
@@ -250,6 +282,8 @@ class SignalRow(_StrictModel):
     peer_corr_60d: dict[str, float] = Field(default_factory=dict)
     safe_haven_trend_ok: bool = False
     safe_haven_strength: float = 0.0
+    insider_score: float = 0.0
+    has_recent_restatement: bool = False
 
     @field_validator("symbol")
     @classmethod

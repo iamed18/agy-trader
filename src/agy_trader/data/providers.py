@@ -5,7 +5,7 @@ from datetime import date, datetime
 
 import pandas as pd
 
-from agy_trader.core.models import EarningsEvent, MacroPoint, NewsArticle
+from agy_trader.core.models import EarningsEvent, MacroPoint, NewsArticle, SecFilingEvent
 
 
 class MarketDataProvider(ABC):
@@ -53,3 +53,16 @@ class EarningsProvider(ABC):
     @abstractmethod
     def fetch_earnings(self, symbols: list[str]) -> list[EarningsEvent]:
         """Fetch earnings calendar events for the requested symbols."""
+
+
+class SecFilingsProvider(ABC):
+    """Abstract interface for point-in-time SEC EDGAR filings providers."""
+
+    @abstractmethod
+    def fetch_filings(
+        self,
+        symbols: list[str],
+        start: datetime,
+        end: datetime,
+    ) -> list[SecFilingEvent]:
+        """Fetch SEC filings for the requested symbols within [start, end]."""

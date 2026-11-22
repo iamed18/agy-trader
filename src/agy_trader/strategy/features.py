@@ -11,8 +11,16 @@ import numpy as np
 import pandas as pd
 from pandas.tseries.holiday import USFederalHolidayCalendar
 
+from agy_trader.core.calendar import nyse_trading_days_apart
 from agy_trader.core.config import StrategyConfig
-from agy_trader.core.models import MacroPoint, NewsArticle, SignalRow, ensure_utc
+from agy_trader.core.models import (
+    MacroPoint,
+    NewsArticle,
+    SecFilingEvent,
+    SignalRow,
+    ensure_utc,
+)
+from agy_trader.data.news_filters import is_forward_only_source
 from agy_trader.nlp.sentiment import SentimentAggregator
 
 MIN_HISTORY_BARS = 65
@@ -26,6 +34,7 @@ _FRED_RELEASE_SCHEDULE_ET: dict[str, tuple[int, time]] = {
     "VIXCLS": (1, time(11, 30)),
     "BAMLH0A0HYM2": (1, time(11, 30)),
     "T10Y2Y": (1, time(16, 30)),
+    "DGS3MO": (1, time(16, 30)),
 }
 _DEFAULT_FRED_RELEASE_LAG: tuple[int, time] = (2, time(9, 30))
 _US_HOLIDAY_CAL = USFederalHolidayCalendar()
@@ -57,6 +66,90 @@ def macro_point_available_at_utc(point: MacroPoint) -> datetime:
     return ensure_utc(release_dt_et)
 
 
+def latest_pit_rf_apr(
+    as_of_utc: datetime,
+    macro_points: Sequence[MacroPoint] | None,
+    fallback_apr: float = 0.045,
+) -> float:
+    """Return strictly point-in-time annualized 3-month T-bill yield (DGS3MO) in [0.0, 0.25]."""
+    as_of = ensure_utc(as_of_utc)
+    clamped_fallback = (
+        max(0.0, min(0.25, float(fallback_apr))) if math.isfinite(fallback_apr) else 0.0
+    )
+    if not macro_points:
+        return clamped_fallback
+
+    latest: MacroPoint | None = None
+    for pt in macro_points:
+        if pt.series_id != "DGS3MO" or not math.isfinite(pt.value):
+            continue
+        if macro_point_available_at_utc(pt) > as_of:
+            continue
+        if latest is None or pt.as_of_date > latest.as_of_date:
+            latest = pt
+
+    if latest is None:
+        return clamped_fallback
+    return max(0.0, min(0.25, float(latest.value) / 100.0))
+
+
+def _filter_news_by_sources(
+    articles: Sequence[NewsArticle],
+    allowed_sources: frozenset[str] | None,
+) -> Sequence[NewsArticle]:
+    if allowed_sources is None:
+        return [art for art in articles if not is_forward_only_source(art.source)]
+    return [
+        art
+        for art in articles
+        if not is_forward_only_source(art.source)
+        and art.source.strip().lower() in allowed_sources
+    ]
+
+
+def _compute_sec_features_for_symbol(
+    events: Sequence[SecFilingEvent],
+    as_of_utc: datetime,
+    insider_lookback_days: int,
+    restatement_blackout_days: int,
+) -> tuple[float, bool, bool]:
+    """Compute strictly PIT Form 4 insider score and 8-K Item 4.02 restatement flag."""
+    if not events:
+        return 0.0, False, False
+
+    lookback_start = as_of_utc - timedelta(days=insider_lookback_days)
+    as_of_et_date = as_of_utc.astimezone(NY_TZ).date()
+
+    net_usd = 0.0
+    buyer_count = 0
+    seller_count = 0
+    has_recent_restatement = False
+
+    for ev in events:
+        accepted_utc = ensure_utc(ev.accepted_at)
+        if accepted_utc > as_of_utc:
+            continue
+        if ev.form_type == "4":
+            if accepted_utc >= lookback_start:
+                net_usd += float(ev.net_insider_buy_usd)
+                buyer_count += int(ev.insider_buyer_count)
+                seller_count += int(ev.insider_seller_count)
+        elif ev.form_type == "8-K" and restatement_blackout_days > 0 and "4.02" in ev.items:
+            ev_et_date = accepted_utc.astimezone(NY_TZ).date()
+            if nyse_trading_days_apart(as_of_et_date, ev_et_date) <= restatement_blackout_days:
+                has_recent_restatement = True
+
+    has_insider_activity = (buyer_count > 0) or (seller_count > 0) or (abs(net_usd) > 0.0)
+    if has_insider_activity:
+        raw_insider = math.tanh(net_usd / 500_000.0) * (1.0 + 0.25 * min(buyer_count, 4))
+        clamped_raw = max(-1.5, min(1.5, raw_insider))
+        insider_score = max(-3.0, min(3.0, clamped_raw * 1.8))
+    else:
+        insider_score = 0.0
+
+    return insider_score, has_insider_activity, has_recent_restatement
+
+
 @dataclass(frozen=True, slots=True)
 class _RawSymbolFeatures:
     symbol: str
@@ -65,6 +158,9 @@ class _RawSymbolFeatures:
     news_raw: float
     news_velocity_z: float
     news_article_count: int
+    insider_score: float
+    has_insider_activity: bool
+    has_recent_restatement: bool
     atr_pct: float
     ann_vol: float
     ret_5d: float
@@ -356,6 +452,9 @@ class FeatureEngine:
         news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
         macro_points: Sequence[MacroPoint] | None = None,
         benchmark_symbol: str = "SPY",
+        fallback_rf_apr: float = 0.045,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        restatement_blackout_days: int = 10,
     ) -> list[SignalRow]:
         """Compute cross-sectional SignalRows strictly using data <= as_of (UTC)."""
         as_of_utc = ensure_utc(as_of)
@@ -366,9 +465,18 @@ class FeatureEngine:
                 news_by_symbol=news_by_symbol,
                 macro_points=macro_points,
                 benchmark_symbol=benchmark_symbol,
+                fallback_rf_apr=fallback_rf_apr,
+                sec_filings_by_symbol=sec_filings_by_symbol,
+                restatement_blackout_days=restatement_blackout_days,
             )
 
         news_map = news_by_symbol or {}
+        sec_map = sec_filings_by_symbol or {}
+        allowed_sources: frozenset[str] | None = (
+            frozenset(s.strip().lower() for s in self.config.model_news_sources if s.strip())
+            if self.config.model_news_sources is not None
+            else None
+        )
 
         # Benchmark 20d return strictly <= as_of_utc (safe fallback on corrupt benchmark bars)
         spy_df = bars_by_symbol.get(benchmark_symbol)
@@ -451,8 +559,14 @@ class FeatureEngine:
             # Mild anti-chase / pullback preference: positive when oversold, negative when overbought
             pullback_raw = -0.5 * max(-3.0, min(3.0, z_20)) - 0.5 * ((rsi_14 - 50.0) / 25.0)
 
-            sym_news = news_map.get(symbol, ())
+            sym_news = _filter_news_by_sources(news_map.get(symbol, ()), allowed_sources)
             agg_sent = self.sentiment_agg.aggregate_for_symbol(sym_news, as_of=as_of_utc)
+            insider_score, has_insider_act, has_restatement = _compute_sec_features_for_symbol(
+                sec_map.get(symbol, ()),
+                as_of_utc=as_of_utc,
+                insider_lookback_days=self.config.insider_lookback_days,
+                restatement_blackout_days=restatement_blackout_days,
+            )
 
             if not all(
                 math.isfinite(x)
@@ -461,6 +575,7 @@ class FeatureEngine:
                     pullback_raw,
                     agg_sent.news_score,
                     agg_sent.velocity_z,
+                    insider_score,
                     atr_pct,
                     ann_vol,
                     ret_5d,
@@ -476,6 +591,9 @@ class FeatureEngine:
                     news_raw=agg_sent.news_score,
                     news_velocity_z=agg_sent.velocity_z,
                     news_article_count=agg_sent.article_count_window,
+                    insider_score=insider_score,
+                    has_insider_activity=has_insider_act,
+                    has_recent_restatement=has_restatement,
                     atr_pct=atr_pct,
                     ann_vol=ann_vol,
                     ret_5d=ret_5d,
@@ -493,16 +611,19 @@ class FeatureEngine:
         w_t = self.config.w_trend
         w_p = self.config.w_pullback
         w_n = self.config.w_news_sentiment
+        w_i = self.config.w_insider
 
         signals: list[SignalRow] = []
         for idx, r in enumerate(raw_rows):
             t_z = trend_zs[idx]
             p_z = pullback_zs[idx]
             n_z = news_zs[idx]
+            i_z = r.insider_score
             effective_w_n = w_n if r.news_article_count > 0 else 0.0
-            row_w_sum = w_t + w_p + effective_w_n
+            effective_w_i = w_i if (w_i > 0.0 and r.has_insider_activity) else 0.0
+            row_w_sum = w_t + w_p + effective_w_n + effective_w_i
             composite = (
-                (w_t * t_z + w_p * p_z + effective_w_n * n_z) / row_w_sum
+                (w_t * t_z + w_p * p_z + effective_w_n * n_z + effective_w_i * i_z) / row_w_sum
                 if row_w_sum > 0.0
                 else 0.0
             )
@@ -520,6 +641,8 @@ class FeatureEngine:
                     ann_vol=round(r.ann_vol, 6),
                     ret_5d=round(r.ret_5d, 6),
                     abs_trend_raw=round(r.trend_raw, 6),
+                    insider_score=round(i_z, 6),
+                    has_recent_restatement=r.has_recent_restatement,
                 )
             )
         return signals
@@ -532,10 +655,21 @@ class FeatureEngine:
         news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None,
         macro_points: Sequence[MacroPoint] | None,
         benchmark_symbol: str,
+        fallback_rf_apr: float = 0.045,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        restatement_blackout_days: int = 10,
     ) -> list[SignalRow]:
         """Compute multi-horizon OPUS-M2 + CAPM residual Sharpe + 60d peer correlations."""
         as_of_ns = np.int64(pd.Timestamp(as_of_utc).value)
         news_map = news_by_symbol or {}
+        sec_map = sec_filings_by_symbol or {}
+        allowed_sources: frozenset[str] | None = (
+            frozenset(s.strip().lower() for s in self.config.model_news_sources if s.strip())
+            if self.config.model_news_sources is not None
+            else None
+        )
+        rf_apr = latest_pit_rf_apr(as_of_utc, macro_points, fallback_apr=fallback_rf_apr)
+        rf_daily = rf_apr / 252.0
 
         spy_df = bars_by_symbol.get(benchmark_symbol)
         spy_lr: np.ndarray | None = None
@@ -611,6 +745,11 @@ class FeatureEngine:
             m120 = float(np.mean(lr120))
             s120 = max(float(np.std(lr120, ddof=1)), 0.004)
             shp_120 = (m120 / s120) * math.sqrt(252.0)
+            abs_shp_120 = (
+                ((m120 - rf_daily) / s120) * math.sqrt(252.0)
+                if self.config.use_rf_hurdle_for_abs_momentum
+                else shp_120
+            )
 
             shp_252_s21 = _seg_sharpe(lr_vals, long_lb, long_skip, shp_120)
             shp_126_s10 = _seg_sharpe(lr_vals, med_lb, med_skip, shp_120)
@@ -664,19 +803,27 @@ class FeatureEngine:
             rsi5 = _fast_rsi_last(closes, 5)
             pullback_5 = (50.0 - rsi5) / 25.0
 
-            sym_news = news_map.get(symbol, ())
+            sym_news = _filter_news_by_sources(news_map.get(symbol, ()), allowed_sources)
             agg_sent = self.sentiment_agg.aggregate_for_symbol(sym_news, as_of=as_of_utc)
+            insider_score, has_insider_act, has_restatement = _compute_sec_features_for_symbol(
+                sec_map.get(symbol, ()),
+                as_of_utc=as_of_utc,
+                insider_lookback_days=self.config.insider_lookback_days,
+                restatement_blackout_days=restatement_blackout_days,
+            )
 
             if not all(
                 math.isfinite(x)
                 for x in (
                     shp_120,
+                    abs_shp_120,
                     shp_126_s10,
                     shp_252_s21,
                     rshp_252_s21,
                     pullback_5,
                     agg_sent.news_score,
                     agg_sent.velocity_z,
+                    insider_score,
                     atr_pct,
                     ann_vol,
                     ret_5d,
@@ -690,6 +837,7 @@ class FeatureEngine:
                 {
                     "symbol": symbol,
                     "shp_120": shp_120,
+                    "abs_shp_120": abs_shp_120,
                     "shp_126_s10": shp_126_s10,
                     "shp_252_s21": shp_252_s21,
                     "rshp_252_s21": rshp_252_s21,
@@ -697,6 +845,9 @@ class FeatureEngine:
                     "news_raw": agg_sent.news_score,
                     "news_velocity_z": agg_sent.velocity_z,
                     "news_count": agg_sent.article_count_window,
+                    "insider_score": insider_score,
+                    "has_insider_activity": has_insider_act,
+                    "has_recent_restatement": has_restatement,
                     "atr_pct": atr_pct,
                     "ann_vol": ann_vol,
                     "ret_5d": ret_5d,
@@ -752,6 +903,7 @@ class FeatureEngine:
         w_t = self.config.w_trend
         w_p = self.config.w_pullback
         w_n = self.config.w_news_sentiment
+        w_i = self.config.w_insider
 
         signals: list[SignalRow] = []
         for idx, r in enumerate(raw_items):
@@ -763,10 +915,12 @@ class FeatureEngine:
             )
             p_score = zs["pullback_5"][idx]
             n_score = news_zs[idx]
+            i_score = float(r["insider_score"])
             eff_wn = w_n if int(r["news_count"]) > 0 else 0.0
-            denom = w_t + w_p + eff_wn
+            eff_wi = w_i if (w_i > 0.0 and bool(r["has_insider_activity"])) else 0.0
+            denom = w_t + w_p + eff_wn + eff_wi
             composite = (
-                (w_t * t_score + w_p * p_score + eff_wn * n_score) / denom
+                (w_t * t_score + w_p * p_score + eff_wn * n_score + eff_wi * i_score) / denom
                 if denom > 0.0
                 else 0.0
             )
@@ -783,10 +937,12 @@ class FeatureEngine:
                     atr_pct=round(float(r["atr_pct"]), 6),
                     ann_vol=round(float(r["ann_vol"]), 6),
                     ret_5d=round(float(r["ret_5d"]), 6),
-                    abs_trend_raw=round(float(r["shp_120"]), 6),
+                    abs_trend_raw=round(float(r["abs_shp_120"]), 6),
                     peer_corr_60d=peer_corrs.get(sym, {}),
                     safe_haven_trend_ok=bool(r["sh_ok"]),
                     safe_haven_strength=float(r["sh_strength"]),
+                    insider_score=round(i_score, 6),
+                    has_recent_restatement=bool(r["has_recent_restatement"]),
                 )
             )
         return signals

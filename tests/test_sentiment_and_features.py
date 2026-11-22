@@ -17,6 +17,7 @@ from agy_trader.nlp.sentiment import (
 from agy_trader.strategy.features import (
     FeatureEngine,
     compute_macro_regime_scale,
+    latest_pit_rf_apr,
     macro_point_available_at_utc,
 )
 
@@ -711,3 +712,311 @@ def test_compute_macro_regime_scale_fast_equity_crash_checks() -> None:
         )
         == 0.20
     )
+
+
+def test_dgs3mo_pit_release_lag_and_rf_hurdle() -> None:
+    fri = date(2025, 2, 14)  # Presidents' Day on Mon Feb 17 -> Tue Feb 18 at 16:30 ET
+    dgs_pt = MacroPoint(as_of_date=fri, series_id="DGS3MO", value=5.0)
+    avail = macro_point_available_at_utc(dgs_pt).astimezone(NY_TZ)
+    assert avail == datetime(2025, 2, 18, 16, 30, tzinfo=NY_TZ)
+
+    # Before release: uses fallback_apr
+    before_tue = datetime(2025, 2, 18, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+    assert latest_pit_rf_apr(before_tue, [dgs_pt], fallback_apr=0.04) == pytest.approx(0.04)
+
+    # At release: uses 5.0% -> 0.05
+    at_tue = datetime(2025, 2, 18, 16, 30, tzinfo=NY_TZ).astimezone(UTC)
+    assert latest_pit_rf_apr(at_tue, [dgs_pt], fallback_apr=0.04) == pytest.approx(0.05)
+
+    # Clamping bounds [0.0, 0.25]
+    neg_pt = MacroPoint(as_of_date=date(2025, 2, 10), series_id="DGS3MO", value=-0.2)
+    hi_pt = MacroPoint(as_of_date=date(2025, 2, 11), series_id="DGS3MO", value=40.0)
+    assert latest_pit_rf_apr(before_tue, [neg_pt]) == 0.0
+    assert latest_pit_rf_apr(before_tue, [hi_pt]) == 0.25
+
+    # m2_residual abs_trend_raw subtracts PIT rf_daily when use_rf_hurdle_for_abs_momentum=True
+    n_bars = 140
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2024, 9, 2), periods=n_bars)]
+    as_of = datetime.combine(bdays[-1], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+    # Mild upward drift ~2.5% annualized (< 5% T-bill rate!)
+    closes_mild = 100.0 * np.exp(np.linspace(0.0, 0.012, n_bars) + np.sin(np.arange(n_bars)) * 0.002)
+    bars = {
+        "SPY": _make_price_df(bdays, np.linspace(400.0, 420.0, n_bars)),
+        "AAPL": _make_price_df(bdays, closes_mild),
+        "MSFT": _make_price_df(bdays, np.linspace(200.0, 230.0, n_bars)),
+    }
+    macro = [MacroPoint(as_of_date=bdays[-5], series_id="DGS3MO", value=5.0)]
+    future_macro = [
+        *macro,
+        MacroPoint(as_of_date=bdays[-1], series_id="DGS3MO", value=25.0),
+    ]
+
+    cfg_no_rf = StrategyConfig(momentum_mode="m2_residual", use_rf_hurdle_for_abs_momentum=False)
+    cfg_with_rf = StrategyConfig(momentum_mode="m2_residual", use_rf_hurdle_for_abs_momentum=True)
+
+    sigs_no_rf = {
+        s.symbol: s
+        for s in FeatureEngine(cfg_no_rf).build_signals(
+            as_of=as_of, bars_by_symbol=bars, macro_points=macro
+        )
+    }
+    sigs_with_rf = {
+        s.symbol: s
+        for s in FeatureEngine(cfg_with_rf).build_signals(
+            as_of=as_of, bars_by_symbol=bars, macro_points=macro
+        )
+    }
+    sigs_future_rf = {
+        s.symbol: s
+        for s in FeatureEngine(cfg_with_rf).build_signals(
+            as_of=as_of, bars_by_symbol=bars, macro_points=future_macro
+        )
+    }
+    assert sigs_no_rf["AAPL"].abs_trend_raw is not None
+    assert sigs_with_rf["AAPL"].abs_trend_raw is not None
+    # With 5% T-bill hurdle, raw positive 2.5% drift flips negative!
+    assert sigs_no_rf["AAPL"].abs_trend_raw > 0.0
+    assert sigs_with_rf["AAPL"].abs_trend_raw < 0.0
+    # Future DGS3MO has zero lookahead effect
+    assert sigs_future_rf == sigs_with_rf
+
+
+def test_feature_engine_model_news_sources_allowlist() -> None:
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2024, 9, 2), periods=130)]
+    as_of = datetime.combine(bdays[-1], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+    bars = {
+        "SPY": _make_price_df(bdays, np.linspace(400.0, 420.0, 130)),
+        "AAPL": _make_price_df(bdays, np.linspace(100.0, 130.0, 130)),
+        "MSFT": _make_price_df(bdays, np.linspace(200.0, 210.0, 130)),
+    }
+    news = {
+        "AAPL": [
+            NewsArticle(
+                article_id="rss-1",
+                published_at=as_of - timedelta(hours=2),
+                headline="Fed press release",
+                source="rss:fed_fomc",
+                symbols=["AAPL"],
+                sentiment_score=-0.95,
+                sentiment_label="negative",
+                confidence=0.99,
+                scorer_model="lexicon-v1",
+            ),
+            NewsArticle(
+                article_id="yf-1",
+                published_at=as_of - timedelta(hours=1),
+                headline="Yahoo Finance recap",
+                source="yfinance_news",
+                symbols=["AAPL"],
+                sentiment_score=-0.95,
+                sentiment_label="negative",
+                confidence=0.99,
+                scorer_model="lexicon-v1",
+            ),
+            NewsArticle(
+                article_id="fh-1",
+                published_at=as_of - timedelta(hours=3),
+                headline="Strong product demand",
+                source=" Finnhub ",
+                symbols=["AAPL"],
+                sentiment_score=0.80,
+                sentiment_label="positive",
+                confidence=0.95,
+                scorer_model="lexicon-v1",
+            ),
+        ]
+    }
+
+    for mode in ("legacy", "m2_residual"):
+        cfg_filtered = StrategyConfig(
+            momentum_mode=mode,
+            model_news_sources=["benzinga", "fiscal.ai", "finnhub"],
+            w_trend=0.80,
+            w_pullback=0.0,
+            w_news_sentiment=0.20,
+        )
+        cfg_only_fh = StrategyConfig(
+            momentum_mode=mode,
+            model_news_sources=None,
+            w_trend=0.80,
+            w_pullback=0.0,
+            w_news_sentiment=0.20,
+        )
+        sigs_filtered = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_filtered).build_signals(
+                as_of=as_of, bars_by_symbol=bars, news_by_symbol=news
+            )
+        }
+        sigs_only_fh = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_only_fh).build_signals(
+                as_of=as_of,
+                bars_by_symbol=bars,
+                news_by_symbol={"AAPL": [news["AAPL"][2]]},
+            )
+        }
+        assert sigs_filtered["AAPL"].news_score == sigs_only_fh["AAPL"].news_score
+        assert sigs_filtered["AAPL"].news_score > 0.0
+
+        # MEDIUM #5: Even when model_news_sources=None, forward-only feeds MUST be excluded
+        sigs_unbounded_none = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_only_fh).build_signals(
+                as_of=as_of, bars_by_symbol=bars, news_by_symbol=news
+            )
+        }
+        assert sigs_unbounded_none["AAPL"].news_score == sigs_only_fh["AAPL"].news_score
+        assert sigs_unbounded_none["AAPL"].news_score > 0.0
+
+
+def test_feature_engine_sec_insider_score_and_restatement_pit_both_modes() -> None:
+    import math
+
+    from agy_trader.core.models import SecFilingEvent
+
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2024, 9, 2), periods=130)]
+    as_of = datetime.combine(bdays[-1], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+    bars = {
+        "SPY": _make_price_df(bdays, np.linspace(400.0, 420.0, 130)),
+        "AAPL": _make_price_df(bdays, np.linspace(100.0, 130.0, 130)),
+        "MSFT": _make_price_df(bdays, np.linspace(200.0, 210.0, 130)),
+    }
+
+    sec_filings = {
+        "AAPL": [
+            # In-window Form 4 cluster buy
+            SecFilingEvent(
+                accession_number="f4-aapl-1",
+                symbol="AAPL",
+                cik="0000320193",
+                form_type="4",
+                accepted_at=as_of - timedelta(days=5),
+                net_insider_buy_usd=400_000.0,
+                insider_buyer_count=2,
+                insider_seller_count=0,
+            ),
+            # Future Form 4 (1 min after as_of) -> MUST be excluded strictly PIT
+            SecFilingEvent(
+                accession_number="f4-aapl-future",
+                symbol="AAPL",
+                cik="0000320193",
+                form_type="4",
+                accepted_at=as_of + timedelta(minutes=1),
+                net_insider_buy_usd=-5_000_000.0,
+                insider_buyer_count=0,
+                insider_seller_count=3,
+            ),
+            # Expired Form 4 (> 60d ago) -> MUST be excluded
+            SecFilingEvent(
+                accession_number="f4-aapl-stale",
+                symbol="AAPL",
+                cik="0000320193",
+                form_type="4",
+                accepted_at=as_of - timedelta(days=75),
+                net_insider_buy_usd=-2_000_000.0,
+                insider_buyer_count=0,
+                insider_seller_count=2,
+            ),
+            # Recent 8-K Item 4.02 (within 10 NYSE trading days)
+            SecFilingEvent(
+                accession_number="f8k-aapl-restatement",
+                symbol="AAPL",
+                cik="0000320193",
+                form_type="8-K",
+                accepted_at=as_of - timedelta(days=3),
+                items=["4.02", "9.01"],
+            ),
+        ],
+        "MSFT": [
+            # Future 8-K Item 4.02 -> MUST NOT trigger restatement flag PIT
+            SecFilingEvent(
+                accession_number="f8k-msft-future",
+                symbol="MSFT",
+                cik="0000789019",
+                form_type="8-K",
+                accepted_at=as_of + timedelta(minutes=1),
+                items=["4.02"],
+            ),
+            # Stale 8-K Item 4.02 (> 10 trading days ago) -> MUST NOT trigger restatement flag
+            SecFilingEvent(
+                accession_number="f8k-msft-old",
+                symbol="MSFT",
+                cik="0000789019",
+                form_type="8-K",
+                accepted_at=as_of - timedelta(days=30),
+                items=["4.02"],
+            ),
+        ],
+    }
+
+    expected_aapl_score = round(
+        max(-1.5, min(1.5, math.tanh(400_000.0 / 500_000.0) * (1.0 + 0.25 * 2))) * 1.8, 6
+    )
+
+    for mode in ("legacy", "m2_residual"):
+        cfg_zero = StrategyConfig(
+            momentum_mode=mode,
+            w_trend=0.80,
+            w_pullback=0.20,
+            w_news_sentiment=0.0,
+            w_insider=0.0,
+        )
+        cfg_weighted = StrategyConfig(
+            momentum_mode=mode,
+            w_trend=0.60,
+            w_pullback=0.20,
+            w_news_sentiment=0.0,
+            w_insider=0.20,
+            insider_lookback_days=60,
+        )
+        sigs_no_sec = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_zero).build_signals(as_of=as_of, bars_by_symbol=bars)
+        }
+        sigs_zero_w = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_zero).build_signals(
+                as_of=as_of,
+                bars_by_symbol=bars,
+                sec_filings_by_symbol=sec_filings,
+                restatement_blackout_days=10,
+            )
+        }
+        # w_insider=0.0 -> composite scores are identical to no-SEC run
+        assert sigs_zero_w["AAPL"].composite_score == sigs_no_sec["AAPL"].composite_score
+        assert sigs_zero_w["AAPL"].insider_score == pytest.approx(expected_aapl_score)
+        assert sigs_zero_w["AAPL"].has_recent_restatement is True
+        assert sigs_zero_w["MSFT"].insider_score == 0.0
+        assert sigs_zero_w["MSFT"].has_recent_restatement is False
+
+        sigs_weighted_no_sec = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_weighted).build_signals(as_of=as_of, bars_by_symbol=bars)
+        }
+        sigs_weighted = {
+            s.symbol: s
+            for s in FeatureEngine(cfg_weighted).build_signals(
+                as_of=as_of,
+                bars_by_symbol=bars,
+                sec_filings_by_symbol=sec_filings,
+                restatement_blackout_days=10,
+            )
+        }
+        # AAPL blends w_insider=0.20; MSFT (no Form 4) renormalizes cleanly
+        expected_comp_aapl = round(
+            0.60 * sigs_weighted["AAPL"].trend_score
+            + 0.20 * sigs_weighted["AAPL"].pullback_score
+            + 0.20 * expected_aapl_score,
+            6,
+        )
+        assert sigs_weighted["AAPL"].composite_score == pytest.approx(expected_comp_aapl, abs=1e-5)
+        assert sigs_weighted["MSFT"].composite_score == sigs_weighted_no_sec["MSFT"].composite_score
+
+

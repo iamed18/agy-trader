@@ -557,3 +557,245 @@ def test_cli_honors_nlp_backend_env_default(
     assert payload_syn["score_backend"] == "lexicon-stub"
     assert seen_backends == ["finbert", "lexicon"]
 
+
+def test_cli_backtest_cpcv_ntrials_execution_timing_and_source_filtering(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC
+
+    from agy_trader.core.models import NewsArticle
+    from agy_trader.storage.db import StateDB
+    from agy_trader.storage.parquet_store import ParquetBarStore
+
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports"
+
+    res_bf = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--synthetic",
+            "--days",
+            "400",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_bf.exit_code == 0, res_bf.output
+
+    # Inject a forward-only RSS article (should be excluded by model_news_sources)
+    db = StateDB(data_dir / "state.db")
+    spy_df = ParquetBarStore(data_dir / "parquet").load_bars("SPY", timeframe="1d")
+    last_ts = spy_df["timestamp"].iloc[-2].to_pydatetime()
+    db.upsert_news_articles(
+        [
+            NewsArticle(
+                article_id="rss-cli-1",
+                published_at=last_ts.astimezone(UTC),
+                headline="Forward-only RSS shock",
+                source="rss:fed_fomc",
+                symbols=["AAPL"],
+                sentiment_score=-1.0,
+                sentiment_label="negative",
+                confidence=1.0,
+                scorer_model="lexicon-v1",
+            )
+        ]
+    )
+
+    res_cpcv = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--cpcv",
+            "--n-trials",
+            "10",
+            "--execution-timing",
+            "next_open",
+            "--report-dir",
+            str(report_dir),
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_cpcv.exit_code == 0, res_cpcv.output
+    payload = json.loads(res_cpcv.stdout)
+    assert payload["results"][0]["n_trials_assumed"] == 10
+    assert payload["results"][0]["execution_timing"] == "next_open"
+    assert payload["cpcv_summary"] is not None
+    assert payload["cpcv_summary"]["n_paths"] == 15
+    report_text = Path(payload["report_path"]).read_text(encoding="utf-8")
+    assert "Equal-Weight Universe" in report_text
+    assert "Combinatorial Purged Cross-Validation (CPCV)" in report_text
+
+    # Non-JSON Rich output with --cpcv
+    res_rich = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--cpcv",
+            "--n-trials",
+            "5",
+            "--execution-timing",
+            "same_close",
+            "--report-dir",
+            str(report_dir),
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_rich.exit_code == 0, res_rich.output
+    assert "CPCV Summary" in res_rich.stdout
+
+    # Invalid execution timing fails cleanly
+    res_bad_timing = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--execution-timing",
+            "bad_mode",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_bad_timing.exit_code == 1
+
+
+def test_cli_collect_feeds_and_backfill_source_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from agy_trader.core.models import NewsArticle, SecFilingEvent
+    from agy_trader.storage.db import StateDB
+
+    data_dir = tmp_path / "data"
+    seen_yf_symbols: list[list[str]] = []
+
+    def _fake_rss() -> list[NewsArticle]:
+        return [
+            NewsArticle(
+                article_id="rss:fed_fomc:test-1",
+                published_at=datetime(2025, 5, 1, 18, 0, tzinfo=UTC),
+                headline="FOMC holds benchmark rate steady",
+                source="rss:fed_fomc",
+                symbols=["SPY", "TLT"],
+            )
+        ]
+
+    def _fake_yf(symbols: list[str], max_per_symbol: int = 10) -> list[NewsArticle]:
+        seen_yf_symbols.append(list(symbols))
+        return [
+            NewsArticle(
+                article_id="yf:spy-1",
+                published_at=datetime(2025, 5, 1, 19, 0, tzinfo=UTC),
+                headline="SPY weekly ETF flow report",
+                source="yfinance_news",
+                symbols=["SPY"],
+            )
+        ]
+
+    monkeypatch.setattr("agy_trader.cli.main.collect_official_rss_feeds", _fake_rss)
+    monkeypatch.setattr("agy_trader.cli.main.collect_yfinance_news", _fake_yf)
+
+    # Default collect-feeds targets only ETFs (15 in universe.yaml) and scores when --score is passed
+    res_collect = runner.invoke(
+        app,
+        [
+            "collect-feeds",
+            "--score",
+            "--score-backend",
+            "lexicon",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_collect.exit_code == 0, res_collect.output
+    payload = json.loads(res_collect.stdout)
+    assert payload["rss_saved"] == 1
+    assert payload["yfinance_saved"] == 1
+    assert payload["yfinance_symbols"] == 15
+    assert payload["news_scored"] == 2
+    assert len(seen_yf_symbols[0]) == 15
+    assert "AAPL" not in seen_yf_symbols[0]
+
+    # --all-symbols collects for all 50 universe symbols
+    res_all = runner.invoke(
+        app,
+        [
+            "collect-feeds",
+            "--skip-rss",
+            "--all-symbols",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_all.exit_code == 0, res_all.output
+    assert "Ops Intelligence Feeds" in res_all.stdout
+    assert "yfinance_symbols" in res_all.stdout
+    assert len(seen_yf_symbols[1]) == 50
+
+    # Verify DB holds sec_filings + forward-only feeds, and invalid --news-sources fails cleanly
+    db = StateDB(data_dir / "state.db")
+    db.upsert_sec_filings(
+        [
+            SecFilingEvent(
+                accession_number="cli-sec-1",
+                symbol="AAPL",
+                cik="0000320193",
+                form_type="8-K",
+                accepted_at=datetime(2025, 5, 1, 20, 0, tzinfo=UTC),
+                items=["2.02"],
+            )
+        ]
+    )
+    assert db.get_summary_counts()["sec_filings"] == 1
+
+    res_bad_src = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--news-sources",
+            "alpaca,unknown_feed",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_bad_src.exit_code == 1
+
+    # Passing a forward-only source to `backtest --sources` must fail cleanly
+    res_bad_bt_src = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--sources",
+            "benzinga,rss:fed_fomc",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_bad_bt_src.exit_code == 1
+    assert "Forward-only sources" in res_bad_bt_src.stdout
+
+
+

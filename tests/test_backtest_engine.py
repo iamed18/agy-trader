@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -8,15 +8,24 @@ import pandas as pd
 import pytest
 
 from agy_trader.backtest.engine import BacktestEngine
+from agy_trader.backtest.research_stress import (
+    RESEARCH_ETF_UNIVERSE,
+    RegimeWindow,
+    render_stress_markdown,
+    run_multi_regime_stress,
+)
 from agy_trader.core.config import AppConfig, BacktestConfig, RiskConfig, StrategyConfig
 from agy_trader.core.models import (
     AssetType,
+    MacroPoint,
+    NewsArticle,
     OrderSide,
     PositionSide,
     ProposedOrder,
     RiskVerdict,
     SignalRow,
     UniverseSymbol,
+    ensure_utc,
 )
 from agy_trader.data.synthetic import generate_synthetic_dataset
 from agy_trader.nlp.sentiment import LexiconSentimentScorer
@@ -110,7 +119,7 @@ def test_end_to_end_synthetic_ablation_and_walk_forward_deterministic(tmp_path) 
     earnings_map = db.get_all_earnings_map()
 
     cfg = AppConfig(
-        strategy=StrategyConfig(min_signal_threshold=0.25),
+        strategy=StrategyConfig(min_signal_threshold=0.25, model_news_sources=None),
         risk=RiskConfig(),
         backtest=BacktestConfig(),
     )
@@ -223,6 +232,8 @@ def test_long_trade_exact_slippage_sec_fee_and_equity_conservation(
             equity_slippage_bps=10.0,  # 0.001
             sec_sell_fee_bps=0.28,  # 0.000028
             short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="AAPL",
         ),
     )
@@ -321,6 +332,8 @@ def test_short_trade_exact_slippage_and_daily_borrow_cost_accrual(
             equity_slippage_bps=10.0,  # 0.001
             sec_sell_fee_bps=0.28,
             short_borrow_apr=apr,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="AAPL",
         ),
     )
@@ -425,6 +438,8 @@ def test_gap_through_stop_loss_long_and_short(monkeypatch: pytest.MonkeyPatch) -
             equity_slippage_bps=10.0,  # 0.001
             sec_sell_fee_bps=0.28,
             short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="AAPL",
         )
     )
@@ -507,6 +522,8 @@ def test_intraday_stop_loss_fill_and_zero_same_bar_lookahead(
             equity_slippage_bps=10.0,  # 0.001
             sec_sell_fee_bps=0.28,
             short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="AAPL",
         )
     )
@@ -633,6 +650,8 @@ def test_position_add_partial_close_pro_rata_borrow_sec_and_close_at_end(
             equity_slippage_bps=10.0,
             sec_sell_fee_bps=sec_bps,
             short_borrow_apr=apr,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="MSFT",
         ),
     )
@@ -830,6 +849,8 @@ def test_post_gap_entry_abort_carried_exit_and_cash_exposure_conservation(
             initial_capital=10_000.0,
             equity_slippage_bps=10.0,
             short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="ORCL",
         ),
     )
@@ -1011,6 +1032,8 @@ def test_etf_vs_equity_slippage_tier(monkeypatch: pytest.MonkeyPatch) -> None:
             etf_slippage_bps=5.0,
             equity_slippage_bps=10.0,
             short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="SPY",
         ),
     )
@@ -1096,7 +1119,7 @@ def test_ema50_window_parity_with_full_history_feature_engine(
         UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology"),
         UniverseSymbol(symbol="MSFT", asset_type=AssetType.equity, sector="Technology"),
     ]
-    cfg = AppConfig()
+    cfg = AppConfig(backtest=BacktestConfig(execution_timing="next_open"))
     engine = BacktestEngine(cfg, universe)
     full_fe = FeatureEngine(cfg.strategy)
 
@@ -1146,6 +1169,8 @@ def test_rebalance_every_n_days_cadence_and_intermediate_stoploss(
             equity_slippage_bps=0.0,
             sec_sell_fee_bps=0.0,
             short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="next_open",
             benchmark_symbol="AAPL",
         ),
     )
@@ -1193,4 +1218,660 @@ def test_rebalance_every_n_days_cadence_and_intermediate_stoploss(
     assert len(res.trades) == 1
     assert res.trades[0].exit_reason == "stop_loss_intraday"
     assert res.trades[0].exit_time.date() == dates[68]
+
+
+def test_same_close_execution_timing_and_no_retroactive_same_bar_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates, opens, highs, lows, closes = _craft_constant_warmup_bars()
+    # t0 (65): low=90.0 (below stop=95.0!), close=100.0 -> same_close buys at t0 close=100.0*(1+slip).
+    #          Stop-loss MUST NOT trigger retroactively on bar t0's low=90.0!
+    # t1 (66): opens at 99.0, dips intraday to low=92.0 <= reanchored stop -> stops out on t1!
+    opens[65], highs[65], lows[65], closes[65] = 100.0, 101.0, 90.0, 100.0
+    opens[66], highs[66], lows[66], closes[66] = 99.0, 100.0, 92.0, 94.0
+
+    bars = {"AAPL": _build_ohlc_df(dates, opens, highs, lows, closes)}
+    universe = [UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology")]
+    cfg = AppConfig(
+        backtest=BacktestConfig(
+            initial_capital=20_000.0,
+            equity_slippage_bps=10.0,
+            sec_sell_fee_bps=0.0,
+            short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            execution_timing="same_close",
+            benchmark_symbol="AAPL",
+        )
+    )
+    engine = BacktestEngine(cfg, universe)
+
+    t0_ts = datetime(dates[65].year, dates[65].month, dates[65].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+    t1_ts = datetime(dates[66].year, dates[66].month, dates[66].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.FeatureEngine.build_signals",
+        lambda self, as_of, **kwargs: [_dummy_signal("AAPL", as_of)],
+    )
+
+    def fake_propose(self, signals, current_positions, prices, equity, dials, as_of, universe_meta):
+        if as_of == t0_ts:
+            return [
+                ProposedOrder(
+                    symbol="AAPL",
+                    side=OrderSide.buy,
+                    qty=10.0,
+                    target_side=PositionSide.long,
+                    is_risk_reducing=False,
+                    reference_price=100.0,
+                    stop_loss_price=95.0,
+                    reason="same_close_entry",
+                )
+            ]
+        return []
+
+    def fake_eval(self, orders, state, dials, universe_meta, signals_by_symbol=None, earnings_by_symbol=None):
+        return [
+            RiskVerdict(approved=True, order=o, adjusted_qty=o.qty, stop_loss_price=o.stop_loss_price)
+            for o in orders
+        ]
+
+    monkeypatch.setattr("agy_trader.backtest.engine.PortfolioConstructor.build_proposed_orders", fake_propose)
+    monkeypatch.setattr("agy_trader.backtest.engine.HardRiskEngine.evaluate_batch", fake_eval)
+
+    res = engine.run(bars, use_news=False)
+    assert res.metrics.execution_timing == "same_close"
+    assert len(res.trades) == 1
+    trade = res.trades[0]
+    slip = 0.001
+    expected_entry = 100.0 * (1.0 + slip)
+    reanchored_stop = round(expected_entry * 0.95, 4)
+    assert trade.entry_time == t0_ts
+    assert trade.exit_time == t1_ts
+    assert trade.entry_price == pytest.approx(expected_entry, rel=1e-6)
+    assert trade.exit_reason == "stop_loss_intraday"
+    assert trade.exit_price == pytest.approx(reanchored_stop * (1.0 - slip), rel=1e-6)
+    # Position was open at t0 EOD!
+    assert res.equity_curve[0].gross_exposure > 0.0
+
+    # Override execution_timing="next_open" on same engine -> entry moves to t1 open=99.0!
+    res_next = engine.run(bars, use_news=False, execution_timing="next_open")
+    assert res_next.metrics.execution_timing == "next_open"
+    assert res_next.equity_curve[0].gross_exposure == 0.0
+
+
+def test_idle_cash_tbill_yield_accrual_and_pit_dgs3mo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates, opens, highs, lows, closes = _craft_constant_warmup_bars()
+    bars = {"AAPL": _build_ohlc_df(dates, opens, highs, lows, closes)}
+    universe = [UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology")]
+
+    # Use constant 3.65% APR fallback (0.0001 / calendar day) -> exact closed-form compounding
+    cfg = AppConfig(
+        backtest=BacktestConfig(
+            initial_capital=10_000.0,
+            risk_free_rate_apr=0.0365,
+            cash_yield_apr=0.0365,
+            use_fred_tbill_yield=True,
+            execution_timing="same_close",
+            benchmark_symbol="AAPL",
+        )
+    )
+    engine = BacktestEngine(cfg, universe)
+    monkeypatch.setattr("agy_trader.backtest.engine.FeatureEngine.build_signals", lambda self, as_of, **kwargs: [])
+
+    # Future DGS3MO dated on dates[68] must NOT alter yield on dates[65..68]
+    future_dgs = [MacroPoint(as_of_date=dates[68], series_id="DGS3MO", value=25.0)]
+    res_base = engine.run(bars, use_news=False)
+    res_fut = engine.run(bars, macro_points=future_dgs, use_news=False)
+    assert res_fut.metrics == res_base.metrics
+
+    expected_cash = 10_000.0
+    for i in range(66, 69):
+        cal_days = (dates[i] - dates[i - 1]).days
+        expected_cash += expected_cash * 0.0365 * (cal_days / 365.0)
+    expected_yield = expected_cash - 10_000.0
+
+    assert res_base.metrics.total_cash_yield_usd == pytest.approx(expected_yield, abs=0.02)
+    assert res_base.metrics.final_equity == pytest.approx(expected_cash, abs=0.02)
+    assert res_base.metrics.ew_universe_return_pct == pytest.approx(0.0, abs=1e-6)
+
+
+def test_cpcv_purge_embargo_zero_overlap_and_distribution(tmp_path) -> None:
+    universe = [
+        UniverseSymbol(symbol="SPY", asset_type=AssetType.etf, sector="Broad Market"),
+        UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology"),
+        UniverseSymbol(symbol="MSFT", asset_type=AssetType.equity, sector="Technology"),
+        UniverseSymbol(symbol="JPM", asset_type=AssetType.equity, sector="Financials"),
+    ]
+    store = ParquetBarStore(tmp_path / "bars")
+    db = StateDB(tmp_path / "state.db")
+    generate_synthetic_dataset(
+        universe, store, db, days=320, end_date=date(2025, 10, 31), seed=101
+    )
+    bars = store.load_universe_bars([u.symbol for u in universe])
+    cfg = AppConfig(
+        strategy=StrategyConfig(min_signal_threshold=0.0),
+        risk=RiskConfig(),
+        backtest=BacktestConfig(),
+    )
+    engine = BacktestEngine(cfg, universe)
+    summary = engine.run_cpcv(
+        bars,
+        n_groups=6,
+        k_test_groups=2,
+        purge_days=5,
+        embargo_days=2,
+        allow_shorting=False,
+        use_news=False,
+    )
+    # C(6, 2) = 15 paths
+    assert summary.n_paths == 15
+    assert len(summary.fold_metrics) == 15
+    assert summary.min_sharpe <= summary.p25_sharpe <= summary.median_sharpe <= summary.p75_sharpe <= summary.max_sharpe
+    assert 0.0 <= summary.pct_positive_paths <= 100.0
+    for pm in summary.fold_metrics:
+        assert pm.trading_days > 0
+        assert pm.start_date < pm.end_date
+
+
+def test_source_allowlist_isolation_in_backtest(tmp_path) -> None:
+    universe = [
+        UniverseSymbol(symbol="SPY", asset_type=AssetType.etf, sector="Broad Market"),
+        UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology"),
+        UniverseSymbol(symbol="MSFT", asset_type=AssetType.equity, sector="Technology"),
+    ]
+    store = ParquetBarStore(tmp_path / "bars")
+    db = StateDB(tmp_path / "state.db")
+    generate_synthetic_dataset(
+        universe, store, db, days=140, end_date=date(2025, 10, 31), seed=77
+    )
+    bars = store.load_universe_bars([u.symbol for u in universe])
+
+    # Build benzinga baseline news + forward-only rss/yfinance_news extreme shock news
+    spy_ts = bars["SPY"]["timestamp"].tolist()
+    benzinga_news: dict[str, list[NewsArticle]] = {"AAPL": [], "MSFT": []}
+    forward_only_news: dict[str, list[NewsArticle]] = {"AAPL": [], "MSFT": []}
+    for i, ts_val in enumerate(spy_ts[65::5]):
+        pub = ts_val.to_pydatetime() - timedelta(hours=2)
+        bz = NewsArticle(
+            article_id=f"bz-{i}",
+            published_at=pub,
+            headline=f"AAPL steady earnings update {i}",
+            source="benzinga",
+            symbols=["AAPL"],
+            sentiment_score=0.5,
+            sentiment_label="positive",
+            confidence=0.9,
+            scorer_model="lexicon-v1",
+        )
+        rss = NewsArticle(
+            article_id=f"rss-{i}",
+            published_at=pub,
+            headline=f"AAPL emergency FOMC shock {i}",
+            source="rss:fed_fomc",
+            symbols=["AAPL"],
+            sentiment_score=-1.0,
+            sentiment_label="negative",
+            confidence=1.0,
+            scorer_model="lexicon-v1",
+        )
+        yfn = NewsArticle(
+            article_id=f"yfn-{i}",
+            published_at=pub,
+            headline=f"MSFT Yahoo hype {i}",
+            source="yfinance_news",
+            symbols=["MSFT"],
+            sentiment_score=1.0,
+            sentiment_label="positive",
+            confidence=1.0,
+            scorer_model="lexicon-v1",
+        )
+        benzinga_news["AAPL"].append(bz)
+        forward_only_news["AAPL"].extend([bz, rss])
+        forward_only_news["MSFT"].append(yfn)
+
+    cfg = AppConfig(
+        strategy=StrategyConfig(
+            min_signal_threshold=0.0,
+            w_trend=0.80,
+            w_pullback=0.0,
+            w_news_sentiment=0.20,
+            model_news_sources=["benzinga", "fiscal.ai", "finnhub"],
+        )
+    )
+    engine = BacktestEngine(cfg, universe)
+    res_clean = engine.run(bars, news_by_symbol=benzinga_news, use_news=True)
+    res_with_forward = engine.run(bars, news_by_symbol=forward_only_news, use_news=True)
+    assert res_with_forward.equity_curve == res_clean.equity_curve
+    assert res_with_forward.trades == res_clean.trades
+    assert res_with_forward.metrics == res_clean.metrics
+
+
+def test_research_stress_multi_regime_offline(tmp_path) -> None:
+    subset = [u for u in RESEARCH_ETF_UNIVERSE if u.symbol in {"SPY", "QQQ", "TLT", "GLD", "XLK", "XLE"}]
+    store = ParquetBarStore(tmp_path / "research")
+    db = StateDB(tmp_path / "state.db")
+    generate_synthetic_dataset(
+        subset, store, db, days=360, end_date=date(2023, 12, 29), seed=55
+    )
+    bars = store.load_universe_bars([u.symbol for u in subset])
+    all_dates = sorted({ts.date() for ts in bars["SPY"]["timestamp"]})
+    mid_date = all_dates[len(all_dates) // 2]
+
+    windows = (
+        RegimeWindow("Regime A", all_dates[0], mid_date),
+        RegimeWindow("Regime B", mid_date + timedelta(days=1), all_dates[-1]),
+    )
+    report = run_multi_regime_stress(
+        AppConfig(strategy=StrategyConfig(momentum_mode="m2_residual", min_signal_threshold=0.0)),
+        bars,
+        universe=subset,
+        start_date=all_dates[0],
+        end_date=all_dates[-1],
+        regime_windows=windows,
+        run_cpcv=True,
+    )
+    assert report.full_result.metrics.trading_days > 200
+    assert len(report.regime_metrics) == 2
+    assert report.cpcv_summary is not None
+    assert report.cpcv_summary.n_paths == 15
+    md = render_stress_markdown(report)
+    assert "Regime Breakdown" in md
+    assert "CPCV Distribution" in md
+
+
+def test_short_sale_proceeds_do_not_earn_phantom_tbill_yield(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates, opens, highs, lows, closes = _craft_constant_warmup_bars()
+    bars = {"AAPL": _build_ohlc_df(dates, opens, highs, lows, closes)}
+    universe = [UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology")]
+    cfg = AppConfig(
+        risk=RiskConfig(
+            max_long_position_pct=1.0,
+            max_short_position_pct=1.0,
+            max_sector_gross_pct=1.0,
+            max_gross_exposure=1.0,
+            min_net_exposure=-1.0,
+            max_net_exposure=1.0,
+        ),
+        backtest=BacktestConfig(
+            initial_capital=10_000.0,
+            equity_slippage_bps=0.0,
+            sec_sell_fee_bps=0.0,
+            short_borrow_apr=0.0,
+            risk_free_rate_apr=0.0365,
+            cash_yield_apr=0.0365,
+            use_fred_tbill_yield=False,
+            execution_timing="same_close",
+            benchmark_symbol="AAPL",
+        ),
+    )
+    engine = BacktestEngine(cfg, universe)
+    t0_ts = datetime(dates[65].year, dates[65].month, dates[65].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.FeatureEngine.build_signals",
+        lambda self, as_of, **kwargs: [_dummy_signal("AAPL", as_of)],
+    )
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.HardRiskEngine.evaluate_batch",
+        lambda self, orders, state, dials, universe_meta, **kwargs: [
+            RiskVerdict(approved=True, order=o, adjusted_qty=o.qty, stop_loss_price=o.stop_loss_price)
+            for o in orders
+        ],
+    )
+
+    # 1. Flat baseline (100% cash)
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.PortfolioConstructor.build_proposed_orders",
+        lambda *args, **kwargs: [],
+    )
+    res_flat = engine.run(bars, use_news=False)
+
+    # 2. Short 100 shares ($10,000 short notional on $10,000 initial equity -> cash=$20,000, unencumbered=$10,000)
+    def propose_short(self, signals, current_positions, prices, equity, dials, as_of, universe_meta):
+        if as_of == t0_ts:
+            return [
+                ProposedOrder(
+                    symbol="AAPL",
+                    side=OrderSide.sell,
+                    qty=100.0,
+                    target_side=PositionSide.short,
+                    is_risk_reducing=False,
+                    reference_price=100.0,
+                    stop_loss_price=150.0,
+                    reason="test_short_proceeds",
+                )
+            ]
+        return []
+
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.PortfolioConstructor.build_proposed_orders", propose_short
+    )
+    res_short = engine.run(bars, use_news=False)
+    assert res_short.equity_curve[0].cash == pytest.approx(20_000.0, abs=0.01)
+    assert res_short.metrics.total_cash_yield_usd == pytest.approx(
+        res_flat.metrics.total_cash_yield_usd, abs=0.01
+    )
+
+
+@pytest.mark.parametrize("timing", ["same_close", "next_open"])
+def test_short_squeeze_bankruptcy_zeroes_cash_in_both_timings(
+    monkeypatch: pytest.MonkeyPatch,
+    timing: str,
+) -> None:
+    dates, opens, highs, lows, closes = _craft_constant_warmup_bars()
+    # Day 65 (t0): $100; Day 66 (t1): $100; Day 67 (t2): gaps to $300 -> short 100 shares loses $20k > $10k capital!
+    opens[67], highs[67], lows[67], closes[67] = 300.0, 305.0, 295.0, 300.0
+    opens[68], highs[68], lows[68], closes[68] = 300.0, 305.0, 295.0, 300.0
+
+    bars = {"AAPL": _build_ohlc_df(dates, opens, highs, lows, closes)}
+    universe = [UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology")]
+    cfg = AppConfig(
+        risk=RiskConfig(
+            max_long_position_pct=1.0,
+            max_short_position_pct=1.0,
+            max_sector_gross_pct=1.0,
+            max_gross_exposure=1.0,
+            min_net_exposure=-1.0,
+            max_net_exposure=1.0,
+        ),
+        backtest=BacktestConfig(
+            initial_capital=10_000.0,
+            equity_slippage_bps=0.0,
+            sec_sell_fee_bps=0.0,
+            short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            use_fred_tbill_yield=False,
+            execution_timing=timing,  # type: ignore[arg-type]
+            benchmark_symbol="AAPL",
+        ),
+    )
+    engine = BacktestEngine(cfg, universe)
+    t0_ts = datetime(dates[65].year, dates[65].month, dates[65].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.FeatureEngine.build_signals",
+        lambda self, as_of, **kwargs: [_dummy_signal("AAPL", as_of)],
+    )
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.PortfolioConstructor.build_proposed_orders",
+        lambda self, signals, current_positions, prices, equity, dials, as_of, universe_meta: (
+            [
+                ProposedOrder(
+                    symbol="AAPL",
+                    side=OrderSide.sell,
+                    qty=100.0,
+                    target_side=PositionSide.short,
+                    is_risk_reducing=False,
+                    reference_price=100.0,
+                    stop_loss_price=None,
+                    reason="test_squeeze",
+                )
+            ]
+            if as_of == t0_ts
+            else []
+        ),
+    )
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.HardRiskEngine.evaluate_batch",
+        lambda self, orders, state, dials, universe_meta, **kwargs: [
+            RiskVerdict(approved=True, order=o, adjusted_qty=o.qty, stop_loss_price=None)
+            for o in orders
+        ],
+    )
+
+    res = engine.run(bars, use_news=False)
+    assert res.metrics.final_equity == 0.0
+    assert res.metrics.max_drawdown_pct == -100.0
+    assert res.equity_curve[-1].equity == 0.0
+    assert res.equity_curve[-1].cash == 0.0
+    assert res.equity_curve[-2].equity == 0.0
+    assert res.equity_curve[-2].cash == 0.0
+
+
+def test_cpcv_skips_incomplete_paths_with_no_duplicates(tmp_path) -> None:
+    universe = [
+        UniverseSymbol(symbol="SPY", asset_type=AssetType.etf, sector="Broad Market"),
+        UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology"),
+    ]
+    store = ParquetBarStore(tmp_path / "bars")
+    db = StateDB(tmp_path / "state.db")
+    # 150 trading days -> 85 eval days -> ~14 days per group for N=6.
+    # With purge=12, embargo=3: G1..G4 singletons collapse (14-12-3=-1 < 1), while G0 (15-3=12)
+    # and G5 (14-12=2) and all adjacent pairs survive. Paths with a collapsed span MUST be skipped!
+    generate_synthetic_dataset(
+        universe, store, db, days=150, end_date=date(2025, 10, 31), seed=33
+    )
+    bars = store.load_universe_bars([u.symbol for u in universe])
+    engine = BacktestEngine(AppConfig(strategy=StrategyConfig(min_signal_threshold=0.0)), universe)
+
+    summary = engine.run_cpcv(
+        bars,
+        n_groups=6,
+        k_test_groups=2,
+        purge_days=12,
+        embargo_days=3,
+        allow_shorting=False,
+        use_news=False,
+    )
+    # Non-adjacent paths where a span collapsed MUST be dropped -> zero duplicate (start, end) windows
+    windows = [(pm.start_date, pm.end_date) for pm in summary.fold_metrics]
+    assert len(windows) == len(set(windows))
+    # Only (0,1), (0,5), (1,2), (2,3), (3,4), (4,5) have zero collapsed spans -> 6 paths
+    assert summary.n_paths == 6
+    assert all(
+        any(tag in pm.label for tag in ("G1+G2", "G1+G6", "G2+G3", "G3+G4", "G4+G5", "G5+G6"))
+        for pm in summary.fold_metrics
+    )
+
+
+def test_live_sector_headroom_prevents_overnight_gap_sector_breach(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dates, opens, highs, lows, closes = _craft_constant_warmup_bars()
+    # t0 (65): buy 25 AAPL at t1 open=100 ($2,500 Tech = 25% of $10k)
+    # t1 (66) close: propose buying 10 MSFT ($1,000 Tech -> 35% total Tech)
+    # t2 (67) open: AAPL gaps up to $136 ($3,400 Tech out of $10,900 equity = 31.19%) ->
+    #              live sector headroom = 0.35 * 10,900 - 3,400 = $415 -> MSFT capped to <= 4 shares!
+    aapl_o, aapl_h, aapl_l, aapl_c = list(opens), list(highs), list(lows), list(closes)
+    msft_o, msft_h, msft_l, msft_c = list(opens), list(highs), list(lows), list(closes)
+    aapl_o[67], aapl_h[67], aapl_l[67], aapl_c[67] = 136.0, 137.0, 135.0, 136.0
+    aapl_o[68], aapl_h[68], aapl_l[68], aapl_c[68] = 136.0, 137.0, 135.0, 136.0
+
+    bars = {
+        "AAPL": _build_ohlc_df(dates, aapl_o, aapl_h, aapl_l, aapl_c),
+        "MSFT": _build_ohlc_df(dates, msft_o, msft_h, msft_l, msft_c),
+    }
+    universe = [
+        UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology"),
+        UniverseSymbol(symbol="MSFT", asset_type=AssetType.equity, sector="Technology"),
+    ]
+    cfg = AppConfig(
+        risk=RiskConfig(
+            max_long_position_pct=0.50,
+            max_sector_gross_pct=0.35,
+            max_gross_exposure=1.0,
+            max_net_exposure=1.0,
+        ),
+        backtest=BacktestConfig(
+            initial_capital=10_000.0,
+            equity_slippage_bps=0.0,
+            sec_sell_fee_bps=0.0,
+            short_borrow_apr=0.0,
+            cash_yield_apr=0.0,
+            use_fred_tbill_yield=False,
+            execution_timing="next_open",
+            benchmark_symbol="MSFT",
+        ),
+    )
+    engine = BacktestEngine(cfg, universe)
+    t0_ts = datetime(dates[65].year, dates[65].month, dates[65].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+    t1_ts = datetime(dates[66].year, dates[66].month, dates[66].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.FeatureEngine.build_signals",
+        lambda self, as_of, **kwargs: [_dummy_signal("AAPL", as_of), _dummy_signal("MSFT", as_of)],
+    )
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.PortfolioConstructor.build_proposed_orders",
+        lambda self, signals, current_positions, prices, equity, dials, as_of, universe_meta: (
+            [
+                ProposedOrder(
+                    symbol="AAPL",
+                    side=OrderSide.buy,
+                    qty=25.0,
+                    target_side=PositionSide.long,
+                    is_risk_reducing=False,
+                    reference_price=100.0,
+                    stop_loss_price=50.0,
+                )
+            ]
+            if as_of == t0_ts
+            else (
+                [
+                    ProposedOrder(
+                        symbol="MSFT",
+                        side=OrderSide.buy,
+                        qty=10.0,
+                        target_side=PositionSide.long,
+                        is_risk_reducing=False,
+                        reference_price=100.0,
+                        stop_loss_price=50.0,
+                    )
+                ]
+                if as_of == t1_ts
+                else []
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.HardRiskEngine.evaluate_batch",
+        lambda self, orders, state, dials, universe_meta, **kwargs: [
+            RiskVerdict(approved=True, order=o, adjusted_qty=o.qty, stop_loss_price=o.stop_loss_price)
+            for o in orders
+        ],
+    )
+
+    res = engine.run(bars, use_news=False, close_open_positions_at_end=True)
+    msft_trades = [t for t in res.trades if t.symbol == "MSFT"]
+    assert len(msft_trades) == 1
+    # Headroom = 0.35 * 10900 - 3400 = $415 -> MSFT capped to 4.15 shares (< 10 requested!)
+    assert msft_trades[0].qty <= 4.15 + 1e-6
+    # Verify post-fill Technology sector gross exposure at t2 did NOT breach 35%
+    assert res.equity_curve[2].gross_exposure <= 0.35 + 1e-6
+
+
+def test_backtest_sec_filings_pit_and_forward_only_feeds_zero_delta(tmp_path) -> None:
+    from agy_trader.core.models import SecFilingEvent
+
+    universe = [
+        UniverseSymbol(symbol="SPY", asset_type=AssetType.etf, sector="Broad Market"),
+        UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology"),
+        UniverseSymbol(symbol="MSFT", asset_type=AssetType.equity, sector="Technology"),
+    ]
+    store = ParquetBarStore(tmp_path / "bars")
+    db = StateDB(tmp_path / "state.db")
+    generate_synthetic_dataset(
+        universe, store, db, days=150, end_date=date(2025, 9, 30), seed=99
+    )
+    bars = store.load_universe_bars([u.symbol for u in universe])
+    spy_timestamps = [
+        ensure_utc(ts.to_pydatetime()) for ts in bars["SPY"]["timestamp"].tolist()
+    ]
+
+    # Inject forward-only RSS & yfinance_news articles with extreme sentiment
+    forward_only_news = {
+        sym: [
+            NewsArticle(
+                article_id=f"rss-{sym}-{i}",
+                published_at=ts - timedelta(hours=1),
+                headline="Extreme negative forward-only macro shock",
+                source="rss:fed_fomc",
+                symbols=[sym],
+                sentiment_score=-1.0,
+                sentiment_label="negative",
+                confidence=1.0,
+                scorer_model="lexicon-v1",
+            )
+            for i, ts in enumerate(spy_timestamps[65:75])
+        ]
+        + [
+            NewsArticle(
+                article_id=f"yf-{sym}-{i}",
+                published_at=ts - timedelta(hours=1),
+                headline="Extreme yfinance noise",
+                source="yfinance_news",
+                symbols=[sym],
+                sentiment_score=1.0,
+                sentiment_label="positive",
+                confidence=1.0,
+                scorer_model="lexicon-v1",
+            )
+            for i, ts in enumerate(spy_timestamps[75:85])
+        ]
+        for sym in ("AAPL", "MSFT")
+    }
+
+    cfg = AppConfig(
+        strategy=StrategyConfig(
+            model_news_sources=["benzinga", "fiscal.ai", "finnhub"],
+            min_signal_threshold=0.0,
+        ),
+        risk=RiskConfig(restatement_blackout_days=10),
+        backtest=BacktestConfig(),
+    )
+    engine = BacktestEngine(cfg, universe)
+
+    res_clean = engine.run(bars, news_by_symbol=None, allow_shorting=False, use_news=True)
+    res_with_forward_feeds = engine.run(
+        bars, news_by_symbol=forward_only_news, allow_shorting=False, use_news=True
+    )
+    # 0.000000 delta isolation guarantee for forward-only feeds
+    assert res_with_forward_feeds.metrics == res_clean.metrics
+    assert res_with_forward_feeds.equity_curve == res_clean.equity_curve
+
+    # SEC EDGAR Item 4.02 late in window must only affect bars AFTER accepted_at (strictly PIT)
+    late_ts = spy_timestamps[-5]
+    sec_events = {
+        "AAPL": [
+            SecFilingEvent(
+                accession_number="acc-late-402",
+                symbol="AAPL",
+                cik="0000320193",
+                form_type="8-K",
+                accepted_at=late_ts,
+                items=["4.02"],
+            )
+        ]
+    }
+    res_before_end = engine.run(
+        bars,
+        sec_filings_by_symbol=sec_events,
+        end_date=(late_ts - timedelta(days=1)).date(),
+        allow_shorting=False,
+        use_news=False,
+    )
+    res_no_sec_before_end = engine.run(
+        bars,
+        sec_filings_by_symbol=None,
+        end_date=(late_ts - timedelta(days=1)).date(),
+        allow_shorting=False,
+        use_news=False,
+    )
+    assert res_before_end.equity_curve == res_no_sec_before_end.equity_curve
+    assert res_before_end.metrics == res_no_sec_before_end.metrics
+
+    # Also verify run_ablation / run_walk_forward / run_cpcv accept sec_filings_by_symbol
+    ablation = engine.run_ablation(bars, sec_filings_by_symbol=sec_events)
+    assert len(ablation) == 4
+    wf = engine.run_walk_forward(bars, sec_filings_by_symbol=sec_events, n_folds=2)
+    assert len(wf) == 2
+    cpcv = engine.run_cpcv(bars, sec_filings_by_symbol=sec_events, n_groups=4, k_test_groups=2, purge_days=2, embargo_days=1)
+    assert cpcv.n_paths > 0
+
+
+
 

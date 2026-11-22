@@ -750,3 +750,72 @@ def test_risk_engine_additional_hard_guards_and_min_net_exposure() -> None:
     assert v_min_net[3].approved is False
     assert "NET_EXPOSURE_BOUND_EXCEEDED" in v_min_net[3].violations
 
+
+def test_restatement_blackout_blocks_new_longs_allows_exits_and_respects_zero_config() -> None:
+    as_of = _as_of_et(date(2025, 3, 5))
+    meta = {"AAPL": _meta("AAPL"), "MSFT": _meta("MSFT")}
+    dials = ControlDials()
+    sig_restated = _signal("AAPL", as_of).model_copy(update={"has_recent_restatement": True})
+    sig_clean = _signal("MSFT", as_of).model_copy(update={"has_recent_restatement": False})
+    signals = {"AAPL": sig_restated, "MSFT": sig_clean}
+
+    buy_aapl = ProposedOrder(
+        symbol="AAPL",
+        side=OrderSide.buy,
+        qty=20.0,
+        target_side=PositionSide.long,
+        reference_price=100.0,
+        stop_loss_price=95.0,
+    )
+    sell_exit_aapl = ProposedOrder(
+        symbol="AAPL",
+        side=OrderSide.sell,
+        qty=15.0,
+        is_risk_reducing=True,
+        reference_price=100.0,
+    )
+    short_aapl = ProposedOrder(
+        symbol="AAPL",
+        side=OrderSide.sell,
+        qty=10.0,
+        target_side=PositionSide.short,
+        reference_price=100.0,
+        stop_loss_price=104.0,
+    )
+
+    engine = HardRiskEngine(RiskConfig(restatement_blackout_days=10))
+    # Pass 1 exit allowed; Pass 2 long entry blocked with RESTATEMENT_BLACKOUT
+    verdicts = engine.evaluate_batch(
+        [sell_exit_aapl, buy_aapl],
+        _base_state(as_of, positions={"AAPL": 15.0}, prices={"AAPL": 100.0, "MSFT": 100.0}),
+        dials,
+        meta,
+        signals,
+    )
+    assert verdicts[0].approved is True
+    assert verdicts[0].adjusted_qty == 15.0
+    assert verdicts[1].approved is False
+    assert "RESTATEMENT_BLACKOUT" in verdicts[1].violations
+
+    # Short entry is NOT blocked by RESTATEMENT_BLACKOUT
+    verdict_short = engine.evaluate_batch(
+        [short_aapl],
+        _base_state(as_of, prices={"AAPL": 100.0}),
+        dials,
+        meta,
+        signals,
+    )
+    assert verdict_short[0].approved is True
+
+    # restatement_blackout_days=0 disables the blackout
+    engine_off = HardRiskEngine(RiskConfig(restatement_blackout_days=0))
+    verdict_off = engine_off.evaluate_batch(
+        [buy_aapl],
+        _base_state(as_of, prices={"AAPL": 100.0}),
+        dials,
+        meta,
+        signals,
+    )
+    assert verdict_off[0].approved is True
+
+

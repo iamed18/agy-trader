@@ -10,9 +10,15 @@ import pytest
 from pydantic import ValidationError
 
 from agy_trader.backtest.metrics import (
+    BacktestResult,
+    CPCVSummary,
     EquityPoint,
     SimulatedTrade,
+    _norm_cdf,
+    _norm_ppf,
     compute_backtest_metrics,
+    compute_deflated_sharpe_ratio,
+    render_ablation_markdown,
 )
 from agy_trader.core.config import RiskConfig, StrategyConfig
 from agy_trader.core.models import (
@@ -998,3 +1004,108 @@ def test_portfolio_multi_sleeve_safe_haven_exemption_rotation_and_controls() -> 
     assert w_paused["EQ1"] == 0.0
     assert w_paused["TLT"] == 0.0
     assert 0.0 < w_paused["GLD"] <= 0.15 + 1e-9
+
+
+def test_norm_cdf_ppf_dsr_excess_sharpe_ew_and_markdown_rendering() -> None:
+    for p in (1e-8, 0.001, 0.02425, 0.25, 0.5, 0.75, 0.97575, 0.999, 1.0 - 1e-8):
+        assert _norm_cdf(_norm_ppf(p)) == pytest.approx(p, abs=1e-7)
+
+    with pytest.raises(ValueError):
+        _norm_ppf(0.0)
+    with pytest.raises(ValueError):
+        _norm_ppf(1.0)
+
+    rng = np.random.default_rng(7)
+    excess_rets = rng.normal(0.0009, 0.01, size=252).tolist()
+    dsr_1 = compute_deflated_sharpe_ratio(excess_rets, n_trials=1)
+    dsr_5 = compute_deflated_sharpe_ratio(excess_rets, n_trials=5)
+    dsr_20 = compute_deflated_sharpe_ratio(excess_rets, n_trials=20)
+    dsr_100 = compute_deflated_sharpe_ratio(excess_rets, n_trials=100)
+    assert 1.0 >= dsr_1 > dsr_5 > dsr_20 > dsr_100 >= 0.0
+
+    equities = [100_000.0]
+    for r in excess_rets:
+        equities.append(equities[-1] * (1.0 + r + 0.045 / 252.0))
+    curve = [_eq_pt(i, eq) for i, eq in enumerate(equities)]
+    daily_rf = [0.045 / 252.0] * len(curve)
+    ew_equities = [100_000.0]
+    for i in range(1, len(curve)):
+        ew_equities.append(ew_equities[-1] * (1.0012 if i % 2 == 0 else 0.9994))
+
+    metrics = compute_backtest_metrics(
+        label="Hardened",
+        equity_curve=curve,
+        trades=[_trade("AAPL", 400.0)],
+        initial_capital=100_000.0,
+        total_traded_notional=25_000.0,
+        total_orders_filled=2,
+        stop_loss_exits=0,
+        risk_rejections=0,
+        total_slippage_usd=5.0,
+        total_borrow_cost_usd=0.0,
+        total_sec_fees_usd=0.5,
+        total_cash_yield_usd=1234.56,
+        benchmark_symbol="SPY",
+        benchmark_closes=[100.0 * (1.0002**i) for i in range(len(curve))],
+        daily_rf_rates=daily_rf,
+        ew_universe_equities=ew_equities,
+        n_trials=20,
+        execution_timing="same_close",
+    )
+    assert metrics.excess_sharpe_ratio < metrics.sharpe_ratio
+    assert metrics.deflated_sharpe_prob is not None
+    assert metrics.n_trials_assumed == 20
+    assert metrics.total_cash_yield_usd == 1234.56
+    assert metrics.ew_universe_return_pct > 0.0
+    assert metrics.ew_universe_sharpe > 0.0
+    assert metrics.execution_timing == "same_close"
+
+    cpcv = CPCVSummary(
+        n_groups=6,
+        k_test_groups=2,
+        purge_days=21,
+        embargo_days=5,
+        n_paths=1,
+        median_sharpe=1.2,
+        mean_sharpe=1.2,
+        p25_sharpe=1.2,
+        p75_sharpe=1.2,
+        min_sharpe=1.2,
+        max_sharpe=1.2,
+        pct_positive_paths=100.0,
+        median_excess_sharpe=0.9,
+        fold_metrics=[metrics],
+    )
+    md = render_ablation_markdown([BacktestResult(metrics=metrics)], cpcv_summary=cpcv)
+    assert "Equal-Weight Universe" in md
+    assert "Excess Sharpe" in md
+    assert "Cash Yield" in md
+    assert "Combinatorial Purged Cross-Validation (CPCV)" in md
+    assert "same_close" in md
+
+    # Degenerate DSR variance guard and 100%-cash rounding dust (excess_sharpe=0.0, dsr=None)
+    assert compute_deflated_sharpe_ratio([0.01, -0.02, 0.015, float("nan")], n_trials=1) == (
+        pytest.approx(compute_deflated_sharpe_ratio([0.01, -0.02, 0.015], n_trials=1))
+    )
+    cash_curve = [_eq_pt(i, round(100_000.0 * ((1.0 + 0.045 / 365.0) ** i), 2)) for i in range(20)]
+    cash_rf = [0.045 / 365.0] * len(cash_curve)
+    cash_metrics = compute_backtest_metrics(
+        label="CashOnly",
+        equity_curve=cash_curve,
+        trades=[],
+        initial_capital=100_000.0,
+        total_traded_notional=0.0,
+        total_orders_filled=0,
+        stop_loss_exits=0,
+        risk_rejections=0,
+        total_slippage_usd=0.0,
+        total_borrow_cost_usd=0.0,
+        total_sec_fees_usd=0.0,
+        benchmark_symbol="SPY",
+        benchmark_closes=[100.0] * len(cash_curve),
+        daily_rf_rates=cash_rf,
+    )
+    assert cash_metrics.excess_sharpe_ratio == 0.0
+    assert cash_metrics.deflated_sharpe_prob is None
+
+

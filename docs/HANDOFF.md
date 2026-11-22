@@ -27,11 +27,11 @@ All architectural decisions below were explicitly agreed with the user during di
 
 | Dimension | Locked-In Choice |
 | :--- | :--- |
-| **Time Horizon** | **Swing trading** (hold days to weeks; avoid PDT rule and millisecond HFT competition; evaluate signals at `10:00`, `13:00`, `15:40` ET) |
+| **Time Horizon** | **Swing trading** (hold days to weeks; avoid PDT rule and millisecond HFT competition; evaluate & execute daily at `15:40 ET` aligned with backtest `execution_timing: "same_close"`, with `"next_open"` available for A/B testing) |
 | **Decision Architecture** | **100% Deterministic Quantitative Execution** (fully backtestable) + **Active Ops AI Agent Supervisor** (no LLM discretionary trade orders) |
 | **Asset Universe** | **50 curated liquid US symbols** in `config/universe.yaml`: 15 core/sector ETFs + 35 large-cap stocks with GICS sectors |
-| **News & Events** | Real-time + historical **Alpaca/Benzinga news** scored locally via quantitative NLP (**FinBERT** `ProsusAI/finbert`, with zero-ML `lexicon-v1` fallback) fed directly into trade signals alongside price, volume, macro regime, and earnings calendar |
-| **Risk Posture** | **Long/Short Market-Neutral capable** with immutable hard Risk Engine caps (10% max long, 6% max short, 25% sector gross, 100% max gross, `[-25%, +60%]` net, `-2%` daily halt, `-8%` max drawdown halt, `±2` NYSE trading-day earnings blackout, mandatory `shortable` + `easy_to_borrow`, whole-share shorts only, squeeze filters, mandatory directional hard stop-losses, and `allow_shorting` toggle) |
+| **News & Events** | Real-time + historical **validated news feeds** (`model_news_sources: ["benzinga", "fiscal.ai", "finnhub"]`) scored locally via quantitative NLP (**FinBERT** `ProsusAI/finbert`, with zero-ML `lexicon-v1` fallback) fed directly into trade signals alongside price, volume, macro regime, and earnings calendar |
+| **Risk Posture** | **Long-Only Default (`top_k_short: 0`), Long/Short Market-Neutral capable** with immutable hard Risk Engine caps (`20%` max long, `6%` max short, `35%` sector gross, `100%` max gross, `[-35%, +100%]` net, `-3.5%` daily halt, `-14%` max drawdown halt, `±2` NYSE trading-day earnings blackout, `3.5x`/`3.0x` ATR hard stop-losses, mandatory `shortable` + `easy_to_borrow`, whole-share shorts only, squeeze filters, and `allow_shorting` toggle) |
 | **Live Safety Lock** | Paper mode is default (`ALPACA_PAPER=true`). Live mode requires `ALPACA_PAPER=false`, live API keys, AND `LIVE_TRADING_CONFIRMATION=I_ACCEPT_REAL_MONEY_RISK` (`core/config.py:validate_trading_mode`) |
 | **Monitoring Agent Power** | **Active Ops Agent** constrained strictly to bounded, audited `agy ops ...` commands: read telemetry/P&L/news, pause/resume new entries, dial `exposure_multiplier` strictly in `[0.0, 1.0]`, toggle `allow_shorting`, add TTL symbol blacklists, and restart stuck daemons (max 2/hr/service via atomic SQLite `service_restart_log`). **Cannot** place arbitrary trades, raise hard risk caps, or edit strategy code (writes Markdown proposals instead) |
 | **Data Tier & Budget** | **\$0/mo starter**: Alpaca Paper + Basic IEX bars + Benzinga News + free FRED macro + free `yfinance` earnings, behind pluggable provider interfaces (`ALPACA_DATA_FEED=sip` flip later) |
@@ -88,10 +88,11 @@ All architectural decisions below were explicitly agreed with the user during di
    - **4.2-Year Continuous (`2022-09-12..2026-11-20`):** **`+227.49%`** (`+32.83%` CAGR, **`2.110` Sharpe**, `3.329` Sortino, **`-9.18%` Max DD**, `6.83x` turnover; 50-perturbation median Sharpe `2.082`) vs. `SPY` `+77.72%` (`0.946` Sharpe, `-18.74%` Max DD).
    - **5-Year Continuous + 5-Fold Walk-Forward (`2022-02-28..2026-11-20`, incl. 2022 Bear):** **`+223.30%`** (**`1.905` Sharpe**, `2.969` Sortino, `-10.55%` Max DD vs. `SPY -22.11%`); all 5 walk-forward folds positive (`0.281 / 2.484 / 2.534 / 2.266 / 1.281`, mean **`1.769`**).
    - **Held-Out OOS (`2025-01-02..2026-11-20`):** **`+49.27%`** (**`1.670` Sharpe**, 5-start-day mean `1.752`, continuous OOS `1.778`, `2.527` Sortino, `-9.85%` Max DD, `7.22x` turnover) vs. `SPY` `+20.47%` (`0.674` Sharpe, `-18.74%` Max DD).
-   - **Phase 2 Live-Parity Requirements:**
-     - Run daily-bar signal evaluation once per trading session at `15:40 ET` (`rebalance_every_n_days: 1` eliminates multi-day session-phase tracking), reserving the 30s loop for stops/broker sync/drawdown guards.
+   - **Phase 2 Live-Parity & Validation Hardening:**
+     - **Execution Timing Alignment (`same_close` / `15:40 ET`):** `backtest.execution_timing: "same_close"` executes bar-$t$ signals at bar-$t$ close + adverse slippage (matching daily `15:40 ET` live execution; `"next_open"` remains supported for A/B comparison). Stop-losses for new entries anchor to fill price and first activate on bar $t+1$.
+     - **T-Bill Hurdle & Safe-Haven Pruning:** `safe_haven_rotation_fraction: 0.0` and `exempt_safe_havens_from_macro_scale: false` are disabled by default (retained for opt-in ablation); idle positive cash accrues point-in-time FRED `DGS3MO` T-bill yield (`use_fred_tbill_yield: true`, fallback `0.045`), and `use_rf_hurdle_for_abs_momentum: true` subtracts daily T-bill yield from trailing 120d dual-momentum drift.
+     - **Source Allowlist & Mixed-Model Isolation:** `model_news_sources: ["benzinga", "fiscal.ai", "finnhub"]` strictly excludes forward-only feeds (`rss:*`, `yfinance_news`), and `agy backtest` resolves mixed `scorer_model` entries in SQLite to the active `NLP_BACKEND`.
      - Ensure `>=300` historical daily bars per symbol (and `SPY`) are backfilled on startup so `m2_long_lookback: 252` and `spy_sma200_defensive_scale` are active from day 1.
-     - Filter `StateDB.get_all_scored_news()` by active `scorer_model` (`ProsusAI/finbert`) if mixed models exist in SQLite.
 
 ---
 

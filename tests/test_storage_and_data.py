@@ -681,3 +681,595 @@ def test_yfinance_earnings_provider_resilience(monkeypatch: pytest.MonkeyPatch) 
         EarningsEvent(symbol="AAPL", earnings_date=date(2025, 5, 1)),
     ]
 
+
+# ---------------------------------------------------------------------------
+# Workstreams 3, 4, 5: News filters, Finnhub, SEC EDGAR, RSS/yfinance, DB
+# ---------------------------------------------------------------------------
+
+
+def test_news_filters_aliases_and_institutional_noise_regex() -> None:
+    from agy_trader.data.news_filters import (
+        canonicalize_article_symbols,
+        expand_query_symbols,
+        is_institutional_noise_headline,
+    )
+
+    assert expand_query_symbols(["aapl", "googl", "msft", "GOOGL", " "]) == [
+        "AAPL",
+        "GOOGL",
+        "GOOG",
+        "MSFT",
+    ]
+    assert canonicalize_article_symbols(
+        ["goog", "aapl", "GOOGL", "tsla"], {"GOOGL", "AAPL"}
+    ) == ["GOOGL", "AAPL"]
+    assert canonicalize_article_symbols(["goog", "aapl", "googl"], set()) == ["GOOGL", "AAPL"]
+
+    noise_samples = [
+        "BlackRock Discloses Stake in Apple Inc.",
+        "Vanguard Discloses Increased Position in MSFT",
+        "Fidelity Discloses Decreased Holding in NVDA",
+        "Form 13F: Citadel Reports Q1 Holdings",
+        "Form 13G Filing for Alphabet",
+        "Form 13D Activist Stake Update",
+        "Schedule 13G/A Amendment Filed",
+        "TR-1 Notification of Major Holdings",
+        "Notification of Major Holdings: Total Voting Rights",
+        "Total Voting Rights and Capital Update",
+        "Major Shareholding Announcement",
+        "SEC Filing: Form 4 Transaction Notice",
+    ]
+    for h in noise_samples:
+        assert is_institutional_noise_headline(h) is True, f"Expected noise for {h!r}"
+
+    signal_samples = [
+        "Apple beats Q3 earnings estimates and raises guidance",
+        "Alphabet unveils Gemini model update at developer conference",
+        "Federal Reserve holds interest rates steady",
+    ]
+    for h in signal_samples:
+        assert is_institutional_noise_headline(h) is False, f"Unexpected noise for {h!r}"
+
+
+@respx.mock
+def test_alpaca_news_provider_aliases_and_noise_filtering() -> None:
+    base_url = "https://data.alpaca.markets/v1beta1/news"
+    start = datetime(2025, 4, 1, 0, 0, tzinfo=UTC)
+    end = datetime(2025, 4, 2, 23, 59, tzinfo=UTC)
+
+    route = respx.get(base_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "news": [
+                    {
+                        "id": "goog-1",
+                        "created_at": "2025-04-01T15:00:00Z",
+                        "headline": "Alphabet announces cloud expansion",
+                        "symbols": ["GOOG", "UNREQUESTED"],
+                    },
+                    {
+                        "id": "noise-1",
+                        "created_at": "2025-04-01T16:00:00Z",
+                        "headline": "BlackRock Discloses Stake in AAPL via Form 13G",
+                        "symbols": ["AAPL"],
+                    },
+                ],
+                "next_page_token": None,
+            },
+        )
+    )
+
+    provider = AlpacaNewsProvider(api_key="k", secret_key="s", base_url=base_url)
+    articles = provider.fetch_news(["GOOGL", "AAPL"], start=start, end=end)
+
+    assert route.call_count == 1
+    assert route.calls[0].request.url.params["symbols"] == "GOOGL,GOOG,AAPL"
+    assert [a.article_id for a in articles] == ["goog-1"]
+    assert articles[0].symbols == ["GOOGL"]
+
+
+@respx.mock
+def test_finnhub_news_provider_chunking_pacing_retry_alias_and_noise() -> None:
+    from agy_trader.data.finnhub_news import FinnhubNewsProvider
+
+    base_url = "https://finnhub.io/api/v1/company-news"
+    start = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+    end = datetime(2025, 2, 14, 18, 0, tzinfo=UTC)  # 45 calendar days -> 2 chunks (30 + 15)
+
+    # Empty API key short-circuits cleanly
+    assert FinnhubNewsProvider(api_key="  ", base_url=base_url).fetch_news(["AAPL"], start, end) == []
+
+    shared_ts = int(datetime(2025, 1, 15, 14, 0, tzinfo=UTC).timestamp())
+    out_of_window_ts = int(datetime(2025, 1, 1, 10, 0, tzinfo=UTC).timestamp())  # before start_utc
+
+    route = respx.get(base_url).mock(
+        side_effect=[
+            # GOOGL slice 1 -> 429 retry, then ok
+            httpx.Response(429, headers={"Retry-After": "2"}),
+            httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 9001,
+                        "datetime": shared_ts,
+                        "headline": "Alphabet posts record search revenue",
+                        "summary": "Strong quarter",
+                        "related": "GOOGL",
+                    },
+                    {
+                        "id": 9002,
+                        "datetime": shared_ts,
+                        "headline": "Vanguard Discloses Increased Stake in GOOGL",
+                        "related": "GOOGL",
+                    },
+                    {
+                        "id": 9003,
+                        "datetime": out_of_window_ts,
+                        "headline": "Too early before start timestamp",
+                        "related": "GOOGL",
+                    },
+                ],
+            ),
+            # GOOGL slice 2
+            httpx.Response(200, json=[]),
+            # GOOG slice 1 -> returns same 9001 plus unique GOOG item
+            httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": 9001,
+                        "datetime": shared_ts,
+                        "headline": "Alphabet posts record search revenue",
+                        "related": "GOOG,OTHER",
+                    },
+                    {
+                        "id": 9004,
+                        "datetime": shared_ts + 60,
+                        "headline": "Google Cloud signs enterprise deal",
+                        "related": "GOOG",
+                    },
+                ],
+            ),
+            # GOOG slice 2 -> 503 then ok
+            httpx.Response(503),
+            httpx.Response(200, json=[]),
+        ]
+    )
+
+    sleeps: list[float] = []
+    provider = FinnhubNewsProvider(
+        api_key="fh-key",
+        base_url=base_url,
+        chunk_days=30,
+        min_interval_seconds=1.25,
+        backoff_base_seconds=1.0,
+        sleep_fn=sleeps.append,
+        now_fn=lambda: 1000.0,
+    )
+    articles = provider.fetch_news(["GOOGL"], start=start, end=end)
+
+    assert route.call_count == 6
+    assert route.calls[0].request.headers["X-Finnhub-Token"] == "fh-key"
+    assert "token" not in route.calls[0].request.url.params
+    assert route.calls[0].request.url.params["symbol"] == "GOOGL"
+    assert route.calls[0].request.url.params["from"] == "2025-01-01"
+    assert route.calls[0].request.url.params["to"] == "2025-01-30"
+    assert route.calls[2].request.url.params["from"] == "2025-01-31"
+    assert route.calls[2].request.url.params["to"] == "2025-02-14"
+    assert [a.article_id for a in articles] == ["finnhub:9001", "finnhub:9004"]
+    assert all(a.source == "finnhub" and a.symbols == ["GOOGL"] for a in articles)
+    assert 2.0 in sleeps  # Retry-After
+    assert 1.25 in sleeps  # Pacing
+
+
+@respx.mock
+def test_sec_edgar_provider_cik_form4_xml_8k_and_pit_timestamps(tmp_path) -> None:
+    from agy_trader.data.sec_edgar import SecEdgarProvider
+
+    with pytest.raises(ValueError, match="user_agent"):
+        SecEdgarProvider(user_agent="   ")
+
+    tickers_url = "https://www.sec.gov/files/company_tickers.json"
+    sub_base = "https://data.sec.gov/submissions"
+    arch_base = "https://www.sec.gov/Archives/edgar/data"
+
+    respx.get(tickers_url).mock(
+        return_value=httpx.Response(
+            200,
+            json={"0": {"cik_str": 320193, "ticker": "AAPL", "title": "Apple Inc."}},
+        )
+    )
+    respx.get(f"{sub_base}/CIK0000320193.json").mock(
+        side_effect=[
+            httpx.Response(429, headers={"Retry-After": "1"}),
+            httpx.Response(
+                200,
+                json={
+                    "cik": "0000320193",
+                    "filings": {
+                        "recent": {
+                            "accessionNumber": [
+                                "0000320193-25-000010",
+                                "0000320193-25-000011",
+                                "0000320193-25-000012",
+                                "0000320193-25-000013",
+                            ],
+                            "filingDate": [
+                                "2025-03-01",
+                                "2025-03-05",
+                                "2025-03-06",
+                                "2025-03-10",
+                            ],
+                            "acceptanceDateTime": [
+                                "2025-03-01T21:15:30.000Z",
+                                "",  # missing -> conservative 21:00 UTC fallback
+                                "2025-03-06T14:00:00.000Z",
+                                "2025-03-10T18:00:00.000Z",
+                            ],
+                            "form": ["4", "8-K", "4", "4"],
+                            "primaryDocument": [
+                                "xslF345X05/form4_buy.xml",
+                                "f8k.htm",
+                                "xslF345X05/form4_bad.xml",
+                                "form4_non_officer.xml",
+                            ],
+                            "items": [[], ["4.02", "9.01"], [], []],
+                        },
+                        "files": [
+                            {
+                                "name": "CIK0000320193-submissions-001.json",
+                                "filingFrom": "2024-01-01",
+                                "filingTo": "2025-02-28",
+                            },
+                            {
+                                "name": "CIK0000320193-submissions-old.json",
+                                "filingFrom": "2010-01-01",
+                                "filingTo": "2015-12-31",
+                            },
+                        ],
+                    },
+                },
+            ),
+        ]
+    )
+    respx.get(f"{sub_base}/CIK0000320193-submissions-001.json").mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "accessionNumber": ["0000320193-25-000001"],
+                "filingDate": ["2025-02-15"],
+                "acceptanceDateTime": ["2025-02-15T16:30:00.000Z"],
+                "form": ["8-K"],
+                "primaryDocument": ["old8k.htm"],
+                "items": ["2.02, 9.01"],
+            },
+        )
+    )
+
+    form4_buy_xml = """<?xml version="1.0"?>
+    <ownershipDocument>
+      <reportingOwner>
+        <reportingOwnerId><rptOwnerCik>0001214156</rptOwnerCik><rptOwnerName>Cook Tim</rptOwnerName></reportingOwnerId>
+        <reportingOwnerRelationship><isDirector>1</isDirector><isOfficer>1</isOfficer></reportingOwnerRelationship>
+      </reportingOwner>
+      <nonDerivativeTable>
+        <nonDerivativeTransaction>
+          <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+          <transactionAmounts>
+            <transactionShares><value>1000</value></transactionShares>
+            <transactionPricePerShare><value>200.0</value></transactionPricePerShare>
+          </transactionAmounts>
+        </nonDerivativeTransaction>
+        <nonDerivativeTransaction>
+          <transactionCoding><transactionCode>S</transactionCode></transactionCoding>
+          <transactionAmounts>
+            <transactionShares><value>200</value></transactionShares>
+            <transactionPricePerShare><value>210.0</value></transactionPricePerShare>
+          </transactionAmounts>
+        </nonDerivativeTransaction>
+        <nonDerivativeTransaction>
+          <transactionCoding><transactionCode>A</transactionCode></transactionCoding>
+          <transactionAmounts>
+            <transactionShares><value>5000</value></transactionShares>
+            <transactionPricePerShare><value>0</value></transactionPricePerShare>
+          </transactionAmounts>
+        </nonDerivativeTransaction>
+      </nonDerivativeTable>
+    </ownershipDocument>"""
+
+    form4_non_officer_xml = """<?xml version="1.0"?>
+    <ownershipDocument>
+      <reportingOwner>
+        <reportingOwnerId><rptOwnerCik>0009999999</rptOwnerCik></reportingOwnerId>
+        <reportingOwnerRelationship><isDirector>0</isDirector><isOfficer>0</isOfficer></reportingOwnerRelationship>
+      </reportingOwner>
+      <nonDerivativeTable>
+        <nonDerivativeTransaction>
+          <transactionCoding><transactionCode>P</transactionCode></transactionCoding>
+          <transactionAmounts>
+            <transactionShares><value>9999</value></transactionShares>
+            <transactionPricePerShare><value>200.0</value></transactionPricePerShare>
+          </transactionAmounts>
+        </nonDerivativeTransaction>
+      </nonDerivativeTable>
+    </ownershipDocument>"""
+
+    # Note: XSLT prefix xslF345X05/ must be stripped!
+    respx.get(f"{arch_base}/320193/000032019325000010/form4_buy.xml").mock(
+        return_value=httpx.Response(200, text=form4_buy_xml)
+    )
+    respx.get(f"{arch_base}/320193/000032019325000012/form4_bad.xml").mock(
+        return_value=httpx.Response(200, text="<not-valid-xml")
+    )
+    respx.get(f"{arch_base}/320193/000032019325000013/form4_non_officer.xml").mock(
+        return_value=httpx.Response(200, text=form4_non_officer_xml)
+    )
+
+    sleeps: list[float] = []
+    cache_dir = tmp_path / "sec_cache"
+    provider = SecEdgarProvider(
+        user_agent="agy-trader test@example.com",
+        cache_dir=cache_dir,
+        min_interval_seconds=0.13,
+        sleep_fn=sleeps.append,
+        now_fn=lambda: 500.0,
+    )
+    events = provider.fetch_filings(
+        ["AAPL", "SPY"],
+        start=datetime(2025, 2, 1, 0, 0, tzinfo=UTC),
+        end=datetime(2025, 3, 20, 0, 0, tzinfo=UTC),
+    )
+
+    assert (cache_dir / "company_tickers.json").exists()
+    assert 1.0 in sleeps  # Retry-After
+    assert 0.13 in sleeps  # Rate pacing
+
+    by_acc = {ev.accession_number: ev for ev in events}
+    # Malformed XML skipped; 4 valid events remain (2x 8-K, 2x Form 4)
+    assert set(by_acc.keys()) == {
+        "0000320193-25-000001",
+        "0000320193-25-000010",
+        "0000320193-25-000011",
+        "0000320193-25-000013",
+    }
+    assert by_acc["0000320193-25-000001"].items == ["2.02", "9.01"]
+    assert by_acc["0000320193-25-000011"].items == ["4.02", "9.01"]
+    # Conservative 22:05 ET fallback (2025-03-05 EST -> 2025-03-06T03:05:00Z) when acceptanceDateTime is missing
+    assert by_acc["0000320193-25-000011"].accepted_at == datetime(2025, 3, 6, 3, 5, tzinfo=UTC)
+
+    f4_buy = by_acc["0000320193-25-000010"]
+    # 1000*200 - 200*210 = 200,000 - 42,000 = 158,000 (ignores 'A' grant)
+    assert f4_buy.net_insider_buy_usd == pytest.approx(158_000.0)
+    assert f4_buy.insider_buyer_count == 1
+    assert f4_buy.insider_seller_count == 1
+
+    f4_non_off = by_acc["0000320193-25-000013"]
+    assert f4_non_off.net_insider_buy_usd == 0.0
+    assert f4_non_off.insider_buyer_count == 0
+    assert f4_non_off.insider_seller_count == 0
+
+
+def test_state_db_sec_filings_and_get_all_scored_news_filters(tmp_path) -> None:
+    from agy_trader.core.models import SecFilingEvent
+
+    db = StateDB(tmp_path / "state.db")
+    t1 = datetime(2025, 3, 1, 15, 0, tzinfo=UTC)
+    t2 = datetime(2025, 3, 2, 21, 0, tzinfo=UTC)
+
+    events = [
+        SecFilingEvent(
+            accession_number="acc-1",
+            symbol="aapl",
+            cik="0000320193",
+            form_type="4",
+            accepted_at=t1,
+            net_insider_buy_usd=250_000.0,
+            insider_buyer_count=2,
+            insider_seller_count=0,
+        ),
+        SecFilingEvent(
+            accession_number="acc-2",
+            symbol="AAPL",
+            cik="0000320193",
+            form_type="8-K",
+            accepted_at=t2,
+            items=["4.02", "9.01"],
+        ),
+    ]
+    assert db.upsert_sec_filings(events) == 2
+    assert db.upsert_sec_filings(events) == 2  # idempotent upsert
+
+    loaded = db.get_sec_filings_map()
+    assert list(loaded.keys()) == ["AAPL"]
+    assert [e.accession_number for e in loaded["AAPL"]] == ["acc-1", "acc-2"]
+    assert loaded["AAPL"][1].items == ["4.02", "9.01"]
+    assert db.get_summary_counts()["sec_filings"] == 2
+
+    # News filtering by scorer_model & sources
+    db.upsert_news_articles(
+        [
+            NewsArticle(
+                article_id="n-bz-lex",
+                published_at=t1,
+                headline="AAPL launches product",
+                source="Benzinga",
+                symbols=["AAPL"],
+                sentiment_score=0.6,
+                sentiment_label="positive",
+                confidence=0.9,
+                scorer_model="lexicon-v1",
+            ),
+            NewsArticle(
+                article_id="n-fh-fb",
+                published_at=t2,
+                headline="AAPL beats expectations",
+                source="finnhub",
+                symbols=["AAPL"],
+                sentiment_score=0.8,
+                sentiment_label="positive",
+                confidence=0.95,
+                scorer_model="ProsusAI/finbert",
+            ),
+            NewsArticle(
+                article_id="n-rss-lex",
+                published_at=t2,
+                headline="Fed FOMC minutes released",
+                source="rss:fed_fomc",
+                symbols=["SPY"],
+                sentiment_score=-0.2,
+                sentiment_label="negative",
+                confidence=0.8,
+                scorer_model="lexicon-v1",
+            ),
+        ]
+    )
+
+    assert db.get_all_scored_news(sources=[]) == []
+    # Forward-only rss:fed_fomc excluded by default even with sources=None
+    default_scored = db.get_all_scored_news()
+    assert [a.article_id for a in default_scored] == ["n-bz-lex", "n-fh-fb"]
+    # Explicit include_forward_only=True returns all scored rows
+    with_fwd = db.get_all_scored_news(include_forward_only=True)
+    assert [a.article_id for a in with_fwd] == ["n-bz-lex", "n-fh-fb", "n-rss-lex"]
+    bz_fh = db.get_all_scored_news(sources=["BENZINGA", "finnhub"])
+    assert [a.article_id for a in bz_fh] == ["n-bz-lex", "n-fh-fb"]
+    only_lex_bz = db.get_all_scored_news(scorer_model="lexicon-v1", sources=["benzinga"])
+    assert [a.article_id for a in only_lex_bz] == ["n-bz-lex"]
+
+    # Cross-contamination guard: forward-only yfinance_news & model-eligible finnhub
+    # sharing the exact same headline & date do NOT collide or leak symbols
+    dup_ts = datetime(2025, 4, 10, 15, 0, tzinfo=UTC)
+    yf_art = NewsArticle(
+        article_id="yf:dup-1",
+        published_at=dup_ts,
+        headline="AAPL announces spring hardware event",
+        source="yfinance_news",
+        symbols=["SPY"],
+        sentiment_score=-0.5,
+        sentiment_label="negative",
+        confidence=0.9,
+        scorer_model="lexicon-v1",
+    )
+    fh_art = NewsArticle(
+        article_id="finnhub:dup-1",
+        published_at=dup_ts,
+        headline="AAPL announces spring hardware event",
+        source="finnhub",
+        symbols=["AAPL"],
+        sentiment_score=0.5,
+        sentiment_label="positive",
+        confidence=0.9,
+        scorer_model="lexicon-v1",
+    )
+    assert db.upsert_news_articles([yf_art, fh_art]) == 2
+    fh_rows = db.get_all_scored_news(sources=["finnhub"])
+    fh_dup = next(a for a in fh_rows if a.article_id == "finnhub:dup-1")
+    assert fh_dup.symbols == ["AAPL"]
+    assert "SPY" not in fh_dup.symbols
+    assert fh_dup.headline_hash == fh_art.headline_hash
+
+
+def test_sec_edgar_acceptance_dt_edt_and_winter_est_fallback() -> None:
+    from agy_trader.data.sec_edgar import _parse_sec_acceptance_dt
+
+    # HIGH #1: 14-digit & naive ISO SEC acceptanceDateTime parsed as America/New_York -> UTC
+    dt_14 = _parse_sec_acceptance_dt("20240501161500", "2024-05-01")
+    assert dt_14 == datetime(2024, 5, 1, 20, 15, tzinfo=UTC)
+    assert dt_14 > datetime(2024, 5, 1, 20, 0, tzinfo=UTC)  # strictly after 16:00 EDT
+
+    dt_naive_iso = _parse_sec_acceptance_dt("2024-05-01T16:15:00", "2024-05-01")
+    assert dt_naive_iso == datetime(2024, 5, 1, 20, 15, tzinfo=UTC)
+
+    # HIGH #2: Winter EST fallback on 2024-01-10 -> 22:05 EST = 2024-01-11T03:05:00Z > 16:00 EST (21:00Z)
+    dt_winter_fb = _parse_sec_acceptance_dt("", "2024-01-10")
+    assert dt_winter_fb == datetime(2024, 1, 11, 3, 5, tzinfo=UTC)
+    assert dt_winter_fb > datetime(2024, 1, 10, 21, 0, tzinfo=UTC)
+
+
+@respx.mock
+def test_feeds_collector_rss_and_yfinance(monkeypatch: pytest.MonkeyPatch) -> None:
+    from agy_trader.data.feeds import (
+        RssFeedSpec,
+        collect_official_rss_feeds,
+        collect_yfinance_news,
+    )
+
+    rss_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0">
+      <channel>
+        <item>
+          <title>Federal Reserve issues FOMC statement</title>
+          <description>&lt;p&gt;Rates held steady.&lt;/p&gt;</description>
+          <pubDate>Wed, 07 May 2025 18:00:00 GMT</pubDate>
+          <guid>https://www.federalreserve.gov/newsevents/pressreleases/monetary20250507a.htm</guid>
+        </item>
+      </channel>
+    </rss>"""
+
+    atom_xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry>
+        <id>urn:eia:12345</id>
+        <title>US crude inventories decline</title>
+        <summary>Weekly petroleum report</summary>
+        <published>2025-05-07T14:30:00Z</published>
+      </entry>
+    </feed>"""
+
+    specs = (
+        RssFeedSpec("Fed", "https://example.com/fed.xml", "rss:fed_fomc", ("SPY", "TLT")),
+        RssFeedSpec("EIA", "https://example.com/eia.xml", "rss:eia", ("XLE",)),
+        RssFeedSpec("FDA", "https://example.com/fda.xml", "rss:fda", ("XLV",)),
+    )
+    respx.get("https://example.com/fed.xml").mock(return_value=httpx.Response(200, text=rss_xml))
+    respx.get("https://example.com/eia.xml").mock(return_value=httpx.Response(200, text=atom_xml))
+    respx.get("https://example.com/fda.xml").mock(return_value=httpx.Response(500))
+
+    rss_arts = collect_official_rss_feeds(feeds=specs)
+    assert len(rss_arts) == 2
+    assert {a.source for a in rss_arts} == {"rss:fed_fomc", "rss:eia"}
+    fed_art = next(a for a in rss_arts if a.source == "rss:fed_fomc")
+    assert fed_art.summary == "Rates held steady."
+    assert fed_art.published_at == datetime(2025, 5, 7, 18, 0, tzinfo=UTC)
+    assert fed_art.symbols == ["SPY", "TLT"]
+
+    class _FakeNewsTicker:
+        def __init__(self, sym: str) -> None:
+            self.sym = sym
+
+        @property
+        def news(self) -> list[dict[str, object]]:
+            if self.sym == "FAIL":
+                raise RuntimeError("boom")
+            if self.sym == "GOOG":
+                return [
+                    {
+                        "id": "new-schema-1",
+                        "content": {
+                            "title": "Alphabet expands AI infrastructure",
+                            "summary": "Cloud capex update",
+                            "pubDate": "2025-05-08T13:00:00Z",
+                        },
+                    }
+                ]
+            return [
+                {
+                    "uuid": "legacy-1",
+                    "title": "SPY hits new monthly volume high",
+                    "providerPublishTime": int(datetime(2025, 5, 8, 12, 0, tzinfo=UTC).timestamp()),
+                },
+                {
+                    "uuid": "noise-yf",
+                    "title": "Form 13F: Institution Discloses Stake in SPY",
+                    "providerPublishTime": int(datetime(2025, 5, 8, 12, 5, tzinfo=UTC).timestamp()),
+                },
+            ]
+
+    monkeypatch.setattr("agy_trader.data.feeds.yf.Ticker", _FakeNewsTicker)
+    yf_arts = collect_yfinance_news(["SPY", "GOOG", "FAIL"], max_per_symbol=10)
+    assert [a.article_id for a in yf_arts] == ["yf:legacy-1", "yf:new-schema-1"]
+    assert all(a.source == "yfinance_news" for a in yf_arts)
+    assert yf_arts[1].symbols == ["GOOGL"]
+
+

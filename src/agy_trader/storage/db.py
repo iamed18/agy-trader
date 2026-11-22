@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 from collections import defaultdict
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -16,8 +17,10 @@ from agy_trader.core.models import (
     LLMUsageRecord,
     MacroPoint,
     NewsArticle,
+    SecFilingEvent,
     ensure_utc,
 )
+from agy_trader.data.news_filters import is_forward_only_source
 
 _VALID_SENTIMENT_LABELS = frozenset({"positive", "negative", "neutral"})
 
@@ -95,6 +98,23 @@ class StateDB:
                         updated_at TEXT NOT NULL,
                         PRIMARY KEY (symbol, earnings_date)
                     );
+
+                    CREATE TABLE IF NOT EXISTS sec_filings (
+                        accession_number TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        cik TEXT NOT NULL,
+                        form_type TEXT NOT NULL,
+                        accepted_at TEXT NOT NULL,
+                        items_json TEXT NOT NULL,
+                        net_insider_buy_usd REAL NOT NULL,
+                        insider_buyer_count INTEGER NOT NULL,
+                        insider_seller_count INTEGER NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (accession_number, symbol)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_sec_filings_symbol_acc
+                        ON sec_filings (symbol, accepted_at);
 
                     CREATE TABLE IF NOT EXISTS macro_snapshots (
                         series_id TEXT NOT NULL,
@@ -198,6 +218,8 @@ class StateDB:
         articles: list[NewsArticle] = []
         for row in rows:
             aid = str(row["article_id"])
+            raw_hash = str(row["headline_hash"])
+            clean_hash = raw_hash.removeprefix("fwd:")
             articles.append(
                 NewsArticle(
                     article_id=aid,
@@ -206,7 +228,7 @@ class StateDB:
                     summary=str(row["summary"]),
                     source=str(row["source"]),
                     symbols=symbols_map.get(aid, []),
-                    headline_hash=str(row["headline_hash"]),
+                    headline_hash=clean_hash,
                     sentiment_score=(
                         float(row["sentiment_score"])
                         if row["sentiment_score"] is not None
@@ -237,6 +259,11 @@ class StateDB:
             for article in articles:
                 pub_iso = _dt_to_iso(article.published_at)
                 scored_iso = now_iso if article.sentiment_score is not None else None
+                db_hash = (
+                    f"fwd:{article.headline_hash}"
+                    if is_forward_only_source(article.source)
+                    else article.headline_hash
+                )
                 cur = conn.execute(
                     """
                         INSERT OR IGNORE INTO news_articles (
@@ -251,7 +278,7 @@ class StateDB:
                         article.headline,
                         article.summary,
                         article.source,
-                        article.headline_hash,
+                        db_hash,
                         article.sentiment_score,
                         article.sentiment_label,
                         article.confidence,
@@ -272,7 +299,7 @@ class StateDB:
                         WHERE article_id = ? OR headline_hash = ?
                         LIMIT 1
                         """,
-                        (article.article_id, article.headline_hash),
+                        (article.article_id, db_hash),
                     ).fetchone()
                     if row is None:
                         continue
@@ -383,15 +410,32 @@ class StateDB:
         self,
         start_utc: datetime | None = None,
         end_utc: datetime | None = None,
+        scorer_model: str | None = None,
+        sources: Sequence[str] | None = None,
+        include_forward_only: bool = False,
     ) -> list[NewsArticle]:
         clauses = ["sentiment_score IS NOT NULL"]
         params: list[Any] = []
+        if not include_forward_only:
+            clauses.append(
+                "(LOWER(TRIM(source)) != 'yfinance_news' AND LOWER(TRIM(source)) NOT LIKE 'rss:%')"
+            )
         if start_utc is not None:
             clauses.append("published_at >= ?")
             params.append(_dt_to_iso(start_utc))
         if end_utc is not None:
             clauses.append("published_at <= ?")
             params.append(_dt_to_iso(end_utc))
+        if scorer_model is not None:
+            clauses.append("scorer_model = ?")
+            params.append(scorer_model)
+        if sources is not None:
+            clean_sources = [s.strip().lower() for s in sources if s.strip()]
+            if not clean_sources:
+                return []
+            placeholders = ",".join("?" for _ in clean_sources)
+            clauses.append(f"LOWER(source) IN ({placeholders})")
+            params.extend(clean_sources)
         where_sql = " AND ".join(clauses)
         with closing(self._connect()) as conn:
             rows = conn.execute(
@@ -448,6 +492,78 @@ class StateDB:
             ).fetchall()
         for row in rows:
             result[str(row["symbol"])].append(date.fromisoformat(str(row["earnings_date"])))
+        return dict(result)
+
+    def upsert_sec_filings(self, events: list[SecFilingEvent]) -> int:
+        if not events:
+            return 0
+        now_iso = _dt_to_iso(datetime.now(UTC))
+        deduped: dict[tuple[str, str], SecFilingEvent] = {
+            (ev.accession_number, ev.symbol): ev for ev in events
+        }
+        with closing(self._connect()) as conn, conn:
+            conn.executemany(
+                """
+                INSERT INTO sec_filings (
+                    accession_number, symbol, cik, form_type, accepted_at,
+                    items_json, net_insider_buy_usd, insider_buyer_count,
+                    insider_seller_count, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(accession_number, symbol) DO UPDATE SET
+                    cik = excluded.cik,
+                    form_type = excluded.form_type,
+                    accepted_at = excluded.accepted_at,
+                    items_json = excluded.items_json,
+                    net_insider_buy_usd = excluded.net_insider_buy_usd,
+                    insider_buyer_count = excluded.insider_buyer_count,
+                    insider_seller_count = excluded.insider_seller_count,
+                    updated_at = excluded.updated_at
+                """,
+                [
+                    (
+                        ev.accession_number,
+                        ev.symbol,
+                        ev.cik,
+                        ev.form_type,
+                        _dt_to_iso(ev.accepted_at),
+                        json.dumps(ev.items),
+                        float(ev.net_insider_buy_usd),
+                        int(ev.insider_buyer_count),
+                        int(ev.insider_seller_count),
+                        now_iso,
+                    )
+                    for ev in deduped.values()
+                ],
+            )
+        return len(deduped)
+
+    def get_sec_filings_map(self) -> dict[str, list[SecFilingEvent]]:
+        result: dict[str, list[SecFilingEvent]] = defaultdict(list)
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT accession_number, symbol, cik, form_type, accepted_at,
+                       items_json, net_insider_buy_usd, insider_buyer_count,
+                       insider_seller_count
+                FROM sec_filings
+                ORDER BY symbol ASC, accepted_at ASC
+                """
+            ).fetchall()
+        for row in rows:
+            raw_form = str(row["form_type"])
+            form_type: Literal["4", "8-K"] = "4" if raw_form == "4" else "8-K"
+            ev = SecFilingEvent(
+                accession_number=str(row["accession_number"]),
+                symbol=str(row["symbol"]),
+                cik=str(row["cik"]),
+                form_type=form_type,
+                accepted_at=_iso_to_dt(str(row["accepted_at"])),
+                items=json.loads(str(row["items_json"])),
+                net_insider_buy_usd=float(row["net_insider_buy_usd"]),
+                insider_buyer_count=int(row["insider_buyer_count"]),
+                insider_seller_count=int(row["insider_seller_count"]),
+            )
+            result[ev.symbol].append(ev)
         return dict(result)
 
     def upsert_macro(self, points: list[MacroPoint]) -> int:
@@ -825,12 +941,14 @@ class StateDB:
                 "SELECT COUNT(*) FROM news_articles WHERE sentiment_score IS NOT NULL"
             ).fetchone()[0]
             earnings_events = conn.execute("SELECT COUNT(*) FROM earnings_calendar").fetchone()[0]
+            sec_filings = conn.execute("SELECT COUNT(*) FROM sec_filings").fetchone()[0]
             macro_points = conn.execute("SELECT COUNT(*) FROM macro_snapshots").fetchone()[0]
             backtest_runs = conn.execute("SELECT COUNT(*) FROM backtest_runs").fetchone()[0]
         return {
             "news_articles": int(news_articles),
             "scored_news": int(scored_news),
             "earnings_events": int(earnings_events),
+            "sec_filings": int(sec_filings),
             "macro_points": int(macro_points),
             "backtest_runs": int(backtest_runs),
         }

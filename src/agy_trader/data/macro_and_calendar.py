@@ -14,7 +14,7 @@ from agy_trader.data.providers import EarningsProvider, MacroProvider
 logger = logging.getLogger(__name__)
 
 FRED_OBSERVATIONS_URL = "https://api.stlouisfed.org/fred/series/observations"
-FRED_SERIES_IDS: tuple[str, ...] = ("T10Y2Y", "BAMLH0A0HYM2", "VIXCLS")
+FRED_SERIES_IDS: tuple[str, ...] = ("T10Y2Y", "BAMLH0A0HYM2", "VIXCLS", "DGS3MO")
 
 
 class FREDMacroProvider(MacroProvider):

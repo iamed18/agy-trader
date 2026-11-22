@@ -12,6 +12,10 @@ strategy:
   w_trend: 0.80
   w_pullback: 0.00
   w_news_sentiment: 0.20
+  model_news_sources:
+    - "benzinga"
+    - "fiscal.ai"
+    - "finnhub"
   news_half_life_hours: 48.0
   news_lookback_hours: 120.0
   top_k_long: 6
@@ -22,13 +26,14 @@ strategy:
   rebalance_every_n_days: 1
   hold_rank_buffer: 5
   abs_momentum_filter: true
+  use_rf_hurdle_for_abs_momentum: true
   short_only_in_bear_regime: true
   max_pair_corr_60d: 0.70
   corr_penalty_eta: 0.30
   score_tilt_power: 0.15
   waterfill_weights: true
-  exempt_safe_havens_from_macro_scale: true
-  safe_haven_rotation_fraction: 0.85
+  exempt_safe_havens_from_macro_scale: false
+  safe_haven_rotation_fraction: 0.0
   spy_sma200_defensive_scale: 0.60
   spy_ema50_dual_scale: 0.75
   spy_vol_surge_scale: 0.65
@@ -59,6 +64,10 @@ backtest:
   equity_slippage_bps: 10.0
   short_borrow_apr: 0.015
   sec_sell_fee_bps: 0.28
+  risk_free_rate_apr: 0.045
+  cash_yield_apr: 0.045
+  use_fred_tbill_yield: true
+  execution_timing: "same_close"
   benchmark_symbol: "SPY"
 
 llm_quota:
