@@ -59,7 +59,6 @@ def render_launchd_plist(
     """Render a macOS pre-login LaunchDaemon XML plist for a ServiceSpec."""
     root = Path(repo_root)
     exe = executable_path or (root / ".venv" / "bin" / "agy-ops")
-    logs = log_dir or DEFAULT_LAUNCHD_LOG_DIR
     program_args = [str(exe), "daemon", spec.daemon_arg, *spec.extra_args]
     env_vars = {
         "HOME": f"/Users/{username}",
@@ -71,7 +70,7 @@ def render_launchd_plist(
         "AGY_DATA_DIR": str(root / "data"),
         "AGY_CONFIG_DIR": str(root / "config"),
     }
-    payload = {
+    payload: dict[str, object] = {
         "Label": spec.label,
         "UserName": username,
         "GroupName": "staff",
@@ -81,9 +80,11 @@ def render_launchd_plist(
         "RunAtLoad": True,
         "KeepAlive": True,
         "ThrottleInterval": int(spec.throttle_interval),
-        "StandardOutPath": str(logs / f"{spec.name}.stdout.log"),
-        "StandardErrorPath": str(logs / f"{spec.name}.stderr.log"),
     }
+    if log_dir is not None:
+        logs = Path(log_dir)
+        payload["StandardOutPath"] = str(logs / f"{spec.name}.stdout.log")
+        payload["StandardErrorPath"] = str(logs / f"{spec.name}.stderr.log")
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True).decode("utf-8")
 
 

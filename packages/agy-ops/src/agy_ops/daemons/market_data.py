@@ -17,7 +17,7 @@ from alpaca.data.requests import StockSnapshotRequest
 
 from agy_trader.core.calendar import is_nyse_trading_day
 from agy_trader.core.config import EnvSettings, load_app_config, load_universe
-from agy_trader.core.models import ensure_utc
+from agy_trader.core.models import AssetType, ensure_utc
 from agy_trader.data.alpaca_market import AlpacaMarketDataProvider
 from agy_trader.data.macro_and_calendar import (
     FREDMacroProvider,
@@ -133,6 +133,11 @@ class MarketDataDaemon(DaemonRunner):
         return list(
             dict.fromkeys([u.symbol for u in universe] + [app_cfg.backtest.benchmark_symbol])
         )
+
+    def _equity_symbols(self) -> list[str]:
+        universe = load_universe(self.config_dir)
+        eq_syms = [u.symbol for u in universe if u.asset_type == AssetType.equity]
+        return eq_syms if eq_syms else [u.symbol for u in universe]
 
     def _get_data_client(self) -> StockHistoricalDataClient | None:
         if self._snapshot_client is not None:
@@ -289,6 +294,7 @@ class MarketDataDaemon(DaemonRunner):
         sec_saved = 0
         start_date = (now_utc - timedelta(days=lookback_days)).date()
         end_date = now_utc.date()
+        equity_syms = self._equity_symbols()
 
         with httpx.Client(timeout=30.0) as http_client:
             # 1. FRED Macro (T10Y2Y, BAMLH0A0HYM2, VIXCLS, DGS3MO)
@@ -305,15 +311,15 @@ class MarketDataDaemon(DaemonRunner):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("macro_refresh_failed", error=str(exc))
 
-            # 2. Earnings calendar
+            # 2. Earnings calendar (equities only — ETFs do not report corporate earnings)
             try:
                 earn_prov = self._earnings_provider or YFinanceEarningsProvider()
-                events = earn_prov.fetch_earnings(symbols)
+                events = earn_prov.fetch_earnings(equity_syms)
                 earnings_saved = self.db.upsert_earnings(events)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("earnings_refresh_failed", error=str(exc))
 
-            # 3. SEC EDGAR Form 4 / 8-K
+            # 3. SEC EDGAR Form 4 / 8-K (equities only)
             try:
                 sec_prov = self._sec_provider
                 if sec_prov is None and self.settings.sec_edgar_user_agent.strip():
@@ -324,7 +330,7 @@ class MarketDataDaemon(DaemonRunner):
                     )
                 if sec_prov is not None:
                     filings = sec_prov.fetch_filings(
-                        symbols=symbols,
+                        symbols=equity_syms,
                         start=now_utc - timedelta(days=lookback_days),
                         end=now_utc,
                     )
@@ -370,6 +376,7 @@ class MarketDataDaemon(DaemonRunner):
     def startup(self, now_utc: datetime | None = None) -> None:
         now = ensure_utc(now_utc) if now_utc is not None else datetime.now(UTC)
         self.verify_wal_integrity(now_utc=now)
+        self.write_heartbeat("starting", {"stage": "cold_boot"}, now_utc=now)
         self._boot_network_ok = wait_for_network(
             self._check_network,
             max_wait_seconds=self.max_network_wait_seconds,
@@ -392,7 +399,15 @@ class MarketDataDaemon(DaemonRunner):
                     {"kind": "boot_gapfill_error", "error": str(exc)},
                     timestamp=now,
                 )
-            aux_summary = self._refresh_auxiliary_data(symbols, now, lookback_days=365)
+            counts = self.db.get_summary_counts()
+            boot_aux_days = (
+                14
+                if (counts.get("sec_filings", 0) > 0 and counts.get("macro_points", 0) > 0)
+                else 365
+            )
+            aux_summary = self._refresh_auxiliary_data(
+                symbols, now, lookback_days=boot_aux_days
+            )
 
         boot_details = {
             "network_ok": self._boot_network_ok,

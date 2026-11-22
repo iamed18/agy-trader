@@ -72,8 +72,8 @@ def test_real_repo_plists_and_newsyslog_use_root_var_log_dir() -> None:
         assert reparsed["GroupName"] == "staff"
         assert reparsed["ProgramArguments"][0] == daemonctl.VENV_AGY_OPS
         assert reparsed["ProgramArguments"][1:3] == ["daemon", service]
-        assert reparsed["StandardOutPath"] == f"/private/var/log/agy-trader/{service}.stdout.log"
-        assert reparsed["StandardErrorPath"] == f"/private/var/log/agy-trader/{service}.stderr.log"
+        assert "StandardOutPath" not in reparsed
+        assert "StandardErrorPath" not in reparsed
 
     newsyslog_lines = [
         line.strip()

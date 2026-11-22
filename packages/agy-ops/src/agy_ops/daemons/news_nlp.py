@@ -140,6 +140,7 @@ class NewsNlpDaemon(DaemonRunner):
         now = ensure_utc(now_utc) if now_utc is not None else datetime.now(UTC)
         universe = load_universe(self.config_dir)
         all_symbols = [u.symbol for u in universe]
+        equity_symbols = [u.symbol for u in universe if u.asset_type == AssetType.equity]
         etf_symbols = [u.symbol for u in universe if u.asset_type == AssetType.etf]
 
         def _source_start(sources: list[str], *, max_days: int, default_days: int) -> datetime:
@@ -198,7 +199,7 @@ class NewsNlpDaemon(DaemonRunner):
                     )
                 if fh_prov is not None:
                     fh_arts = fh_prov.fetch_news(
-                        symbols=all_symbols,
+                        symbols=equity_symbols or all_symbols,
                         start=finnhub_start_utc,
                         end=now,
                     )
