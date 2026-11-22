@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -34,7 +35,15 @@ from agy_ops.reporting.digests import (
     build_readiness_report,
 )
 from agy_trader.core.config import EnvSettings
+from agy_trader.core.control_plane import ControlPlane, ControlPlaneError
 from agy_trader.storage.db import StateDB
+
+DAEMONCTL_PATH = "/usr/local/sbin/agy-daemonctl"
+INSTALL_LAUNCHDAEMONS_CMD = (
+    "sudo /path/to/agy-trader/deploy/macos/install_launchdaemons.sh"
+)
+SERVICE_TARGETS = ("market-data", "news-nlp", "trader", "dashboard", "all")
+CONTROL_PLANE_RESTART_SERVICES = ("market-data", "news-nlp", "trader")
 
 app = typer.Typer(
     name="agy-ops",
@@ -46,7 +55,13 @@ notify_app = typer.Typer(
     help="Send operational Discord notifications to agy-trader",
     no_args_is_help=True,
 )
+service_app = typer.Typer(
+    name="service",
+    help="Manage agy-trader macOS LaunchDaemons without interactive sudo prompts",
+    no_args_is_help=True,
+)
 app.add_typer(notify_app, name="notify")
+app.add_typer(service_app, name="service")
 console = Console()
 err_console = Console(stderr=True)
 
@@ -478,6 +493,245 @@ def notify_test_cmd(
     prefix = "[DRY RUN] " if dry_run else ""
     action = "prepared" if dry_run else "sent"
     typer.echo(f"{prefix}Test notification {action} for agy-trader")
+
+
+def _service_fail(
+    action: str,
+    target: str,
+    message: str,
+    *,
+    json_output: bool,
+    exit_code: int = 1,
+) -> None:
+    if json_output:
+        _emit_json({"action": action, "target": target, "error": message})
+    else:
+        err_console.print(f"[red]Error:[/red] {message}")
+    raise typer.Exit(code=exit_code)
+
+
+def _validate_service_target(action: str, target: str, *, json_output: bool) -> str:
+    cleaned = target.strip().lower()
+    if cleaned not in SERVICE_TARGETS:
+        _service_fail(
+            action,
+            target,
+            f"Invalid service target {target!r}; expected one of {', '.join(SERVICE_TARGETS)}",
+            json_output=json_output,
+        )
+    return cleaned
+
+
+def _invoke_daemonctl(action: str, target: str, *, json_output: bool) -> dict[str, Any]:
+    cmd = ["/usr/bin/sudo", "-n", DAEMONCTL_PATH, action, target, "--json"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except OSError as exc:
+        _service_fail(
+            action,
+            target,
+            f"Failed to execute /usr/bin/sudo {DAEMONCTL_PATH}: {exc}. Run once: {INSTALL_LAUNCHDAEMONS_CMD}",
+            json_output=json_output,
+        )
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    if proc.returncode != 0:
+        combined = f"{proc.stderr}\n{proc.stdout}".lower()
+        needs_install = (not Path(DAEMONCTL_PATH).exists()) or any(
+            marker in combined
+            for marker in (
+                "password is required",
+                "command not found",
+                "no such file",
+                "not allowed to execute",
+                "may not run sudo",
+            )
+        )
+        if needs_install:
+            msg = (
+                f"{DAEMONCTL_PATH} is not installed or passwordless sudo (-n) is not configured. "
+                f"Run once: {INSTALL_LAUNCHDAEMONS_CMD}"
+            )
+        else:
+            msg = ""
+            if proc.stdout.strip():
+                try:
+                    parsed_err = json.loads(proc.stdout)
+                    if isinstance(parsed_err, dict) and parsed_err.get("error"):
+                        msg = str(parsed_err["error"])
+                except json.JSONDecodeError:
+                    pass
+            if not msg:
+                msg = (
+                    proc.stderr.strip()
+                    or proc.stdout.strip()
+                    or f"agy-daemonctl {action} failed with exit code {proc.returncode}"
+                )
+        _service_fail(action, target, msg, json_output=json_output, exit_code=proc.returncode or 1)
+
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        _service_fail(
+            action,
+            target,
+            f"Invalid JSON from agy-daemonctl: {exc}",
+            json_output=json_output,
+        )
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    if not isinstance(payload, dict):
+        _service_fail(
+            action,
+            target,
+            "Unexpected response format from agy-daemonctl",
+            json_output=json_output,
+        )
+    return payload
+
+
+def _render_service_result(payload: dict[str, Any], *, json_output: bool) -> None:
+    if json_output:
+        _emit_json(payload)
+        return
+
+    action = str(payload.get("action", "service"))
+    services = payload.get("services", [])
+    table = Table(title=f"agy-ops service {action}")
+    table.add_column("Service", style="cyan")
+    table.add_column("Loaded")
+    table.add_column("State")
+    table.add_column("PID")
+    table.add_column("Last Exit")
+    table.add_column("Plist Installed")
+    show_outcome = any(isinstance(item, dict) and "outcome" in item for item in services)
+    if show_outcome:
+        table.add_column("Outcome")
+
+    for item in services:
+        if not isinstance(item, dict):
+            continue
+        loaded = bool(item.get("loaded"))
+        loaded_str = "[green]yes[/green]" if loaded else "[yellow]no[/yellow]"
+        pid_str = str(item["pid"]) if item.get("pid") is not None else "-"
+        exit_str = (
+            str(item["last_exit_status"]) if item.get("last_exit_status") is not None else "-"
+        )
+        plist_str = "yes" if item.get("plist_installed") else "no"
+        state_str = str(item.get("state") or ("unloaded" if not loaded else "-"))
+        row = [
+            str(item.get("service", "")),
+            loaded_str,
+            state_str,
+            pid_str,
+            exit_str,
+            plist_str,
+        ]
+        if show_outcome:
+            row.append(str(item.get("outcome", "")))
+        table.add_row(*row)
+    console.print(table)
+
+
+@service_app.command("status")
+def service_status_cmd(
+    target: Annotated[
+        str,
+        typer.Argument(help="Target service: market-data|news-nlp|trader|dashboard|all"),
+    ] = "all",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Inspect macOS LaunchDaemon status for one or all agy-trader services."""
+    resolved = _validate_service_target("status", target, json_output=json_output)
+    payload = _invoke_daemonctl("status", resolved, json_output=json_output)
+    _render_service_result(payload, json_output=json_output)
+
+
+@service_app.command("start")
+def service_start_cmd(
+    target: Annotated[
+        str,
+        typer.Argument(help="Target service: market-data|news-nlp|trader|dashboard|all"),
+    ] = "all",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Start one or all agy-trader macOS LaunchDaemons."""
+    resolved = _validate_service_target("start", target, json_output=json_output)
+    payload = _invoke_daemonctl("start", resolved, json_output=json_output)
+    _render_service_result(payload, json_output=json_output)
+
+
+@service_app.command("stop")
+def service_stop_cmd(
+    target: Annotated[
+        str,
+        typer.Argument(help="Target service: market-data|news-nlp|trader|dashboard|all"),
+    ] = "all",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Stop (bootout) one or all agy-trader macOS LaunchDaemons cleanly."""
+    resolved = _validate_service_target("stop", target, json_output=json_output)
+    payload = _invoke_daemonctl("stop", resolved, json_output=json_output)
+    _render_service_result(payload, json_output=json_output)
+
+
+@service_app.command("restart")
+def service_restart_cmd(
+    ctx: typer.Context,
+    target: Annotated[
+        str,
+        typer.Argument(help="Target service: market-data|news-nlp|trader|dashboard|all"),
+    ] = "all",
+    actor: Annotated[
+        str,
+        typer.Option("--actor", help="Actor identifier (use 'operator' to bypass agent rate limit)"),
+    ] = "ops",
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Audit reason for service restart"),
+    ] = "",
+    data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
+    config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Restart one or all agy-trader macOS LaunchDaemons with ControlPlane rate limiting for non-operators."""
+    resolved = _validate_service_target("restart", target, json_output=json_output)
+    actor_clean = actor.strip()
+    if actor_clean != "operator":
+        if resolved == "all":
+            auth_services: tuple[str, ...] = CONTROL_PLANE_RESTART_SERVICES
+        elif resolved in CONTROL_PLANE_RESTART_SERVICES:
+            auth_services = (resolved,)
+        else:
+            auth_services = ()
+
+        if auth_services:
+            _, resolved_data, _ = _resolve_paths(ctx, data_dir, config_dir)
+            cp = ControlPlane(StateDB(resolved_data / "state.db"))
+            try:
+                for svc in auth_services:
+                    cp.authorize_service_restart(
+                        svc, actor=actor_clean or "ops", reason=reason
+                    )
+            except (ControlPlaneError, ValueError) as exc:
+                _service_fail("restart", resolved, str(exc), json_output=json_output)
+
+    payload = _invoke_daemonctl("restart", resolved, json_output=json_output)
+    _render_service_result(payload, json_output=json_output)
+
+
+@service_app.command("sync-plists")
+def service_sync_plists_cmd(
+    target: Annotated[
+        str,
+        typer.Argument(help="Target service: market-data|news-nlp|trader|dashboard|all"),
+    ] = "all",
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Validate, install, and reload LaunchDaemon plists from deploy/macos."""
+    resolved = _validate_service_target("sync-plists", target, json_output=json_output)
+    payload = _invoke_daemonctl("sync-plists", resolved, json_output=json_output)
+    _render_service_result(payload, json_output=json_output)
 
 
 if __name__ == "__main__":

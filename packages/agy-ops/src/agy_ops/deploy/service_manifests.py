@@ -45,6 +45,9 @@ DEFAULT_SERVICE_SPECS: tuple[ServiceSpec, ...] = (
 )
 
 
+DEFAULT_LAUNCHD_LOG_DIR = Path("/private/var/log/agy-trader")
+
+
 def render_launchd_plist(
     spec: ServiceSpec,
     *,
@@ -56,7 +59,7 @@ def render_launchd_plist(
     """Render a macOS pre-login LaunchDaemon XML plist for a ServiceSpec."""
     root = Path(repo_root)
     exe = executable_path or (root / ".venv" / "bin" / "agy-ops")
-    logs = log_dir or (root / "data" / "logs")
+    logs = log_dir or DEFAULT_LAUNCHD_LOG_DIR
     program_args = [str(exe), "daemon", spec.daemon_arg, *spec.extra_args]
     env_vars = {
         "HOME": f"/Users/{username}",

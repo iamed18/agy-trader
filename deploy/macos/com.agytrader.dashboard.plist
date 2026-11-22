@@ -34,9 +34,9 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/path/to/agy-trader/data/logs/dashboard.stderr.log</string>
+	<string>/private/var/log/agy-trader/dashboard.stderr.log</string>
 	<key>StandardOutPath</key>
-	<string>/path/to/agy-trader/data/logs/dashboard.stdout.log</string>
+	<string>/private/var/log/agy-trader/dashboard.stdout.log</string>
 	<key>ThrottleInterval</key>
 	<integer>15</integer>
 	<key>UserName</key>

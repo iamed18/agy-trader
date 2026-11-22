@@ -711,6 +711,8 @@ def test_service_manifests_launchd_and_systemd(tmp_path: Path) -> None:
         assert parsed["RunAtLoad"] is True
         assert parsed["KeepAlive"] is True
         assert parsed["ThrottleInterval"] == 15
+        assert parsed["StandardOutPath"] == f"/private/var/log/agy-trader/{spec.name}.stdout.log"
+        assert parsed["StandardErrorPath"] == f"/private/var/log/agy-trader/{spec.name}.stderr.log"
         assert "daemon" in parsed["ProgramArguments"]
 
         unit = render_systemd_unit(spec, repo_root=repo_root, username="trader")

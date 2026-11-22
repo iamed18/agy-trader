@@ -30,9 +30,9 @@
 	<key>RunAtLoad</key>
 	<true/>
 	<key>StandardErrorPath</key>
-	<string>/path/to/agy-trader/data/logs/news-nlp.stderr.log</string>
+	<string>/private/var/log/agy-trader/news-nlp.stderr.log</string>
 	<key>StandardOutPath</key>
-	<string>/path/to/agy-trader/data/logs/news-nlp.stdout.log</string>
+	<string>/private/var/log/agy-trader/news-nlp.stdout.log</string>
 	<key>ThrottleInterval</key>
 	<integer>15</integer>
 	<key>UserName</key>

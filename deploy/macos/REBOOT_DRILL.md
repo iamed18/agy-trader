@@ -8,11 +8,13 @@ This checklist verifies that all four `agy-trader` services (`market-data`, `new
 
 `LaunchDaemon`s in `/Library/LaunchDaemons/` launch at boot **before** user login once macOS reaches the login window.
 
-- **Auto-restart after power loss (AC power):**
+- **Always-on power & auto-restart after power loss (AC power):**
+  `install_launchdaemons.sh` automatically applies:
   ```bash
-  sudo pmset -a autorestart 1
-  pmset -g | grep autorestart
+  sudo pmset -a sleep 0 displaysleep 15 autorestart 1
+  pmset -g | grep -E "sleep|displaysleep|autorestart"
   ```
+  This keeps the Mac awake for pre-market, intraday, and post-close daemon cycles while still allowing the display to sleep after 15 minutes and restarting automatically after AC power loss.
 - **FileVault Note:**
   - Check status: `fdesetup status`
   - If **FileVault is On**:
@@ -25,26 +27,45 @@ This checklist verifies that all four `agy-trader` services (`market-data`, `new
 
 ---
 
-## 2. Install `LaunchDaemon`s
+## 2. One-Time Install & Zero-Prompt `agy-ops service` Management
 
-From the repository root (`/path/to/agy-trader`):
+From the repository root (`/path/to/agy-trader`), run the installer **once** with `sudo`:
 
 ```bash
 sudo ./deploy/macos/install_launchdaemons.sh
 ```
 
-Verify all 4 services are loaded:
+This one-time setup:
+- Installs the privilege-separated helper `/usr/local/sbin/agy-daemonctl` (`root:wheel`, `0755`, running under `/usr/bin/python3 -I`)
+- Installs a `visudo`-validated `/etc/sudoers.d/agytrader` policy granting `trader` passwordless `NOPASSWD` access strictly to `/usr/local/sbin/agy-daemonctl`
+- Configures `pmset` (`sleep 0`, `displaysleep 15`, `autorestart 1`) and `/etc/newsyslog.d/com.agytrader.conf`
+- Validates, installs, and bootstraps all 4 `LaunchDaemon` plists in `/Library/LaunchDaemons/`
+
+After this one-time install, unprivileged shells and AGY agent sessions (as user `trader`, with **no interactive sudo password prompt**) can manage all 4 daemons via `agy-ops service`:
 
 ```bash
-sudo launchctl list | grep com.agytrader
+uv run --offline agy-ops service status
+uv run --offline agy-ops service status --json
+uv run --offline agy-ops service start all
+uv run --offline agy-ops service stop dashboard
+uv run --offline agy-ops service restart trader --actor operator --reason "manual check"
+uv run --offline agy-ops service restart trader --actor ops --reason "stale feed recovery"
+uv run --offline agy-ops service sync-plists all
 ```
+
+> **Note on agent rate limits:** `agy-ops service restart` enforces `ControlPlane.authorize_service_restart(...)` (max 2 restarts/hour per service for `market-data`, `news-nlp`, `trader`, requiring `--reason`) whenever `--actor` is not `operator`.
 
 Verify logs and initial readiness:
 
 ```bash
-tail -n 20 data/logs/*.log
+tail -n 20 /path/to/agy-trader/data/logs/*.log
+tail -n 20 /private/var/log/agy-trader/*.log
+uv run --offline agy-ops service status
 uv run --offline agy-ops readiness
 ```
+
+- `/path/to/agy-trader/data/logs/*.log`: structured Python application logs (`RotatingFileHandler`, owned by `<user>:staff`).
+- `/private/var/log/agy-trader/*.log`: `launchd` stdout/stderr logs (owned by `<user>:staff` `0644` inside `root:wheel` `0755` `/private/var/log/agy-trader/`, rotated by `newsyslog`).
 
 Expected: `status: READY` (or `idle_market_closed` heartbeats outside `09:30–16:00 ET`), WAL integrity `ok`, and dashboard reachable at `http://127.0.0.1:8080`.
 
@@ -52,13 +73,14 @@ Expected: `status: READY` (or `idle_market_closed` heartbeats outside `09:30–1
 
 ## 3. Chaos Drill 1: `kill -9` Auto-Restart Verification
 
-Confirm `launchd` `KeepAlive=true` + `ThrottleInterval=15` automatically restarts a killed daemon and reconciles clean state:
+Confirm `launchd` `KeepAlive=true` + `ThrottleInterval=15` automatically restarts a killed daemon (running as `trader`, so no `sudo` is required) and reconciles clean state:
 
 ```bash
 pgrep -fl "agy-ops daemon trader"
-sudo kill -9 "$(pgrep -f 'agy-ops daemon trader' | head -n 1)"
+kill -9 "$(pgrep -f 'agy-ops daemon trader' | head -n 1)"
 sleep 20
 pgrep -fl "agy-ops daemon trader"
+uv run --offline agy-ops service status trader
 uv run --offline agy-ops readiness --json
 ```
 
@@ -71,11 +93,11 @@ Verify:
 
 ## 4. Chaos Drill 2: Cold-Boot Network Outage Backoff
 
-1. Temporarily disconnect Wi-Fi / Ethernet (or disable interface) and kickstart a daemon:
+1. Temporarily disconnect Wi-Fi / Ethernet (or disable interface) and restart a daemon with no interactive `sudo`:
    ```bash
-   sudo launchctl kickstart -k system/com.agytrader.trader
+   uv run --offline agy-ops service restart trader --actor operator
    ```
-2. Observe `data/logs/trader.stderr.log` / `trader.stdout.log`: the daemon waits with exponential backoff (`wait_for_network`, up to 120s) instead of crash-looping.
+2. Observe `/path/to/agy-trader/data/logs/*.log` and `/private/var/log/agy-trader/trader.stderr.log` / `trader.stdout.log`: the daemon waits with exponential backoff (`wait_for_network`, up to 120s) instead of crash-looping.
 3. Reconnect network and confirm the daemon completes startup, reconciles with Alpaca, and emits a `"healthy"` or `"idle_market_closed"` heartbeat.
 
 ---
@@ -90,7 +112,7 @@ Verify:
 3. Run post-reboot checks:
    ```bash
    cd /path/to/agy-trader
-   sudo launchctl list | grep com.agytrader
+   uv run --offline agy-ops service status
    uv run --offline agy-ops readiness --json
    curl -s http://127.0.0.1:8080/api/health | python3 -m json.tool
    ```
