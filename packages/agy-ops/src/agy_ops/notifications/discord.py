@@ -482,6 +482,22 @@ def build_morning_discord_embed(
             "inline": False,
         },
     ]
+    blackout = morning_plan.get("blackout") or {}
+    if blackout.get("active"):
+        if blackout.get("halted"):
+            bo_val = (
+                f"HALTED (fail-closed): {blackout.get('halt_reason') or 'invalid BLACKOUT_PERIOD'}"
+            )
+            color = COLOR_RED
+        else:
+            frozen_str = ", ".join(blackout.get("frozen_symbols") or ()) or "None"
+            etf_str = "; ".join(blackout.get("etf_weights_summary") or ()) or "None"
+            bo_val = f"Frozen: `{frozen_str}`\nETF Exposure: {etf_str}"
+            if blackout.get("warnings"):
+                bo_val += f"\nWarnings: {'; '.join(blackout['warnings'])}"
+        raw_fields.append(
+            {"name": "BLACKOUT_PERIOD Compliance Rail", "value": bo_val, "inline": False}
+        )
     norm = normalize_discord_embed(
         title=title,
         description=description,
@@ -592,6 +608,21 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
             "inline": False,
         },
     ]
+    blackout = summary.get("blackout") or {}
+    if blackout.get("active"):
+        if blackout.get("halted"):
+            bo_val = (
+                f"HALTED (fail-closed): {blackout.get('halt_reason') or 'invalid BLACKOUT_PERIOD'}"
+            )
+        else:
+            frozen_str = ", ".join(blackout.get("frozen_symbols") or ()) or "None"
+            etf_str = "; ".join(blackout.get("etf_weights_summary") or ()) or "None"
+            bo_val = f"Frozen: `{frozen_str}`\nETF Exposure: {etf_str}"
+            if blackout.get("warnings"):
+                bo_val += f"\nWarnings: {'; '.join(blackout['warnings'])}"
+        raw_fields.append(
+            {"name": "BLACKOUT_PERIOD Compliance Rail", "value": bo_val, "inline": False}
+        )
     norm = normalize_discord_embed(
         title=title,
         description=description,
@@ -620,6 +651,89 @@ def build_test_discord_embed(channel_label: str = "Discord alerts") -> dict[str,
         title="AGY Discord Notification Test",
         description=f"Connectivity check for **{channel_label}**.",
         color=COLOR_BLUE,
+        fields=raw_fields,
+        footer="agy-trader",
+    )
+    return {
+        "title": norm["title"],
+        "description": norm["description"],
+        "color": norm["color"],
+        "fields": norm.get("fields", []),
+        "footer": str((norm.get("footer") or {}).get("text", "agy-trader")),
+    }
+
+
+def build_blackout_alert_discord_embed(
+    blackout: Mapping[str, Any],
+    *,
+    affected_positions: Sequence[str] = (),
+    affected_orders: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Build a Discord compliance alert embed for BLACKOUT_PERIOD halts/freezes."""
+    halted = bool(blackout.get("halted", False))
+    frozen_list = [str(s) for s in (blackout.get("frozen_symbols") or ())]
+    warnings_list = [str(w) for w in (blackout.get("warnings") or ())]
+    etf_summary = [str(x) for x in (blackout.get("etf_weights_summary") or ())]
+    pos_list = [str(p) for p in affected_positions]
+    ord_list = [str(o) for o in affected_orders]
+
+    if halted:
+        color = COLOR_RED
+        title = "[COMPLIANCE HALT] BLACKOUT_PERIOD Fail-Closed"
+        description = (
+            f"All portfolio trading is **HALTED** due to `.env` / `BLACKOUT_PERIOD` failure: "
+            f"`{blackout.get('halt_reason') or 'unknown error'}`.\n"
+            "Zero orders were placed and existing resting Alpaca orders were left untouched "
+            "for manual compliance decision."
+        )
+    else:
+        color = COLOR_AMBER
+        title = "[COMPLIANCE] BLACKOUT_PERIOD Active Freeze"
+        frozen_label = ", ".join(frozen_list) or "None"
+        description = (
+            f"Compliance freeze active for **{frozen_label}**.\n"
+            "Zero orders were placed and existing resting Alpaca orders were left untouched "
+            "for manual compliance decision."
+        )
+
+    raw_fields: list[dict[str, Any]] = [
+        {
+            "name": "Frozen Symbols",
+            "value": ", ".join(frozen_list) if frozen_list else ("ALL (HALTED)" if halted else "None"),
+            "inline": True,
+        },
+        {
+            "name": "Held Positions Affected",
+            "value": ", ".join(pos_list) if pos_list else "None",
+            "inline": True,
+        },
+        {
+            "name": "Untouched Resting Orders",
+            "value": ", ".join(ord_list[:15]) if ord_list else "None",
+            "inline": False,
+        },
+    ]
+    if etf_summary:
+        raw_fields.append(
+            {
+                "name": "ETF Concentration Summary",
+                "value": "\n".join(f"- {item}" for item in etf_summary[:10]),
+                "inline": False,
+            }
+        )
+    if warnings_list:
+        raw_fields.append(
+            {
+                "name": "Fail-Closed Warnings",
+                "value": "\n".join(f"- {w}" for w in warnings_list[:10]),
+                "inline": False,
+            }
+        )
+
+    norm = normalize_discord_embed(
+        title=title,
+        description=description,
+        color=color,
         fields=raw_fields,
         footer="agy-trader",
     )

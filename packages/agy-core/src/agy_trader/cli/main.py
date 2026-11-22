@@ -21,6 +21,11 @@ from agy_trader.backtest.metrics import (
     CPCVSummary,
     render_ablation_markdown,
 )
+from agy_trader.core.blackout import (
+    NON_EQUITY_ETF_SECTORS,
+    load_universe_for_blackout,
+    resolve_live_blackout,
+)
 from agy_trader.core.config import (
     AppConfig,
     EnvSettings,
@@ -37,6 +42,7 @@ from agy_trader.data.macro_and_calendar import (
     FRED_SERIES_IDS,
     FREDMacroProvider,
     YFinanceEarningsProvider,
+    YFinanceEtfHoldingsProvider,
 )
 from agy_trader.data.news_filters import is_forward_only_source
 from agy_trader.data.sec_edgar import SecEdgarProvider
@@ -295,6 +301,33 @@ def backfill_cmd(
         earnings_events = earnings_provider.fetch_earnings(symbols)
         earnings_saved = db.upsert_earnings(earnings_events)
 
+        etf_holdings_saved = 0
+        etf_entries = [u for u in universe if u.asset_type == AssetType.etf]
+        if etf_entries:
+            etf_provider = YFinanceEtfHoldingsProvider()
+            holdings_by_etf = etf_provider.fetch_etf_holdings([u.symbol for u in etf_entries])
+            for etf_u in etf_entries:
+                if etf_u.symbol not in holdings_by_etf:
+                    continue
+                weights = holdings_by_etf[etf_u.symbol]
+                is_non_eq = etf_u.sector in NON_EQUITY_ETF_SECTORS
+                if is_non_eq:
+                    db.upsert_etf_holdings(
+                        etf_u.symbol,
+                        weights,
+                        is_non_equity_etf=True,
+                        updated_at=now_utc,
+                    )
+                    etf_holdings_saved += 1
+                elif weights:
+                    db.upsert_etf_holdings(
+                        etf_u.symbol,
+                        weights,
+                        is_non_equity_etf=False,
+                        updated_at=now_utc,
+                    )
+                    etf_holdings_saved += 1
+
         sec_saved = 0
         if not skip_sec and settings.sec_edgar_user_agent.strip():
             sec_provider = SecEdgarProvider(
@@ -320,6 +353,7 @@ def backfill_cmd(
             "news_saved": news_saved,
             "sec_saved": sec_saved,
             "earnings_saved": earnings_saved,
+            "etf_holdings_saved": etf_holdings_saved,
             "macro_saved": macro_saved,
             "news_scored": news_scored,
         }
@@ -341,6 +375,8 @@ def backfill_cmd(
         "macro_saved",
     ):
         table.add_row(key, str(result_payload[key]))
+    if "etf_holdings_saved" in result_payload:
+        table.add_row("etf_holdings_saved", str(result_payload["etf_holdings_saved"]))
     console.print(table)
 
 
@@ -751,7 +787,7 @@ def status_cmd(
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
 ) -> None:
     """Show database counts, Parquet coverage, control dials, recent runs, and LLM budget."""
-    _, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
 
     try:
         app_cfg = load_app_config(resolved_config)
@@ -766,6 +802,17 @@ def status_cmd(
     dials = cp.get_dials()
     recent_runs = db.get_recent_backtest_runs(limit=5)
     budget_allowed, budget_details = cp.check_llm_budget(app_cfg.llm_quota)
+    universe, universe_error = load_universe_for_blackout(resolved_config)
+    env_path = Path(".env")
+    blackout = resolve_live_blackout(
+        env_file=env_path if env_path.exists() else None,
+        require_env_file=env_path.exists(),
+        fallback_raw=settings.blackout_period,
+        db=db,
+        universe=universe,
+        universe_error=universe_error,
+        observed_broker_symbols=[p["symbol"] for p in db.get_live_positions()],
+    )
 
     payload = {
         "data_dir": str(resolved_data),
@@ -774,6 +821,7 @@ def status_cmd(
         "parquet_symbols_count": len(parquet_symbols),
         "parquet_symbols": parquet_symbols,
         "control_dials": dials.model_dump(mode="json"),
+        "blackout": blackout.to_status_dict(),
         "recent_backtest_runs": recent_runs,
         "llm_budget": {
             "allowed": budget_allowed,
@@ -795,6 +843,20 @@ def status_cmd(
     counts_table.add_row("exposure_multiplier", f"{dials.exposure_multiplier:.2f}")
     counts_table.add_row("allow_shorting", str(dials.allow_shorting))
     counts_table.add_row("active_blacklist", str(len(dials.active_blacklist(datetime.now(UTC)))))
+    counts_table.add_row(
+        "blackout_period",
+        blackout.raw_blackout_period or "none",
+    )
+    counts_table.add_row("blackout_halted", str(blackout.halted))
+    counts_table.add_row(
+        "blackout_frozen_symbols",
+        ", ".join(sorted(blackout.frozen_symbols)) or "none",
+    )
+    if blackout.etf_weights_summary:
+        counts_table.add_row(
+            "blackout_etf_weights",
+            "; ".join(blackout.etf_weights_summary),
+        )
     counts_table.add_row(
         "llm_budget_daily",
         f"${budget_details['daily_spend']:.4f} / ${budget_details['daily_cap']:.2f} ({'OK' if budget_allowed else 'EXCEEDED'})",
@@ -1069,6 +1131,13 @@ def emergency_flatten_cmd(
         typer.Option("--reason", help="Audit reason for emergency flatten"),
     ] = "",
     actor: Annotated[str, typer.Option("--actor", help="Actor identifier")] = "operator",
+    override_blackout: Annotated[
+        bool,
+        typer.Option(
+            "--override-blackout",
+            help="Override BLACKOUT_PERIOD freeze for legal/compliance-cleared emergencies",
+        ),
+    ] = False,
     data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
@@ -1081,11 +1150,21 @@ def emergency_flatten_cmd(
         _fail("A non-empty --reason is required for emergency flatten.", json_output=json_output)
         return
 
-    settings, resolved_data, _ = _resolve_paths(ctx, data_dir, config_dir)
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
     db, _ = _open_stores(resolved_data)
     try:
-        broker = AlpacaBroker(settings, db)
-        result = broker.emergency_flatten(confirm=confirm, reason=reason, actor=actor)
+        with AlpacaBroker(
+            settings,
+            db,
+            env_file=Path(".env") if Path(".env").exists() else None,
+            config_dir=resolved_config,
+        ) as broker:
+            result = broker.emergency_flatten(
+                confirm=confirm,
+                reason=reason,
+                actor=actor,
+                override_blackout=override_blackout,
+            )
     except (ControlPlaneError, ValidationError, ValueError, RuntimeError, OSError) as exc:
         _fail(str(exc), json_output=json_output)
         return
@@ -1103,8 +1182,13 @@ def emergency_flatten_cmd(
     table.add_row("ok", str(result["ok"]))
     table.add_row("paper_mode", str(result["paper_mode"]))
     table.add_row("paused_new_entries", str(result["paused_new_entries"]))
+    table.add_row("override_blackout", str(result.get("override_blackout", False)))
     table.add_row("canceled_orders", str(result["canceled_orders"]))
     table.add_row("close_orders_submitted", str(len(result["close_orders"])))
+    table.add_row(
+        "skipped_blackout_symbols",
+        ", ".join(result.get("skipped_blackout_symbols", [])) or "none",
+    )
     table.add_row("errors", str(len(result["errors"])))
     table.add_row("reason", str(result["reason"]))
     console.print(table)

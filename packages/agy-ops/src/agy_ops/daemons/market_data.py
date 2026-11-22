@@ -15,6 +15,7 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
 
+from agy_trader.core.blackout import NON_EQUITY_ETF_SECTORS
 from agy_trader.core.calendar import is_nyse_trading_day
 from agy_trader.core.config import EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ensure_utc
@@ -22,9 +23,11 @@ from agy_trader.data.alpaca_market import AlpacaMarketDataProvider
 from agy_trader.data.macro_and_calendar import (
     FREDMacroProvider,
     YFinanceEarningsProvider,
+    YFinanceEtfHoldingsProvider,
 )
 from agy_trader.data.providers import (
     EarningsProvider,
+    EtfHoldingsProvider,
     MacroProvider,
     MarketDataProvider,
     SecFilingsProvider,
@@ -80,6 +83,7 @@ class MarketDataDaemon(DaemonRunner):
         macro_provider: MacroProvider | None = None,
         earnings_provider: EarningsProvider | None = None,
         sec_provider: SecFilingsProvider | None = None,
+        etf_holdings_provider: EtfHoldingsProvider | None = None,
         snapshot_client: Any = None,
         trading_client: Any = None,
         network_check_fn: Callable[[], bool] | None = None,
@@ -113,6 +117,7 @@ class MarketDataDaemon(DaemonRunner):
         self._macro_provider = macro_provider
         self._earnings_provider = earnings_provider
         self._sec_provider = sec_provider
+        self._etf_holdings_provider = etf_holdings_provider
         self._snapshot_client = snapshot_client
         self._trading_client = trading_client
         self._owns_trading_client = False
@@ -292,9 +297,12 @@ class MarketDataDaemon(DaemonRunner):
         macro_saved = 0
         earnings_saved = 0
         sec_saved = 0
+        etf_holdings_saved = 0
         start_date = (now_utc - timedelta(days=lookback_days)).date()
         end_date = now_utc.date()
         equity_syms = self._equity_symbols()
+        universe = load_universe(self.config_dir)
+        etf_entries = [u for u in universe if u.asset_type == AssetType.etf]
 
         with httpx.Client(timeout=30.0) as http_client:
             # 1. FRED Macro (T10Y2Y, BAMLH0A0HYM2, VIXCLS, DGS3MO)
@@ -338,10 +346,40 @@ class MarketDataDaemon(DaemonRunner):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("sec_refresh_failed", error=str(exc))
 
+            # 4. ETF top holdings (for BLACKOUT_PERIOD concentration rail)
+            if etf_entries:
+                try:
+                    etf_prov = self._etf_holdings_provider or YFinanceEtfHoldingsProvider()
+                    holdings_by_etf = etf_prov.fetch_etf_holdings([u.symbol for u in etf_entries])
+                    for etf_u in etf_entries:
+                        if etf_u.symbol not in holdings_by_etf:
+                            continue
+                        weights = holdings_by_etf[etf_u.symbol]
+                        is_non_eq = etf_u.sector in NON_EQUITY_ETF_SECTORS
+                        if is_non_eq:
+                            self.db.upsert_etf_holdings(
+                                etf_u.symbol,
+                                weights,
+                                is_non_equity_etf=True,
+                                updated_at=now_utc,
+                            )
+                            etf_holdings_saved += 1
+                        elif weights:
+                            self.db.upsert_etf_holdings(
+                                etf_u.symbol,
+                                weights,
+                                is_non_equity_etf=False,
+                                updated_at=now_utc,
+                            )
+                            etf_holdings_saved += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("etf_holdings_refresh_failed", error=str(exc))
+
         return {
             "macro_saved": macro_saved,
             "earnings_saved": earnings_saved,
             "sec_saved": sec_saved,
+            "etf_holdings_saved": etf_holdings_saved,
         }
 
     def _poll_intraday_snapshots(self, symbols: list[str], now_utc: datetime) -> int:
@@ -386,7 +424,12 @@ class MarketDataDaemon(DaemonRunner):
         symbols = self._universe_symbols()
 
         bar_summary: dict[str, Any] = {"bars_saved": 0, "below_min_bars": [], "alerts": []}
-        aux_summary: dict[str, int] = {"macro_saved": 0, "earnings_saved": 0, "sec_saved": 0}
+        aux_summary: dict[str, int] = {
+            "macro_saved": 0,
+            "earnings_saved": 0,
+            "sec_saved": 0,
+            "etf_holdings_saved": 0,
+        }
         if self._boot_network_ok:
             try:
                 bar_summary = self._sync_bars_gap_fill(symbols, now)
@@ -466,7 +509,12 @@ class MarketDataDaemon(DaemonRunner):
         eod_alerts: list[str] = []
         eod_failed = False
         pruned: dict[str, int] | None = None
-        aux_summary: dict[str, int] = {"macro_saved": 0, "earnings_saved": 0, "sec_saved": 0}
+        aux_summary: dict[str, int] = {
+            "macro_saved": 0,
+            "earnings_saved": 0,
+            "sec_saved": 0,
+            "etf_holdings_saved": 0,
+        }
 
         eod_retry_ready = (
             self._last_eod_attempt_at is None

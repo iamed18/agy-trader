@@ -45,6 +45,7 @@ from agy_trader.core.models import (
 )
 from agy_trader.data.providers import (
     EarningsProvider,
+    EtfHoldingsProvider,
     MacroProvider,
     MarketDataProvider,
     NewsProvider,
@@ -298,6 +299,17 @@ class _StubNewsProvider(NewsProvider):
         return list(self.articles)
 
 
+class _StubEtfHoldingsProvider(EtfHoldingsProvider):
+    def fetch_etf_holdings(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+        out: dict[str, dict[str, float]] = {}
+        for sym in symbols:
+            if sym in {"TLT", "GLD"}:
+                out[sym] = {}
+            else:
+                out[sym] = {"AAPL": 0.08, "MSFT": 0.07}
+        return out
+
+
 def _make_daily_bars(symbol: str, n_bars: int, end_dt_utc: datetime, base_price: float = 100.0) -> pd.DataFrame:
     dates = pd.bdate_range(end=end_dt_utc.date(), periods=n_bars)
     closes = [base_price + i * 0.25 for i in range(n_bars)]
@@ -423,6 +435,7 @@ def test_market_data_daemon_boot_gapfill_eod_and_corporate_action(tmp_path: Path
         macro_provider=_StubMacroProvider(),
         earnings_provider=_StubEarningsProvider(),
         sec_provider=_StubSecProvider(),
+        etf_holdings_provider=_StubEtfHoldingsProvider(),
         network_check_fn=lambda: True,
         min_bars_required=300,
     )
@@ -1159,6 +1172,7 @@ def test_h4_m3_low1_market_data_recovery_eod_retry_dynamic_gap_and_client_owners
         macro_provider=_StubMacroProvider(),
         earnings_provider=_StubEarningsProvider(),
         sec_provider=_StubSecProvider(),
+        etf_holdings_provider=_StubEtfHoldingsProvider(),
         trading_client=tc,
         network_check_fn=lambda: net_up,
         min_bars_required=300,

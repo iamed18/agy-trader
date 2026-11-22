@@ -5,7 +5,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from datetime import time as dt_time
@@ -17,6 +17,15 @@ import structlog
 from alpaca.data.enums import DataFeed
 from alpaca.data.requests import StockSnapshotRequest
 
+from agy_ops.notifications import (
+    DiscordWebhookNotifier,
+    build_blackout_alert_discord_embed,
+)
+from agy_trader.core.blackout import (
+    ISSUER_SHARE_CLASS_GROUPS,
+    BlackoutResolution,
+    EnvBlackoutTracker,
+)
 from agy_trader.core.calendar import is_nyse_trading_day, nyse_trading_days_apart
 from agy_trader.core.config import (
     AppConfig,
@@ -189,6 +198,9 @@ class TraderDaemon(DaemonRunner):
         broker: AlpacaBroker | None = None,
         snapshot_client: Any = None,
         network_check_fn: Callable[[], bool] | None = None,
+        env_file: Path | None = None,
+        require_env_file: bool = False,
+        discord_notifier: DiscordWebhookNotifier | None = None,
         poll_interval_open_seconds: float = 30.0,
         poll_interval_closed_seconds: float = 300.0,
         snapshot_interval_open_seconds: float = 300.0,
@@ -214,6 +226,18 @@ class TraderDaemon(DaemonRunner):
         self.broker: AlpacaBroker | None = broker
         self._snapshot_client = snapshot_client
         self._network_check_fn = network_check_fn
+        self._explicit_env_file: Path | None = Path(env_file) if env_file is not None else None
+        self._require_env_file: bool = bool(require_env_file) or (env_file is not None)
+        self._blackout_tracker = EnvBlackoutTracker(
+            env_file=env_file,
+            require_env_file=require_env_file,
+            fallback_raw=settings.blackout_period,
+        )
+        self._discord_notifier = discord_notifier
+        self._last_blackout_db_sig: tuple[Any, ...] | None = None
+        self._last_blackout_discord_sig: tuple[Any, ...] | None = None
+        self._last_blackout_discord_attempt_sig: tuple[Any, ...] | None = None
+        self._last_blackout_discord_attempt_at: datetime | None = None
 
         self.poll_interval_open_seconds = float(poll_interval_open_seconds)
         self.poll_interval_closed_seconds = float(poll_interval_closed_seconds)
@@ -227,8 +251,116 @@ class TraderDaemon(DaemonRunner):
 
     def _get_broker(self) -> AlpacaBroker:
         if self.broker is None:
-            self.broker = AlpacaBroker(self.settings, self.db)
+            self.broker = AlpacaBroker(
+                self.settings,
+                self.db,
+                env_file=self._explicit_env_file,
+                require_env_file=self._require_env_file,
+                config_dir=self.config_dir,
+            )
         return self.broker
+
+    def _resolve_live_blackout_state(
+        self,
+        now_utc: datetime,
+        observed_broker_symbols: Iterable[str] = (),
+    ) -> BlackoutResolution:
+        return self._blackout_tracker.resolve(
+            db=self.db,
+            config_dir=self.config_dir,
+            now_utc=now_utc,
+            observed_broker_symbols=observed_broker_symbols,
+        )
+
+    def _maybe_send_blackout_alert(
+        self,
+        blackout: BlackoutResolution,
+        *,
+        affected_positions: list[str],
+        affected_orders: list[str],
+        now_utc: datetime,
+    ) -> bool:
+        should_alert = (
+            blackout.halted
+            or blackout.has_warnings
+            or (
+                bool(blackout.frozen_symbols)
+                and (bool(affected_positions) or bool(affected_orders))
+            )
+        )
+        if not should_alert:
+            self._last_blackout_db_sig = None
+            self._last_blackout_discord_sig = None
+            self._last_blackout_discord_attempt_sig = None
+            self._last_blackout_discord_attempt_at = None
+            return False
+
+        sig = (
+            blackout.halted,
+            blackout.halt_reason,
+            tuple(sorted(blackout.frozen_symbols)),
+            tuple(sorted(blackout.warnings)),
+            tuple(affected_positions),
+            tuple(affected_orders),
+        )
+        blackout_dict = blackout.to_status_dict()
+        if sig != self._last_blackout_db_sig:
+            self.db.record_daemon_event(
+                self.daemon_name,
+                "blackout_alert",
+                {
+                    **blackout_dict,
+                    "affected_positions": affected_positions,
+                    "affected_orders": affected_orders,
+                },
+                timestamp=now_utc,
+            )
+            self._last_blackout_db_sig = sig
+
+        webhook_url = self.settings.discord_webhook_url.strip()
+        if self._discord_notifier is None and not webhook_url:
+            return False
+        if sig == self._last_blackout_discord_sig:
+            return False
+        if (
+            sig == self._last_blackout_discord_attempt_sig
+            and self._last_blackout_discord_attempt_at is not None
+            and (now_utc - self._last_blackout_discord_attempt_at).total_seconds() < 300.0
+        ):
+            return False
+
+        self._last_blackout_discord_attempt_sig = sig
+        self._last_blackout_discord_attempt_at = now_utc
+
+        embed = build_blackout_alert_discord_embed(
+            blackout_dict,
+            affected_positions=affected_positions,
+            affected_orders=affected_orders,
+        )
+        try:
+            if self._discord_notifier is not None:
+                self._discord_notifier.send_embed(
+                    title=embed["title"],
+                    description=embed["description"],
+                    color=embed["color"],
+                    fields=embed.get("fields", ()),
+                    footer=embed.get("footer", "agy-trader"),
+                )
+            else:
+                with DiscordWebhookNotifier(webhook_url) as notifier:
+                    notifier.send_embed(
+                        title=embed["title"],
+                        description=embed["description"],
+                        color=embed["color"],
+                        fields=embed.get("fields", ()),
+                        footer=embed.get("footer", "agy-trader"),
+                    )
+        except Exception as exc:  # noqa: BLE001 - retry on next eligible cooldown tick
+            logger.warning("blackout_discord_alert_failed", error=str(exc))
+            return False
+
+        self._last_blackout_discord_sig = sig
+        return True
 
     def _get_snapshot_client(self, broker: AlpacaBroker) -> Any:
         if self._snapshot_client is not None:
@@ -615,6 +747,7 @@ class TraderDaemon(DaemonRunner):
         live_marks: Mapping[str, float],
         mark_ts: Mapping[str, datetime],
         snapshots: Mapping[str, _IntradaySnapshot],
+        blackout: BlackoutResolution | None = None,
     ) -> dict[str, Any]:
         symbols = list(
             dict.fromkeys([u.symbol for u in universe] + [app_cfg.backtest.benchmark_symbol])
@@ -660,6 +793,29 @@ class TraderDaemon(DaemonRunner):
             )
             for u in universe
         }
+        # HIGH #6: Propagate sector/asset metadata across share-class siblings (e.g. GOOGL -> GOOG)
+        for grp in ISSUER_SHARE_CLASS_GROUPS:
+            template_meta = next((universe_meta[s] for s in grp if s in universe_meta), None)
+            if template_meta is not None:
+                for alias in grp:
+                    if alias not in universe_meta:
+                        universe_meta[alias] = template_meta.model_copy(update={"symbol": alias})
+
+        # HIGH #6: Ensure every held broker position (including out-of-universe GOOG/ACME/BRK.B/VOX)
+        # has a valid price so frozen positions count toward gross/net/sector headroom and do not
+        # fail Pass-2 entries with MISSING_OR_INVALID_PORTFOLIO_PRICE.
+        for sym, pos in broker_positions.items():
+            cur_px = prices.get(sym)
+            if cur_px is None or not math.isfinite(cur_px) or cur_px <= 0.0:
+                mark_px = live_marks.get(sym)
+                if mark_px is not None and math.isfinite(mark_px) and mark_px > 0.0:
+                    prices[sym] = float(mark_px)
+                else:
+                    mkt_px = float(pos.get("market_price", 0.0))
+                    entry_px = float(pos.get("avg_entry_price", 0.0))
+                    fallback_px = mkt_px if (math.isfinite(mkt_px) and mkt_px > 0.0) else entry_px
+                    if math.isfinite(fallback_px) and fallback_px > 0.0:
+                        prices[sym] = float(fallback_px)
 
         feature_engine = FeatureEngine(app_cfg.strategy)
         signals = feature_engine.build_signals(
@@ -674,6 +830,10 @@ class TraderDaemon(DaemonRunner):
         )
 
         current_positions = {sym: float(pos["qty"]) for sym, pos in broker_positions.items()}
+        active_blackout = blackout or self._resolve_live_blackout_state(
+            now_utc,
+            observed_broker_symbols=broker_positions.keys(),
+        )
 
         portfolio_ctor = PortfolioConstructor(app_cfg.strategy, app_cfg.risk)
         proposed = portfolio_ctor.build_proposed_orders(
@@ -684,6 +844,7 @@ class TraderDaemon(DaemonRunner):
             dials=dials,
             as_of=now_utc,
             universe_meta=universe_meta,
+            frozen_symbols=active_blackout.frozen_symbols,
         )
 
         risk_state = PortfolioRiskState(
@@ -707,6 +868,8 @@ class TraderDaemon(DaemonRunner):
             universe_meta=universe_meta,
             signals_by_symbol=signals_by_symbol,
             earnings_by_symbol=earnings_by_symbol,
+            frozen_symbols=active_blackout.frozen_symbols,
+            blackout_halted=active_blackout.halted,
         )
 
         ckpt_compact = checkpoint.replace(":", "")
@@ -729,6 +892,8 @@ class TraderDaemon(DaemonRunner):
                 desired_stops[v.order.symbol] = float(v.stop_loss_price)
 
         for sym, pos in broker.get_broker_positions().items():
+            if active_blackout.halted or sym in active_blackout.frozen_symbols:
+                continue
             if sym in desired_stops:
                 continue
             if sym in existing_db_stops and existing_db_stops[sym] is not None:
@@ -766,6 +931,9 @@ class TraderDaemon(DaemonRunner):
             "approved_count": sum(1 for v in verdicts if v.approved and v.adjusted_qty > 0.0),
             "executed_count": len(exec_report.records),
             "submitted_stops": sorted(stop_sync.submitted_stops.keys()),
+            "untouched_blackout_positions": stop_sync.untouched_blackout_positions,
+            "untouched_blackout_orders": stop_sync.untouched_blackout_orders,
+            "blackout": active_blackout.to_status_dict(),
             "errors": exec_report.errors + stop_sync.errors,
         }
         self.db.record_daemon_event(
@@ -792,10 +960,31 @@ class TraderDaemon(DaemonRunner):
             dict.fromkeys([u.symbol for u in universe] + [app_cfg.backtest.benchmark_symbol])
         )
 
-        # 1. Fast cycle broker reconciliation + stop verification
-        broker.reconcile_with_broker(daemon_name=self.daemon_name, record_if_clean=False)
+        # 1. Fast cycle broker reconciliation + stop verification + live BLACKOUT_PERIOD check
+        recon = broker.reconcile_with_broker(daemon_name=self.daemon_name, record_if_clean=False)
         acct = broker.get_account_state()
         positions = broker.get_broker_positions()
+        open_orders = broker._fetch_open_orders()
+        observed_broker_symbols = set(positions.keys()) | {
+            str(getattr(o, "symbol", "")).strip().upper()
+            for o in open_orders
+            if getattr(o, "symbol", None)
+        }
+        blackout = self._resolve_live_blackout_state(
+            now,
+            observed_broker_symbols=observed_broker_symbols,
+        )
+        affected_positions = (
+            sorted(positions.keys())
+            if blackout.halted
+            else sorted(sym for sym in positions if sym in blackout.frozen_symbols)
+        )
+        self._maybe_send_blackout_alert(
+            blackout,
+            affected_positions=affected_positions,
+            affected_orders=recon.untouched_blackout_orders,
+            now_utc=now,
+        )
 
         equity = acct["equity"]
         cash = acct["cash"]
@@ -872,8 +1061,9 @@ class TraderDaemon(DaemonRunner):
         )
 
         if should_rebalance or due_for_snapshot:
+            mark_symbols = list(dict.fromkeys(all_symbols + list(positions.keys())))
             live_marks, mark_ts, snapshots = self._fetch_live_marks(
-                all_symbols, broker, positions, now
+                mark_symbols, broker, positions, now
             )
 
         if should_rebalance:
@@ -893,6 +1083,7 @@ class TraderDaemon(DaemonRunner):
                 live_marks=live_marks,
                 mark_ts=mark_ts,
                 snapshots=snapshots,
+                blackout=blackout,
             )
             acct = broker.get_account_state()
             positions = broker.get_broker_positions()
@@ -948,6 +1139,7 @@ class TraderDaemon(DaemonRunner):
             "daily_pnl_pct": round(daily_pnl_pct, 6),
             "drawdown_pct": round(drawdown_pct, 6),
             "paused": dials.pause_new_entries,
+            "blackout": blackout.to_status_dict(),
             "rebalance_ran": rebalance_result is not None,
             "snapshot_recorded": snapshot_recorded,
         }

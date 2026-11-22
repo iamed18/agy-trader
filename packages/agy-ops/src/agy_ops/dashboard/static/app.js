@@ -147,6 +147,24 @@
     }
     document.getElementById("kpi-dials-detail").textContent =
       `Multiplier: ${Number(dials.exposure_multiplier ?? 1).toFixed(2)}x · Shorting: ${dials.allow_shorting ? "ON" : "OFF"}`;
+
+    const banner = document.getElementById("blackout-banner");
+    const bo = data.blackout || {};
+    if (banner) {
+      if (bo.active) {
+        const isHalt = Boolean(bo.halted);
+        banner.className = `blackout-banner ${isHalt ? "blackout-halt" : "blackout-freeze"}`;
+        const frozenStr = (bo.frozen_symbols || []).join(", ") || "NONE";
+        const etfSummary = (bo.etf_weights_summary || []).join(" · ");
+        const detail = isHalt
+          ? `ALL PORTFOLIO ORDERS HALTED (fail-closed): ${bo.halt_reason || "invalid BLACKOUT_PERIOD"}`
+          : `Frozen symbols (zero buys/sells/cancels): ${frozenStr}${etfSummary ? ` · ETFs: ${etfSummary}` : ""}`;
+        banner.innerHTML = `<strong>${isHalt ? "COMPLIANCE HALT" : "BLACKOUT_PERIOD ACTIVE"}:</strong> ${esc(detail)}`;
+      } else {
+        banner.className = "blackout-banner hidden";
+        banner.innerHTML = "";
+      }
+    }
   }
 
   function renderPositions(data) {

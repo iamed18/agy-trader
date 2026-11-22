@@ -83,6 +83,8 @@ class HardRiskEngine:
         universe_meta: Mapping[str, AssetRiskMetadata],
         signals_by_symbol: Mapping[str, SignalRow] | None = None,
         earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        frozen_symbols: set[str] | frozenset[str] = frozenset(),
+        blackout_halted: bool = False,
     ) -> list[RiskVerdict]:
         """Validate a batch of ProposedOrders against immutable hard risk limits."""
         as_of_utc = ensure_utc(state.as_of)
@@ -90,9 +92,33 @@ class HardRiskEngine:
         signals_map = {k.upper(): v for k, v in (signals_by_symbol or {}).items()}
         earnings_map = {k.upper(): v for k, v in (earnings_by_symbol or {}).items()}
         blacklist = dials.active_blacklist(as_of_utc)
+        frozen_set = frozenset(s.strip().upper() for s in frozen_symbols if s.strip())
 
         projected: dict[str, float] = {k.upper(): float(v) for k, v in state.positions.items()}
         prices: dict[str, float] = {k.upper(): float(v) for k, v in state.prices.items()}
+
+        verdicts_by_idx: dict[int, RiskVerdict] = {}
+
+        # Layer 2 BLACKOUT_PERIOD compliance rail: enforce BEFORE Pass-1/Pass-2 split so
+        # BOTH risk-reducing exits/trims AND risk-increasing entries are strictly blocked.
+        eligible_orders: list[tuple[int, ProposedOrder]] = []
+        for idx, order in enumerate(orders):
+            if blackout_halted:
+                verdicts_by_idx[idx] = RiskVerdict(
+                    approved=False,
+                    order=order,
+                    adjusted_qty=0.0,
+                    violations=["BLACKOUT_PERIOD_HALT"],
+                )
+            elif order.symbol in frozen_set:
+                verdicts_by_idx[idx] = RiskVerdict(
+                    approved=False,
+                    order=order,
+                    adjusted_qty=0.0,
+                    violations=["BLACKOUT_PERIOD_FROZEN"],
+                )
+            else:
+                eligible_orders.append((idx, order))
 
         # Partition into Pass 1 (genuinely risk-reducing) and Pass 2 (risk-increasing)
         # while tracking remaining reducible shares per symbol so side-flip open legs
@@ -103,7 +129,7 @@ class HardRiskEngine:
 
         # Prioritize orders explicitly flagged is_risk_reducing=True when claiming reduction capacity
         ordered_candidates = sorted(
-            enumerate(orders),
+            eligible_orders,
             key=lambda pair: (0 if pair[1].is_risk_reducing else 1, pair[0]),
         )
         for idx, order in ordered_candidates:
@@ -118,8 +144,6 @@ class HardRiskEngine:
         # Preserve caller relative order within each pass
         reducing_indices.sort(key=lambda pair: pair[0])
         increasing_indices.sort(key=lambda pair: pair[0])
-
-        verdicts_by_idx: dict[int, RiskVerdict] = {}
 
         # Pass 1: Risk-reducing exits/trims (always allowed even during kill-switch / pause)
         for idx, order in reducing_indices:

@@ -66,3 +66,11 @@ class SecFilingsProvider(ABC):
         end: datetime,
     ) -> list[SecFilingEvent]:
         """Fetch SEC filings for the requested symbols within [start, end]."""
+
+
+class EtfHoldingsProvider(ABC):
+    """Abstract interface for ETF top-holdings providers."""
+
+    @abstractmethod
+    def fetch_etf_holdings(self, symbols: list[str]) -> dict[str, dict[str, float]]:
+        """Fetch top-holding weights in [0.0, 1.0] keyed by uppercase ETF symbol."""

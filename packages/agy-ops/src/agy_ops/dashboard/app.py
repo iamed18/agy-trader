@@ -9,6 +9,7 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from agy_trader.core.blackout import load_universe_for_blackout, resolve_live_blackout
 from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ControlDials, ensure_utc
 from agy_trader.storage.db import StateDB
@@ -47,6 +48,22 @@ def _safe_load_asset_types(config_dir: Path) -> dict[str, AssetType]:
         return {u.symbol: u.asset_type for u in load_universe(config_dir)}
     except (FileNotFoundError, OSError, ValueError):
         return {}
+
+
+def _resolve_dashboard_blackout(config_dir: Path, db: StateDB | None) -> dict[str, Any]:
+    settings = EnvSettings()
+    universe, universe_error = load_universe_for_blackout(config_dir)
+    env_path = Path(".env")
+    obs = [p["symbol"] for p in db.get_live_positions()] if db is not None else ()
+    return resolve_live_blackout(
+        env_file=env_path if env_path.exists() else None,
+        require_env_file=env_path.exists(),
+        fallback_raw=settings.blackout_period,
+        db=db,
+        universe=universe,
+        universe_error=universe_error,
+        observed_broker_symbols=obs,
+    ).to_status_dict()
 
 
 def _count_parquet_symbols(data_dir: Path) -> int:
@@ -100,6 +117,7 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
     def api_overview() -> dict[str, Any]:
         app_cfg = _safe_load_config(resolved_config)
         db = _open_readonly_db(resolved_data)
+        blackout = _resolve_dashboard_blackout(resolved_config, db)
         if db is None:
             dials = ControlDials()
             return {
@@ -117,6 +135,7 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                 "spy_return_pct": None,
                 "ew50_return_pct": None,
                 "control_dials": dials.model_dump(mode="json"),
+                "blackout": blackout,
             }
 
         first = db.get_first_portfolio_snapshot()
@@ -138,6 +157,7 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                 "spy_return_pct": None,
                 "ew50_return_pct": None,
                 "control_dials": dials.model_dump(mode="json"),
+                "blackout": blackout,
             }
 
         base_eq = float(first["equity"])
@@ -175,6 +195,7 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
             "spy_return_pct": round(spy_ret_pct, 4) if spy_ret_pct is not None else None,
             "ew50_return_pct": round(ew_ret_pct, 4) if ew_ret_pct is not None else None,
             "control_dials": dials.model_dump(mode="json"),
+            "blackout": blackout,
         }
 
     @app.get("/api/equity-curve")

@@ -6,8 +6,9 @@ import re
 import time
 import uuid
 from collections import defaultdict
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Self
 
 import structlog
@@ -25,6 +26,10 @@ from alpaca.trading.requests import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
+from agy_trader.core.blackout import (
+    BlackoutResolution,
+    EnvBlackoutTracker,
+)
 from agy_trader.core.config import EnvSettings, validate_trading_mode
 from agy_trader.core.control_plane import ControlPlane
 from agy_trader.core.models import OrderSide, RiskVerdict, UtcDatetime
@@ -106,6 +111,8 @@ class StopSyncResult(_StrictExecutionModel):
     submitted_stops: dict[str, str] = Field(default_factory=dict)
     canceled_orphans: list[str] = Field(default_factory=list)
     canceled_stale: list[str] = Field(default_factory=list)
+    untouched_blackout_positions: list[str] = Field(default_factory=list)
+    untouched_blackout_orders: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
 
@@ -118,6 +125,8 @@ class ReconciliationResult(_StrictExecutionModel):
     position_diffs: list[dict[str, Any]] = Field(default_factory=list)
     updated_orders: list[str] = Field(default_factory=list)
     missing_stop_symbols: list[str] = Field(default_factory=list)
+    untouched_blackout_positions: list[str] = Field(default_factory=list)
+    untouched_blackout_orders: list[str] = Field(default_factory=list)
     stop_sync_result: StopSyncResult | None = None
 
 
@@ -228,6 +237,9 @@ class AlpacaBroker:
         poll_interval_seconds: float = 2.0,
         sleep_fn: Callable[[float], None] = time.sleep,
         now_fn: Callable[[], datetime] | None = None,
+        env_file: Path | None = None,
+        require_env_file: bool = False,
+        config_dir: Path | None = None,
     ) -> None:
         validate_trading_mode(settings)
         self.settings = settings
@@ -237,6 +249,12 @@ class AlpacaBroker:
         self.poll_interval_seconds = float(poll_interval_seconds)
         self._sleep = sleep_fn
         self._now = now_fn or (lambda: datetime.now(UTC))
+        self._blackout_tracker = EnvBlackoutTracker(
+            env_file=env_file,
+            require_env_file=require_env_file,
+            fallback_raw=settings.blackout_period,
+        )
+        self._config_dir: Path = Path(config_dir) if config_dir is not None else Path(settings.agy_config_dir)
         self._data_feed = DataFeed.SIP if settings.alpaca_data_feed == "sip" else DataFeed.IEX
         self._owns_trading_client = trading_client is None
         self._owns_quote_client = False
@@ -286,6 +304,64 @@ class AlpacaBroker:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+    @staticmethod
+    def _collect_observed_symbols(
+        positions: Mapping[str, Any] | None = None,
+        open_orders: Sequence[Any] | None = None,
+        extra_symbols: Iterable[str] = (),
+    ) -> set[str]:
+        observed: set[str] = set()
+        if positions:
+            observed.update(str(s).strip().upper() for s in positions if str(s).strip())
+        if open_orders:
+            for order in open_orders:
+                sym = getattr(order, "symbol", None)
+                if sym:
+                    clean = str(sym).strip().upper()
+                    if clean:
+                        observed.add(clean)
+        for sym in extra_symbols:
+            clean = str(sym).strip().upper()
+            if clean:
+                observed.add(clean)
+        return observed
+
+    def resolve_blackout_state(
+        self,
+        now_utc: datetime | None = None,
+        observed_broker_symbols: Iterable[str] = (),
+    ) -> BlackoutResolution:
+        """Hot-reload BLACKOUT_PERIOD from .env on disk and resolve frozen symbols."""
+        return self._blackout_tracker.resolve(
+            db=self.db,
+            config_dir=self._config_dir,
+            now_utc=now_utc or self._now(),
+            observed_broker_symbols=observed_broker_symbols,
+        )
+
+    def _resolve_blackout_with_live_observed(
+        self,
+        *,
+        now_utc: datetime | None = None,
+        extra_symbols: Iterable[str] = (),
+    ) -> tuple[BlackoutResolution, set[str]]:
+        """Resolve blackout and inspect live broker positions/open orders if blackout is active."""
+        extra_set = {str(s).strip().upper() for s in extra_symbols if str(s).strip()}
+        prelim = self.resolve_blackout_state(
+            now_utc=now_utc,
+            observed_broker_symbols=extra_set,
+        )
+        if prelim.halted or not prelim.raw_symbols:
+            return prelim, extra_set
+        positions = self.get_broker_positions()
+        open_orders = self._fetch_open_orders()
+        observed = self._collect_observed_symbols(positions, open_orders, extra_set)
+        resolved = self.resolve_blackout_state(
+            now_utc=now_utc,
+            observed_broker_symbols=observed,
+        )
+        return resolved, observed
 
     def get_account_state(self) -> dict[str, float]:
         account = self.trading_client.get_account()
@@ -649,6 +725,40 @@ class AlpacaBroker:
                 adopted_existing=adopted_existing,
             )
 
+        # HIGH #4: Re-check blackout state after limit poll BEFORE canceling resting limit order
+        blackout_mid = self.resolve_blackout_state(
+            now_utc=self._now(),
+            observed_broker_symbols=(symbol,),
+        )
+        if blackout_mid.halted or symbol in blackout_mid.frozen_symbols:
+            mid_err = (
+                f"{symbol}: BLACKOUT_PERIOD activated mid-poll "
+                f"({blackout_mid.halt_reason or 'frozen'}); leaving resting order {cid} untouched"
+            )
+            logger.warning(
+                "alpaca_blackout_mid_poll_abort",
+                symbol=symbol,
+                client_order_id=cid,
+                halted=blackout_mid.halted,
+            )
+            return OrderExecutionRecord(
+                client_order_id=cid,
+                broker_order_id=b_id,
+                symbol=symbol,
+                side=side,
+                order_type="limit",
+                requested_qty=req_qty,
+                filled_qty=f_qty,
+                filled_avg_price=f_px,
+                reference_price=ref_px,
+                limit_price=limit_px,
+                realized_slippage_bps=slip,
+                status="blocked_blackout",
+                is_risk_reducing=is_rr,
+                adopted_existing=adopted_existing,
+                error=mid_err,
+            )
+
         # Unfilled or partially filled after limit timeout: cancel open limit before market fallback
         if status in _OPEN_ORDER_STATUSES and b_id is not None:
             try:
@@ -764,6 +874,33 @@ class AlpacaBroker:
                 fallback_client_order_id=mkt_cid,
             )
         else:
+            # HIGH #4: Final blackout check immediately before submitting market fallback
+            blackout_pre_mkt = self.resolve_blackout_state(
+                now_utc=self._now(),
+                observed_broker_symbols=(symbol,),
+            )
+            if blackout_pre_mkt.halted or symbol in blackout_pre_mkt.frozen_symbols:
+                mkt_blk_err = (
+                    f"{symbol}: BLACKOUT_PERIOD active before market fallback "
+                    f"({blackout_pre_mkt.halt_reason or 'frozen'}); skipping market submit"
+                )
+                return OrderExecutionRecord(
+                    client_order_id=cid,
+                    broker_order_id=b_id,
+                    symbol=symbol,
+                    side=side,
+                    order_type="limit",
+                    requested_qty=req_qty,
+                    filled_qty=f_qty,
+                    filled_avg_price=f_px,
+                    reference_price=ref_px,
+                    limit_price=limit_px,
+                    realized_slippage_bps=slip,
+                    status="blocked_blackout",
+                    is_risk_reducing=is_rr,
+                    adopted_existing=adopted_existing,
+                    error=mkt_blk_err,
+                )
             mkt_req = MarketOrderRequest(
                 symbol=symbol,
                 qty=remaining_qty,
@@ -913,20 +1050,92 @@ class AlpacaBroker:
             else:
                 skipped_unapproved += 1
 
-        pass1 = [v for v in approved if v.order.is_risk_reducing]
-        pass2 = [v for v in approved if not v.order.is_risk_reducing]
+        verdict_symbols = {v.order.symbol for v in approved}
+        blackout, observed_symbols = self._resolve_blackout_with_live_observed(
+            now_utc=started_at,
+            extra_symbols=verdict_symbols,
+        )
 
         records: list[OrderExecutionRecord] = []
         errors: list[str] = []
         occ_counts: dict[tuple[int, str, OrderSide], int] = defaultdict(int)
-        failed_pass1_symbols: set[str] = set()
-        any_pass1_complete_failure = False
 
         def _next_legs(pass_num: int, verdict: RiskVerdict) -> tuple[str, str]:
             key = (pass_num, verdict.order.symbol, verdict.order.side)
             occ = occ_counts[key]
             occ_counts[key] = occ + 1
             return f"p{pass_num}m{occ}", f"p{pass_num}k{occ}"
+
+        if blackout.halted:
+            halt_err = f"BLACKOUT_PERIOD halt active ({blackout.halt_reason}); all orders blocked"
+            errors.append(halt_err)
+            for v in approved:
+                pass_num = 1 if v.order.is_risk_reducing else 2
+                leg_main, _ = _next_legs(pass_num, v)
+                cid = build_client_order_id(
+                    session_date, checkpoint, v.order.symbol, v.order.side, leg=leg_main
+                )
+                records.append(
+                    OrderExecutionRecord(
+                        client_order_id=cid,
+                        symbol=v.order.symbol,
+                        side=v.order.side,
+                        order_type="limit",
+                        requested_qty=float(v.adjusted_qty),
+                        reference_price=float(v.order.reference_price),
+                        status="blocked_blackout",
+                        is_risk_reducing=bool(v.order.is_risk_reducing),
+                        error=halt_err,
+                    )
+                )
+            completed_at = self._now()
+            return ExecutionReport(
+                run_id=run_id,
+                session_date=session_date,
+                checkpoint=checkpoint,
+                started_at=started_at,
+                completed_at=completed_at,
+                records=records,
+                pass1_count=0,
+                pass2_count=0,
+                skipped_unapproved=skipped_unapproved,
+                errors=errors,
+            )
+
+        failed_pass1_symbols: set[str] = set()
+        any_pass1_complete_failure = False
+
+        executable_approved: list[RiskVerdict] = []
+        for v in approved:
+            if v.order.symbol in blackout.frozen_symbols:
+                pass_num = 1 if v.order.is_risk_reducing else 2
+                if v.order.is_risk_reducing:
+                    failed_pass1_symbols.add(v.order.symbol)
+                    any_pass1_complete_failure = True
+                leg_main, _ = _next_legs(pass_num, v)
+                cid = build_client_order_id(
+                    session_date, checkpoint, v.order.symbol, v.order.side, leg=leg_main
+                )
+                blk_err = f"{v.order.symbol}: blocked by BLACKOUT_PERIOD compliance rail"
+                errors.append(blk_err)
+                records.append(
+                    OrderExecutionRecord(
+                        client_order_id=cid,
+                        symbol=v.order.symbol,
+                        side=v.order.side,
+                        order_type="limit",
+                        requested_qty=float(v.adjusted_qty),
+                        reference_price=float(v.order.reference_price),
+                        status="blocked_blackout",
+                        is_risk_reducing=bool(v.order.is_risk_reducing),
+                        error=blk_err,
+                    )
+                )
+            else:
+                executable_approved.append(v)
+
+        pass1 = [v for v in executable_approved if v.order.is_risk_reducing]
+        pass2 = [v for v in executable_approved if not v.order.is_risk_reducing]
 
         def _handle_exception(
             verdict: RiskVerdict, cid: str, exc: Exception
@@ -1032,6 +1241,33 @@ class AlpacaBroker:
             cid = build_client_order_id(
                 session_date, checkpoint, verdict.order.symbol, verdict.order.side, leg=leg_main
             )
+            blackout_now = self.resolve_blackout_state(
+                now_utc=self._now(),
+                observed_broker_symbols=observed_symbols,
+            )
+            if blackout_now.halted or verdict.order.symbol in blackout_now.frozen_symbols:
+                blk_err = (
+                    f"BLACKOUT_PERIOD halt active ({blackout_now.halt_reason}); all orders blocked"
+                    if blackout_now.halted
+                    else f"{verdict.order.symbol}: blocked by BLACKOUT_PERIOD compliance rail"
+                )
+                errors.append(blk_err)
+                records.append(
+                    OrderExecutionRecord(
+                        client_order_id=cid,
+                        symbol=verdict.order.symbol,
+                        side=verdict.order.side,
+                        order_type="limit",
+                        requested_qty=float(verdict.adjusted_qty),
+                        reference_price=float(verdict.order.reference_price),
+                        status="blocked_blackout",
+                        is_risk_reducing=True,
+                        error=blk_err,
+                    )
+                )
+                failed_pass1_symbols.add(verdict.order.symbol)
+                any_pass1_complete_failure = True
+                continue
             try:
                 rec = self._execute_single_verdict(
                     verdict,
@@ -1081,6 +1317,32 @@ class AlpacaBroker:
                         status="skipped_pass1_gate",
                         is_risk_reducing=False,
                         error=gate_err,
+                    )
+                )
+                continue
+
+            blackout_now = self.resolve_blackout_state(
+                now_utc=self._now(),
+                observed_broker_symbols=observed_symbols,
+            )
+            if blackout_now.halted or verdict.order.symbol in blackout_now.frozen_symbols:
+                blk_err = (
+                    f"BLACKOUT_PERIOD halt active ({blackout_now.halt_reason}); all orders blocked"
+                    if blackout_now.halted
+                    else f"{verdict.order.symbol}: blocked by BLACKOUT_PERIOD compliance rail"
+                )
+                errors.append(blk_err)
+                records.append(
+                    OrderExecutionRecord(
+                        client_order_id=cid,
+                        symbol=verdict.order.symbol,
+                        side=verdict.order.side,
+                        order_type="limit",
+                        requested_qty=float(verdict.adjusted_qty),
+                        reference_price=float(verdict.order.reference_price),
+                        status="blocked_blackout",
+                        is_risk_reducing=False,
+                        error=blk_err,
                     )
                 )
                 continue
@@ -1198,28 +1460,46 @@ class AlpacaBroker:
 
         Cancels orphan/wrong-side stop orders, keeps existing stops that are at least as
         protective (never widening a stop), and submits missing or tightened stops.
+        Frozen BLACKOUT_PERIOD symbols are left strictly untouched (zero submits, zero cancels).
         """
         validate_trading_mode(self.settings)
+        now = self._now()
         desired_map = {k.strip().upper(): float(v) for k, v in desired_stops.items()}
         positions = self.get_broker_positions()
         open_orders = self._fetch_open_orders()
+        observed_symbols = self._collect_observed_symbols(positions, open_orders)
+        blackout = self.resolve_blackout_state(
+            now_utc=now,
+            observed_broker_symbols=observed_symbols,
+        )
         cancel_ack_timeout = max(10.0, self.poll_interval_seconds * 3.0)
 
         kept_stops: dict[str, str] = {}
         submitted_stops: dict[str, str] = {}
         canceled_orphans: list[str] = []
         canceled_stale: list[str] = []
+        untouched_blackout_positions: list[str] = []
+        untouched_blackout_orders: list[str] = []
         warnings: list[str] = []
         errors: list[str] = []
         cancel_failed_symbols: set[str] = set()
 
+        frozen_stops_by_symbol: dict[str, list[Any]] = {}
         valid_stops_by_symbol: dict[str, list[Any]] = {}
         for order in open_orders:
-            otype = _enum_str(getattr(order, "order_type", None) or getattr(order, "type", None))
-            if otype not in {"stop", "stop_limit"}:
-                continue
             sym = str(getattr(order, "symbol", "")).strip().upper()
             oid = str(getattr(order, "id", ""))
+            otype = _enum_str(getattr(order, "order_type", None) or getattr(order, "type", None))
+
+            if blackout.halted or sym in blackout.frozen_symbols:
+                if oid and oid not in untouched_blackout_orders:
+                    untouched_blackout_orders.append(oid)
+                if otype in {"stop", "stop_limit"}:
+                    frozen_stops_by_symbol.setdefault(sym, []).append(order)
+                continue
+
+            if otype not in {"stop", "stop_limit"}:
+                continue
             oside = _enum_str(getattr(order, "side", ""))
             pos = positions.get(sym)
             if pos is None:
@@ -1241,10 +1521,48 @@ class AlpacaBroker:
             valid_stops_by_symbol.setdefault(sym, []).append(order)
 
         live_pos_rows: list[dict[str, Any]] = []
-        now = self._now()
+        if blackout.halted:
+            warnings.append(
+                f"BLACKOUT_PERIOD halt active ({blackout.halt_reason}); all protective stop operations skipped"
+            )
 
         for sym, pos in sorted(positions.items()):
             signed_qty = pos["qty"]
+            if blackout.halted or sym in blackout.frozen_symbols:
+                untouched_blackout_positions.append(sym)
+                existing_frozen_stops = frozen_stops_by_symbol.get(sym, [])
+                expected_side = "sell" if signed_qty > 0.0 else "buy"
+                matching_frozen = [
+                    o for o in existing_frozen_stops if _enum_str(getattr(o, "side", "")) == expected_side
+                ]
+                chosen_frozen = matching_frozen[0] if matching_frozen else (
+                    existing_frozen_stops[0] if existing_frozen_stops else None
+                )
+                active_id = str(getattr(chosen_frozen, "id", "")) if chosen_frozen is not None else None
+                active_px = (
+                    _opt_float(getattr(chosen_frozen, "stop_price", None))
+                    if chosen_frozen is not None
+                    else None
+                )
+                if active_id:
+                    kept_stops[sym] = active_id
+                if not blackout.halted:
+                    warnings.append(
+                        f"{sym}: frozen by BLACKOUT_PERIOD; resting orders left untouched"
+                    )
+                live_pos_rows.append(
+                    {
+                        "symbol": sym,
+                        "qty": signed_qty,
+                        "avg_entry_price": pos["avg_entry_price"],
+                        "market_price": pos["market_price"],
+                        "unrealized_pnl": pos["unrealized_pnl"],
+                        "stop_order_id": active_id or None,
+                        "stop_price": active_px,
+                        "updated_at": now,
+                    }
+                )
+                continue
             is_long = signed_qty > 0.0
             protective_side = OrderSide.sell if is_long else OrderSide.buy
             target_qty, tif = self._resolve_stop_qty_and_tif(sym, signed_qty, warnings)
@@ -1442,6 +1760,8 @@ class AlpacaBroker:
             submitted_stops=submitted_stops,
             canceled_orphans=canceled_orphans,
             canceled_stale=canceled_stale,
+            untouched_blackout_positions=sorted(untouched_blackout_positions),
+            untouched_blackout_orders=sorted(untouched_blackout_orders),
             warnings=warnings,
             errors=errors,
         )
@@ -1461,6 +1781,28 @@ class AlpacaBroker:
         broker_positions = self.get_broker_positions()
         db_positions = {p["symbol"]: p for p in self.db.get_live_positions()}
         open_orders = self._fetch_open_orders()
+        observed_symbols = self._collect_observed_symbols(broker_positions, open_orders)
+        blackout = self.resolve_blackout_state(
+            now_utc=now,
+            observed_broker_symbols=observed_symbols,
+        )
+
+        untouched_blackout_positions = (
+            sorted(broker_positions.keys())
+            if blackout.halted
+            else sorted(sym for sym in broker_positions if sym in blackout.frozen_symbols)
+        )
+        untouched_blackout_orders = sorted(
+            {
+                str(getattr(order, "id", ""))
+                for order in open_orders
+                if getattr(order, "id", None)
+                and (
+                    blackout.halted
+                    or str(getattr(order, "symbol", "")).strip().upper() in blackout.frozen_symbols
+                )
+            }
+        )
 
         # 1. Diff positions between SQLite and broker ground truth
         position_diffs: list[dict[str, Any]] = []
@@ -1566,24 +1908,40 @@ class AlpacaBroker:
             else:
                 resting_stops[sym] = matching_qty_stops[0]
 
-        has_stop_anomalies = bool(
-            orphan_stop_symbols
-            or wrong_side_stop_symbols
-            or undersized_stop_symbols
-            or duplicate_stop_symbols
-        )
-
         # 4. Sync/repair protective stops or overwrite live_positions with broker ground truth
         stop_sync_result: StopSyncResult | None = None
         session_date = now.date().isoformat()
         run_id = f"reconcile-{now.strftime('%Y%m%dT%H%M%SZ')}"
+        non_frozen_missing = [
+            sym
+            for sym in missing_stop_symbols
+            if not blackout.halted and sym not in blackout.frozen_symbols
+        ]
+        non_frozen_undersized = [
+            sym
+            for sym in undersized_stop_symbols
+            if not blackout.halted and sym not in blackout.frozen_symbols
+        ]
+        non_frozen_anomalies = any(
+            not blackout.halted and sym not in blackout.frozen_symbols
+            for sym in (
+                orphan_stop_symbols
+                + wrong_side_stop_symbols
+                + undersized_stop_symbols
+                + duplicate_stop_symbols
+            )
+        )
         if desired_stops is not None:
             stop_sync_result = self.sync_protective_stops(
                 desired_stops, session_date=session_date, run_id=run_id
             )
-        elif repair_missing_stops and (missing_stop_symbols or has_stop_anomalies):
+        elif (
+            repair_missing_stops
+            and not blackout.halted
+            and (non_frozen_missing or non_frozen_anomalies)
+        ):
             repair_stops: dict[str, float] = {}
-            for sym in missing_stop_symbols + undersized_stop_symbols:
+            for sym in non_frozen_missing + non_frozen_undersized:
                 existing_sym_stops = same_side_stops.get(sym, [])
                 existing_stop_px = (
                     _opt_float(getattr(existing_sym_stops[0], "stop_price", None))
@@ -1633,8 +1991,8 @@ class AlpacaBroker:
         has_changes = bool(
             position_diffs
             or updated_orders
-            or missing_stop_symbols
-            or has_stop_anomalies
+            or non_frozen_missing
+            or non_frozen_anomalies
             or (
                 stop_sync_result is not None
                 and (
@@ -1662,6 +2020,8 @@ class AlpacaBroker:
                     "repaired_stops": (
                         sorted(stop_sync_result.submitted_stops) if stop_sync_result else []
                     ),
+                    "untouched_blackout_positions": untouched_blackout_positions,
+                    "untouched_blackout_orders": untouched_blackout_orders,
                 },
                 timestamp=now,
             )
@@ -1674,6 +2034,8 @@ class AlpacaBroker:
             position_diffs=position_diffs,
             updated_orders=updated_orders,
             missing_stop_symbols=missing_stop_symbols,
+            untouched_blackout_positions=untouched_blackout_positions,
+            untouched_blackout_orders=untouched_blackout_orders,
             stop_sync_result=stop_sync_result,
         )
 
@@ -1683,8 +2045,13 @@ class AlpacaBroker:
         confirm: bool,
         reason: str,
         actor: str = "operator",
+        override_blackout: bool = False,
     ) -> dict[str, Any]:
-        """Pause new entries, cancel all open orders, and market-close every open position."""
+        """Pause new entries, cancel open orders, and market-close open positions.
+
+        Respects BLACKOUT_PERIOD by leaving frozen positions and resting orders untouched
+        unless override_blackout=True is explicitly supplied.
+        """
         if not confirm:
             raise ValueError("emergency_flatten requires confirm=True")
         clean_reason = reason.strip()
@@ -1702,82 +2069,132 @@ class AlpacaBroker:
             now=now,
         )
 
-        canceled = self.trading_client.cancel_orders()
-        canceled_count = len(canceled) if isinstance(canceled, Sequence) else 0
-
-        # HIGH #3: Poll open orders until cancel acknowledgement drains before submitting closes
-        cancel_ack_timeout = max(10.0, self.poll_interval_seconds * 3.0)
-        cancel_started = self._now()
-        errors: list[str] = []
-        while True:
-            remaining_open = self._fetch_open_orders()
-            if not remaining_open:
-                break
-            elapsed = (self._now() - cancel_started).total_seconds()
-            if elapsed >= cancel_ack_timeout:
-                open_ids = [str(getattr(o, "id", "")) for o in remaining_open]
-                errors.append(
-                    f"cancel_orders timeout: {len(remaining_open)} open order(s) remained active ({open_ids})"
-                )
-                logger.warning("alpaca_emergency_flatten_cancel_timeout", open_order_ids=open_ids)
-                break
-            self._sleep(self.poll_interval_seconds)
-
+        open_orders = self._fetch_open_orders()
         positions = self.get_broker_positions()
-        run_id = f"flatten-{now.strftime('%Y%m%dT%H%M%SZ')}"
-        session_date = now.date().isoformat()
-        checkpoint = now.strftime("%H%M")
+        observed_symbols = self._collect_observed_symbols(positions, open_orders)
+        blackout = self.resolve_blackout_state(
+            now_utc=now,
+            observed_broker_symbols=observed_symbols,
+        )
+
+        errors: list[str] = []
+        skipped_blackout_symbols: list[str] = []
+        untouched_blackout_orders: list[str] = []
+        canceled_count = 0
         close_orders: list[dict[str, Any]] = []
 
-        for sym, pos in sorted(positions.items()):
-            signed_qty = pos["qty"]
-            close_side = OrderSide.sell if signed_qty > 0.0 else OrderSide.buy
-            close_qty = abs(signed_qty)
-            ref_px = pos["market_price"] if pos["market_price"] > 0 else pos["avg_entry_price"]
-            if ref_px <= 0.0:
-                ref_px = 1.0
-            cid = build_client_order_id(
-                session_date,
-                checkpoint,
-                sym,
-                close_side,
-                leg=f"f{uuid.uuid4().hex[:6]}",
+        if not override_blackout and blackout.halted:
+            skipped_blackout_symbols = sorted(positions.keys())
+            untouched_blackout_orders = sorted(
+                {str(getattr(o, "id", "")) for o in open_orders if getattr(o, "id", None)}
             )
-            try:
-                req = MarketOrderRequest(
-                    symbol=sym,
-                    qty=close_qty,
-                    side=_to_alpaca_side(close_side),
-                    time_in_force=TimeInForce.DAY,
-                    client_order_id=cid,
+            errors.append(
+                f"BLACKOUT_PERIOD halt active ({blackout.halt_reason}); "
+                "refusing emergency_flatten without override_blackout=True"
+            )
+        else:
+            frozen_set = (
+                frozenset() if override_blackout else blackout.frozen_symbols
+            )
+            cancel_ack_timeout = max(10.0, self.poll_interval_seconds * 3.0)
+
+            if frozen_set:
+                non_frozen_open_ids: list[str] = []
+                for order in open_orders:
+                    sym = str(getattr(order, "symbol", "")).strip().upper()
+                    oid = str(getattr(order, "id", ""))
+                    if not oid:
+                        continue
+                    if sym in frozen_set:
+                        untouched_blackout_orders.append(oid)
+                    else:
+                        non_frozen_open_ids.append(oid)
+
+                for oid in non_frozen_open_ids:
+                    if self._cancel_and_confirm(oid, timeout_seconds=cancel_ack_timeout):
+                        canceled_count += 1
+                    else:
+                        errors.append(f"failed to confirm cancel of non-blackout order {oid}")
+                untouched_blackout_orders = sorted(set(untouched_blackout_orders))
+            else:
+                canceled = self.trading_client.cancel_orders()
+                canceled_count = len(canceled) if isinstance(canceled, Sequence) else 0
+
+                # HIGH #3: Poll open orders until cancel acknowledgement drains before submitting closes
+                cancel_started = self._now()
+                while True:
+                    remaining_open = self._fetch_open_orders()
+                    if not remaining_open:
+                        break
+                    elapsed = (self._now() - cancel_started).total_seconds()
+                    if elapsed >= cancel_ack_timeout:
+                        open_ids = [str(getattr(o, "id", "")) for o in remaining_open]
+                        errors.append(
+                            f"cancel_orders timeout: {len(remaining_open)} open order(s) remained active ({open_ids})"
+                        )
+                        logger.warning(
+                            "alpaca_emergency_flatten_cancel_timeout", open_order_ids=open_ids
+                        )
+                        break
+                    self._sleep(self.poll_interval_seconds)
+
+            positions = self.get_broker_positions()
+            run_id = f"flatten-{now.strftime('%Y%m%dT%H%M%SZ')}"
+            session_date = now.date().isoformat()
+            checkpoint = now.strftime("%H%M")
+
+            for sym, pos in sorted(positions.items()):
+                if sym in frozen_set:
+                    skipped_blackout_symbols.append(sym)
+                    continue
+                signed_qty = pos["qty"]
+                close_side = OrderSide.sell if signed_qty > 0.0 else OrderSide.buy
+                close_qty = abs(signed_qty)
+                ref_px = pos["market_price"] if pos["market_price"] > 0 else pos["avg_entry_price"]
+                if ref_px <= 0.0:
+                    ref_px = 1.0
+                cid = build_client_order_id(
+                    session_date,
+                    checkpoint,
+                    sym,
+                    close_side,
+                    leg=f"f{uuid.uuid4().hex[:6]}",
                 )
-                submitted = self.trading_client.submit_order(req)
-                b_id, status, f_qty, f_px, _ = self._persist_broker_order(
-                    submitted,
-                    client_order_id=cid,
-                    run_id=run_id,
-                    symbol=sym,
-                    side=close_side,
-                    order_type="market",
-                    qty=close_qty,
-                    reference_price=ref_px,
-                    is_risk_reducing=True,
-                )
-                close_orders.append(
-                    {
-                        "symbol": sym,
-                        "side": close_side.value,
-                        "qty": close_qty,
-                        "client_order_id": cid,
-                        "broker_order_id": b_id,
-                        "status": status,
-                        "filled_qty": f_qty,
-                        "filled_avg_price": f_px,
-                    }
-                )
-            except Exception as exc:
-                errors.append(f"{sym}: {exc}")
-                logger.exception("alpaca_emergency_flatten_close_error", symbol=sym)
+                try:
+                    req = MarketOrderRequest(
+                        symbol=sym,
+                        qty=close_qty,
+                        side=_to_alpaca_side(close_side),
+                        time_in_force=TimeInForce.DAY,
+                        client_order_id=cid,
+                    )
+                    submitted = self.trading_client.submit_order(req)
+                    b_id, status, f_qty, f_px, _ = self._persist_broker_order(
+                        submitted,
+                        client_order_id=cid,
+                        run_id=run_id,
+                        symbol=sym,
+                        side=close_side,
+                        order_type="market",
+                        qty=close_qty,
+                        reference_price=ref_px,
+                        is_risk_reducing=True,
+                    )
+                    close_orders.append(
+                        {
+                            "symbol": sym,
+                            "side": close_side.value,
+                            "qty": close_qty,
+                            "client_order_id": cid,
+                            "broker_order_id": b_id,
+                            "status": status,
+                            "filled_qty": f_qty,
+                            "filled_avg_price": f_px,
+                        }
+                    )
+                except Exception as exc:
+                    errors.append(f"{sym}: {exc}")
+                    logger.exception("alpaca_emergency_flatten_close_error", symbol=sym)
 
         self.db.record_daemon_event(
             daemon_name="cli",
@@ -1785,8 +2202,11 @@ class AlpacaBroker:
             details={
                 "actor": actor,
                 "reason": clean_reason,
+                "override_blackout": override_blackout,
                 "canceled_orders": canceled_count,
                 "close_orders": close_orders,
+                "skipped_blackout_symbols": skipped_blackout_symbols,
+                "untouched_blackout_orders": untouched_blackout_orders,
                 "errors": errors,
             },
             timestamp=now,
@@ -1796,8 +2216,11 @@ class AlpacaBroker:
             "ok": len(errors) == 0,
             "paper_mode": self.settings.alpaca_paper,
             "paused_new_entries": dials.pause_new_entries,
+            "override_blackout": override_blackout,
             "canceled_orders": canceled_count,
             "close_orders": close_orders,
+            "skipped_blackout_symbols": skipped_blackout_symbols,
+            "untouched_blackout_orders": untouched_blackout_orders,
             "errors": errors,
             "actor": actor,
             "reason": clean_reason,

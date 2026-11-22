@@ -4,7 +4,7 @@ import json
 import math
 import sqlite3
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -283,6 +283,22 @@ class StateDB:
 
                     CREATE INDEX IF NOT EXISTS idx_daemon_events_type_ts
                         ON daemon_events (event_type, timestamp, id);
+
+                    CREATE TABLE IF NOT EXISTS etf_holdings (
+                        etf_symbol TEXT NOT NULL,
+                        holding_symbol TEXT NOT NULL,
+                        weight REAL NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        PRIMARY KEY (etf_symbol, holding_symbol)
+                    );
+
+                    CREATE TABLE IF NOT EXISTS etf_holdings_meta (
+                        etf_symbol TEXT PRIMARY KEY,
+                        is_non_equity_etf INTEGER NOT NULL DEFAULT 0,
+                        holdings_count INTEGER NOT NULL,
+                        min_top_weight REAL NOT NULL DEFAULT 0.0,
+                        updated_at TEXT NOT NULL
+                    );
                     """
             )
 
@@ -1770,5 +1786,154 @@ class StateDB:
                 series_id=str(row["series_id"]),
                 value=float(row["value"]),
             )
+            for row in rows
+        }
+
+    def upsert_etf_holdings(
+        self,
+        etf_symbol: str,
+        holdings: Mapping[str, float],
+        *,
+        is_non_equity_etf: bool = False,
+        updated_at: datetime | str | None = None,
+    ) -> int:
+        """Replace top holdings for an ETF and record refresh metadata."""
+        clean_etf = etf_symbol.strip().upper()
+        if not clean_etf:
+            raise ValueError("etf_symbol must not be empty")
+
+        clean_holdings: dict[str, float] = {}
+        for raw_sym, raw_weight in holdings.items():
+            sym = str(raw_sym).strip().upper()
+            if not sym:
+                continue
+            weight = float(raw_weight)
+            if not math.isfinite(weight) or weight < 0.0 or weight > 1.0:
+                raise ValueError(
+                    f"Invalid ETF holding weight for {clean_etf}/{sym}: {raw_weight!r}"
+                )
+            clean_holdings[sym] = weight
+
+        if sum(clean_holdings.values()) > 1.05:
+            raise ValueError(
+                f"ETF holdings weight sum {sum(clean_holdings.values()):.4f} exceeds 1.05 for {clean_etf}"
+            )
+
+        upd_iso = _coerce_ts_iso(updated_at)
+        holdings_count = len(clean_holdings)
+        min_top_weight = min(clean_holdings.values()) if clean_holdings else 0.0
+
+        with closing(self._connect(isolation_level=None)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM etf_holdings WHERE etf_symbol = ?", (clean_etf,))
+                if clean_holdings:
+                    conn.executemany(
+                        """
+                        INSERT INTO etf_holdings (
+                            etf_symbol, holding_symbol, weight, updated_at
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        [
+                            (clean_etf, holding_sym, weight, upd_iso)
+                            for holding_sym, weight in sorted(clean_holdings.items())
+                        ],
+                    )
+                conn.execute(
+                    """
+                    INSERT INTO etf_holdings_meta (
+                        etf_symbol, is_non_equity_etf, holdings_count, min_top_weight, updated_at
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(etf_symbol) DO UPDATE SET
+                        is_non_equity_etf = excluded.is_non_equity_etf,
+                        holdings_count = excluded.holdings_count,
+                        min_top_weight = excluded.min_top_weight,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        clean_etf,
+                        int(bool(is_non_equity_etf)),
+                        holdings_count,
+                        float(min_top_weight),
+                        upd_iso,
+                    ),
+                )
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+        return holdings_count
+
+    def get_etf_holdings(self, etf_symbol: str) -> dict[str, float]:
+        """Return stored top-holding weights keyed by uppercase holding symbol."""
+        clean_etf = etf_symbol.strip().upper()
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT holding_symbol, weight
+                    FROM etf_holdings
+                    WHERE etf_symbol = ?
+                    ORDER BY weight DESC, holding_symbol ASC
+                    """,
+                    (clean_etf,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return {}
+            raise
+        return {str(row["holding_symbol"]): float(row["weight"]) for row in rows}
+
+    def get_etf_holdings_meta(self, etf_symbol: str) -> dict[str, Any] | None:
+        """Return refresh metadata for a single ETF, or None if not cached."""
+        clean_etf = etf_symbol.strip().upper()
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT etf_symbol, is_non_equity_etf, holdings_count, min_top_weight, updated_at
+                    FROM etf_holdings_meta
+                    WHERE etf_symbol = ?
+                    """,
+                    (clean_etf,),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return None
+            raise
+        if row is None:
+            return None
+        return {
+            "etf_symbol": str(row["etf_symbol"]),
+            "is_non_equity_etf": bool(row["is_non_equity_etf"]),
+            "holdings_count": int(row["holdings_count"]),
+            "min_top_weight": float(row["min_top_weight"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def get_all_etf_holdings_meta(self) -> dict[str, dict[str, Any]]:
+        """Return refresh metadata for all cached ETFs keyed by uppercase ETF symbol."""
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT etf_symbol, is_non_equity_etf, holdings_count, min_top_weight, updated_at
+                    FROM etf_holdings_meta
+                    ORDER BY etf_symbol ASC
+                    """
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return {}
+            raise
+        return {
+            str(row["etf_symbol"]): {
+                "etf_symbol": str(row["etf_symbol"]),
+                "is_non_equity_etf": bool(row["is_non_equity_etf"]),
+                "holdings_count": int(row["holdings_count"]),
+                "min_top_weight": float(row["min_top_weight"]),
+                "updated_at": str(row["updated_at"]),
+            }
             for row in rows
         }

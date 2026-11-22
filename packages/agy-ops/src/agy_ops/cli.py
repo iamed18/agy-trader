@@ -270,7 +270,7 @@ def daemon_cmd(
     elif svc == "news-nlp":
         runner = NewsNlpDaemon(settings, resolved_data, resolved_config)
     else:
-        runner = TraderDaemon(settings, resolved_data, resolved_config)
+        runner = TraderDaemon(settings, resolved_data, resolved_config, require_env_file=True)
 
     if once:
         try:

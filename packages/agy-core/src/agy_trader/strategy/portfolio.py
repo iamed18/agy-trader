@@ -40,25 +40,38 @@ class PortfolioConstructor:
         as_of: datetime,
         universe_meta: Mapping[str, AssetRiskMetadata],
         current_weights: Mapping[str, float] | None = None,
+        frozen_symbols: set[str] | frozenset[str] = frozenset(),
     ) -> dict[str, float]:
         """Compute signed target portfolio weights (+long, -short) per symbol."""
         as_of_utc = ensure_utc(as_of)
         blacklist = dials.active_blacklist(as_of_utc)
+        frozen_set = frozenset(s.strip().upper() for s in frozen_symbols if s.strip())
         cur_w = dict(current_weights or {})
 
         if not signals:
-            # No fresh signals: respect blacklist, allow_shorting=False, and exposure_multiplier
+            # No fresh signals: lock frozen positions, respect blacklist, allow_shorting, and multiplier
             targets_empty: dict[str, float] = {}
             for sym, w in cur_w.items():
-                if sym in blacklist or (w < 0.0 and not dials.allow_shorting):
+                if sym in frozen_set:
+                    targets_empty[sym] = w
+                elif sym in blacklist or (w < 0.0 and not dials.allow_shorting):
                     targets_empty[sym] = 0.0
                 else:
                     targets_empty[sym] = w
-            cur_gross = sum(abs(w) for w in targets_empty.values())
+            frozen_gross = sum(
+                abs(w) for sym, w in targets_empty.items() if sym in frozen_set
+            )
+            non_frozen_gross = sum(
+                abs(w) for sym, w in targets_empty.items() if sym not in frozen_set
+            )
             max_allowed = self.risk.max_gross_exposure * dials.exposure_multiplier
-            if cur_gross > max_allowed and cur_gross > 1e-12:
-                scale_down = max_allowed / cur_gross
-                targets_empty = {sym: w * scale_down for sym, w in targets_empty.items()}
+            if frozen_gross + non_frozen_gross > max_allowed and non_frozen_gross > 1e-12:
+                remaining_budget = max(0.0, max_allowed - frozen_gross)
+                scale_down = remaining_budget / non_frozen_gross
+                targets_empty = {
+                    sym: (w if sym in frozen_set else w * scale_down)
+                    for sym, w in targets_empty.items()
+                }
             return targets_empty
 
         # Deduplicate signals by symbol (keep latest as_of <= as_of_utc)
@@ -77,6 +90,7 @@ class PortfolioConstructor:
                 as_of=as_of_utc,
                 universe_meta=universe_meta,
                 current_weights=cur_w,
+                frozen_symbols=frozen_set,
             )
 
         macro_scale = min(s.macro_regime_scale for s in deduped)
@@ -137,7 +151,8 @@ class PortfolioConstructor:
         long_cands = [
             s
             for s in deduped
-            if s.symbol not in blacklist
+            if s.symbol not in frozen_set
+            and s.symbol not in blacklist
             and s.symbol in universe_meta
             and _long_abs_ok(s)
             and s.composite_score
@@ -163,7 +178,8 @@ class PortfolioConstructor:
             short_cands = [
                 s
                 for s in deduped
-                if s.symbol not in blacklist
+                if s.symbol not in frozen_set
+                and s.symbol not in blacklist
                 and s.symbol not in selected_long_syms
                 and s.symbol in universe_meta
                 and universe_meta[s.symbol].shortable
@@ -183,7 +199,7 @@ class PortfolioConstructor:
 
         targets: dict[str, float] = {}
         for sym in set(cur_w.keys()) | {s.symbol for s in deduped}:
-            targets[sym] = 0.0
+            targets[sym] = cur_w.get(sym, 0.0) if sym in frozen_set else 0.0
 
         use_multi_sleeve = (
             self.strategy.waterfill_weights
@@ -198,18 +214,23 @@ class PortfolioConstructor:
                 selected_shorts=selected_shorts,
                 deduped_map=deduped_map,
                 blacklist=blacklist,
+                frozen_set=frozen_set,
                 dials=dials,
                 macro_scale=macro_scale,
                 risk_scale=risk_scale,
                 universe_meta=universe_meta,
             )
-            self._apply_sector_gross_cap(targets, universe_meta)
+            self._apply_sector_gross_cap(targets, universe_meta, frozen_set=frozen_set)
             gross_cap = self.risk.max_gross_exposure * dials.exposure_multiplier
-            cur_gross = sum(abs(w) for w in targets.values())
-            if cur_gross > gross_cap and cur_gross > 1e-12:
-                gs = gross_cap / cur_gross
+            frozen_gross = sum(abs(w) for sym, w in targets.items() if sym in frozen_set)
+            non_frozen_gross = sum(
+                abs(w) for sym, w in targets.items() if sym not in frozen_set
+            )
+            if frozen_gross + non_frozen_gross > gross_cap and non_frozen_gross > 1e-12:
+                gs = max(0.0, gross_cap - frozen_gross) / non_frozen_gross
                 for sym in targets:
-                    targets[sym] *= gs
+                    if sym not in frozen_set:
+                        targets[sym] *= gs
             effective_max_net = min(
                 self.risk.max_net_exposure,
                 self.risk.max_net_exposure * dials.exposure_multiplier,
@@ -218,9 +239,13 @@ class PortfolioConstructor:
                 self.risk.min_net_exposure,
                 self.risk.min_net_exposure * dials.exposure_multiplier,
             )
-            self._apply_net_exposure_bounds(targets, effective_max_net, effective_min_net)
+            self._apply_net_exposure_bounds(
+                targets, effective_max_net, effective_min_net, frozen_set=frozen_set
+            )
         else:
-            # Allocate gross budget across selected longs and shorts proportional to inverse ATR
+            # Allocate remaining gross budget across non-frozen selected longs and shorts
+            frozen_gross = sum(abs(w) for sym, w in targets.items() if sym in frozen_set)
+            avail_gross_budget = max(0.0, effective_gross_budget - frozen_gross)
             raw_inv_vol: dict[str, float] = {}
             for s in selected_longs:
                 raw_inv_vol[s.symbol] = 1.0 / max(s.atr_pct, 0.005)
@@ -231,26 +256,30 @@ class PortfolioConstructor:
                 raw_inv_vol[s.symbol] = cap_ratio / max(s.atr_pct, 0.005)
 
             total_inv_vol = sum(raw_inv_vol.values())
-            if total_inv_vol > 1e-12 and effective_gross_budget > 0.0:
+            if total_inv_vol > 1e-12 and avail_gross_budget > 0.0:
                 for s in selected_longs:
-                    w = effective_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
+                    w = avail_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
                     targets[s.symbol] = min(w, self.risk.max_long_position_pct)
                 for s in selected_shorts:
-                    w = effective_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
+                    w = avail_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
                     targets[s.symbol] = -min(w, self.risk.max_short_position_pct)
 
-            self._apply_sector_gross_cap(targets, universe_meta)
+            self._apply_sector_gross_cap(targets, universe_meta, frozen_set=frozen_set)
             effective_max_net = min(
                 self.risk.max_net_exposure, self.risk.max_net_exposure * risk_scale
             )
             effective_min_net = max(
                 self.risk.min_net_exposure, self.risk.min_net_exposure * risk_scale
             )
-            self._apply_net_exposure_bounds(targets, effective_max_net, effective_min_net)
+            self._apply_net_exposure_bounds(
+                targets, effective_max_net, effective_min_net, frozen_set=frozen_set
+            )
 
         # If ops paused new entries, clamp target magnitude so we never open or increase risk
         if dials.pause_new_entries:
             for sym, tgt in list(targets.items()):
+                if sym in frozen_set:
+                    continue
                 cw = cur_w.get(sym, 0.0)
                 if sym in blacklist or cw == 0.0:
                     targets[sym] = 0.0
@@ -269,21 +298,30 @@ class PortfolioConstructor:
         selected_shorts: list[SignalRow],
         deduped_map: Mapping[str, SignalRow],
         blacklist: set[str],
+        frozen_set: frozenset[str],
         dials: ControlDials,
         macro_scale: float,
         risk_scale: float,
         universe_meta: Mapping[str, AssetRiskMetadata],
     ) -> None:
+        frozen_long_used = sum(
+            w for sym, w in targets.items() if sym in frozen_set and w > 0.0
+        )
+        frozen_gross_used = sum(
+            abs(w) for sym, w in targets.items() if sym in frozen_set
+        )
         max_total_long = max(
             0.0,
             min(self.risk.max_net_exposure, self.risk.max_gross_exposure)
-            * dials.exposure_multiplier,
+            * dials.exposure_multiplier
+            - frozen_long_used,
         )
         short_syms = {s.symbol for s in selected_shorts}
         sh_candidates = [
             sym
             for sym in ("GLD", "TLT")
-            if sym not in blacklist
+            if sym not in frozen_set
+            and sym not in blacklist
             and sym not in short_syms
             and sym in universe_meta
             and sym in deduped_map
@@ -335,8 +373,10 @@ class PortfolioConstructor:
                 )
                 targets[sym] = min(w_val * eff_s, self.risk.max_long_position_pct)
 
-        used_total = sum(w for w in targets.values() if w > 0.0)
-        freed_budget = max(0.0, max_total_long - used_total)
+        used_non_frozen_long = sum(
+            w for sym, w in targets.items() if sym not in frozen_set and w > 0.0
+        )
+        freed_budget = max(0.0, max_total_long - used_non_frozen_long)
         if sh_candidates and freed_budget > 0.02 and self.strategy.safe_haven_rotation_fraction > 0.0:
             rotate_budget = min(
                 freed_budget * self.strategy.safe_haven_rotation_fraction,
@@ -359,8 +399,15 @@ class PortfolioConstructor:
         if selected_shorts:
             short_inv_vol = {s.symbol: 1.0 / max(s.atr_pct, 0.005) for s in selected_shorts}
             tot_short_iv = sum(short_inv_vol.values())
-            long_used = sum(w for w in targets.values() if w > 0.0)
-            gross_avail = max(0.0, self.risk.max_gross_exposure * risk_scale - long_used)
+            non_frozen_long_used = sum(
+                w for sym, w in targets.items() if sym not in frozen_set and w > 0.0
+            )
+            gross_avail = max(
+                0.0,
+                self.risk.max_gross_exposure * risk_scale
+                - non_frozen_long_used
+                - frozen_gross_used,
+            )
             short_budget = min(
                 gross_avail,
                 len(selected_shorts) * self.risk.max_short_position_pct,
@@ -374,18 +421,31 @@ class PortfolioConstructor:
         self,
         targets: dict[str, float],
         universe_meta: Mapping[str, AssetRiskMetadata],
+        *,
+        frozen_set: frozenset[str] = frozenset(),
     ) -> None:
         sector_totals: dict[str, float] = {}
+        sector_frozen_totals: dict[str, float] = {}
         for sym, w in targets.items():
             if abs(w) <= 1e-12 or sym not in universe_meta:
                 continue
             sec = universe_meta[sym].sector
             sector_totals[sec] = sector_totals.get(sec, 0.0) + abs(w)
+            if sym in frozen_set:
+                sector_frozen_totals[sec] = sector_frozen_totals.get(sec, 0.0) + abs(w)
         for sec, sec_gross in sector_totals.items():
             if sec_gross > self.risk.max_sector_gross_pct and sec_gross > 1e-12:
-                sec_scale = self.risk.max_sector_gross_pct / sec_gross
+                frozen_sec = sector_frozen_totals.get(sec, 0.0)
+                non_frozen_sec = sec_gross - frozen_sec
+                if non_frozen_sec <= 1e-12:
+                    continue
+                sec_scale = max(0.0, self.risk.max_sector_gross_pct - frozen_sec) / non_frozen_sec
                 for sym in list(targets.keys()):
-                    if sym in universe_meta and universe_meta[sym].sector == sec:
+                    if (
+                        sym not in frozen_set
+                        and sym in universe_meta
+                        and universe_meta[sym].sector == sec
+                    ):
                         targets[sym] *= sec_scale
 
     @staticmethod
@@ -393,21 +453,27 @@ class PortfolioConstructor:
         targets: dict[str, float],
         effective_max_net: float,
         effective_min_net: float,
+        *,
+        frozen_set: frozenset[str] = frozenset(),
     ) -> None:
         long_sum = sum(w for w in targets.values() if w > 0.0)
         short_sum = sum(-w for w in targets.values() if w < 0.0)
+        frozen_long = sum(w for sym, w in targets.items() if sym in frozen_set and w > 0.0)
+        frozen_short = sum(-w for sym, w in targets.items() if sym in frozen_set and w < 0.0)
+        non_frozen_long = long_sum - frozen_long
+        non_frozen_short = short_sum - frozen_short
         net_exp = long_sum - short_sum
-        if net_exp > effective_max_net and long_sum > 1e-12:
-            target_long_sum = max(0.0, short_sum + effective_max_net)
-            l_scale = target_long_sum / long_sum
+        if net_exp > effective_max_net and non_frozen_long > 1e-12:
+            target_non_frozen_long = max(0.0, short_sum + effective_max_net - frozen_long)
+            l_scale = min(1.0, target_non_frozen_long / non_frozen_long)
             for sym, w in list(targets.items()):
-                if w > 0.0:
+                if sym not in frozen_set and w > 0.0:
                     targets[sym] = w * l_scale
-        elif net_exp < effective_min_net and short_sum > 1e-12:
-            target_short_sum = max(0.0, long_sum - effective_min_net)
-            s_scale = target_short_sum / short_sum
+        elif net_exp < effective_min_net and non_frozen_short > 1e-12:
+            target_non_frozen_short = max(0.0, long_sum - effective_min_net - frozen_short)
+            s_scale = min(1.0, target_non_frozen_short / non_frozen_short)
             for sym, w in list(targets.items()):
-                if w < 0.0:
+                if sym not in frozen_set and w < 0.0:
                     targets[sym] = w * s_scale
 
     def build_proposed_orders(
@@ -419,12 +485,14 @@ class PortfolioConstructor:
         dials: ControlDials,
         as_of: datetime,
         universe_meta: Mapping[str, AssetRiskMetadata],
+        frozen_symbols: set[str] | frozenset[str] = frozenset(),
     ) -> list[ProposedOrder]:
         """Convert signals and current signed share positions into ProposedOrders."""
         if not math.isfinite(equity) or equity <= 0.0:
             return []
 
         as_of_utc = ensure_utc(as_of)
+        frozen_set = frozenset(s.strip().upper() for s in frozen_symbols if s.strip())
         signal_map: dict[str, SignalRow] = {}
         for s in signals:
             if s.as_of <= as_of_utc:
@@ -444,6 +512,7 @@ class PortfolioConstructor:
             as_of=as_of_utc,
             universe_meta=universe_meta,
             current_weights=current_weights,
+            frozen_symbols=frozen_set,
         )
 
         macro_scale = min((s.macro_regime_scale for s in signal_map.values()), default=1.0)
@@ -464,6 +533,8 @@ class PortfolioConstructor:
         deadband = self.strategy.rebalance_deadband_pct
 
         for sym in all_symbols:
+            if sym in frozen_set:
+                continue
             px = prices.get(sym, 0.0)
             if not math.isfinite(px) or px <= 0.0:
                 continue

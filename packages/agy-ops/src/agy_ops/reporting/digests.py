@@ -5,6 +5,11 @@ from pathlib import Path
 from typing import Any
 
 from agy_ops.daemons.common import NY_TZ, is_us_market_open_fallback
+from agy_trader.core.blackout import (
+    BlackoutResolution,
+    load_universe_for_blackout,
+    resolve_live_blackout,
+)
 from agy_trader.core.calendar import nyse_trading_days_apart
 from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ControlDials, MacroPoint, ensure_utc
@@ -39,6 +44,28 @@ def _safe_load_universe(config_dir: Path) -> list[Any]:
 
 def _active_model(settings: EnvSettings) -> str:
     return "ProsusAI/finbert" if settings.nlp_backend == "finbert" else "lexicon-v1"
+
+
+def _resolve_ops_blackout(
+    config_dir: Path,
+    db: StateDB | None,
+    now_utc: datetime,
+    settings: EnvSettings | None = None,
+) -> BlackoutResolution:
+    resolved_settings = settings or EnvSettings()
+    universe, universe_error = load_universe_for_blackout(config_dir)
+    env_path = Path(".env")
+    obs = [p["symbol"] for p in db.get_live_positions()] if db is not None else ()
+    return resolve_live_blackout(
+        env_file=env_path if env_path.exists() else None,
+        require_env_file=env_path.exists(),
+        fallback_raw=resolved_settings.blackout_period,
+        db=db,
+        universe=universe,
+        universe_error=universe_error,
+        observed_broker_symbols=obs,
+        now_utc=now_utc,
+    )
 
 
 def _expected_heartbeat_max_age(daemon_name: str, *, market_open: bool) -> float:
@@ -292,6 +319,30 @@ def build_readiness_report(
             f"Dials active (multiplier={dials.exposure_multiplier:.2f}, shorts={dials.allow_shorting})",
         )
 
+    # 9. BLACKOUT_PERIOD insider/restricted-trading rail
+    blackout = _resolve_ops_blackout(resolved_config, db, now, settings=settings)
+    if blackout.halted:
+        _add_check(
+            "blackout_period",
+            "critical",
+            f"BLACKOUT_PERIOD fail-closed HALT: {blackout.halt_reason}",
+        )
+    elif blackout.has_warnings:
+        _add_check(
+            "blackout_period",
+            "degraded",
+            f"BLACKOUT_PERIOD active ({', '.join(sorted(blackout.frozen_symbols)) or 'none'}) with ETF warnings: {'; '.join(blackout.warnings)}",
+        )
+    elif blackout.frozen_symbols:
+        etf_note = f" | ETFs: {'; '.join(blackout.etf_weights_summary)}" if blackout.etf_weights_summary else ""
+        _add_check(
+            "blackout_period",
+            "ok",
+            f"BLACKOUT_PERIOD active: frozen={', '.join(sorted(blackout.frozen_symbols))}{etf_note}",
+        )
+    else:
+        _add_check("blackout_period", "ok", "No active BLACKOUT_PERIOD restrictions")
+
     severities = {c["severity"] for c in checks}
     if "critical" in severities:
         status = "CRITICAL"
@@ -307,6 +358,7 @@ def build_readiness_report(
         "status": status,
         "checks": checks,
         "issues": issues,
+        "blackout": blackout.to_status_dict(),
         "summary": {
             "parquet_symbols": present_syms,
             "open_positions": len(positions),
@@ -335,6 +387,7 @@ def build_morning_plan(
     dials = db.get_control_dials() if db is not None else ControlDials()
     latest_snap = db.get_latest_portfolio_snapshot() if db is not None else None
     positions = db.get_live_positions() if db is not None else []
+    blackout = _resolve_ops_blackout(resolved_config, db, now)
 
     spy_bars = None
     bars_dir = resolved_data / "parquet" / "bars_1d"
@@ -425,6 +478,13 @@ def build_morning_plan(
 
     equity = float(latest_snap["equity"]) if latest_snap else app_cfg.backtest.initial_capital
     drawdown_pct = float(latest_snap["drawdown_pct"]) * 100.0 if latest_snap else 0.0
+    if blackout.halted:
+        blackout_summary_str = f"HALTED ({blackout.halt_reason})"
+    elif blackout.frozen_symbols:
+        etf_note = f" | {'; '.join(blackout.etf_weights_summary)}" if blackout.etf_weights_summary else ""
+        blackout_summary_str = f"Frozen={', '.join(sorted(blackout.frozen_symbols))}{etf_note}"
+    else:
+        blackout_summary_str = "None"
     md_lines = [
         f"# agy-trader Morning Plan ({today_et.isoformat()})",
         "",
@@ -432,6 +492,7 @@ def build_morning_plan(
         f"- **Open Positions:** {len(positions)}",
         f"- **PIT Macro Regime Scale:** {macro_scale:.4f}",
         f"- **Control Dials:** paused={dials.pause_new_entries}, multiplier={dials.exposure_multiplier:.2f}, allow_shorting={dials.allow_shorting}",
+        f"- **BLACKOUT_PERIOD Compliance:** {blackout_summary_str}",
         f"- **Earnings Blackouts Today:** {', '.join(e['symbol'] for e in earnings_blackouts) or 'None'}",
         f"- **Item 4.02 Restatement Blackouts:** {', '.join(r['symbol'] for r in restatement_blackouts) or 'None'}",
         f"- **Overnight Highlights (24h):** {len(overnight_news)} model news, {len(overnight_sec)} SEC filings, {len(overnight_fwd)} RSS/YF feeds",
@@ -453,6 +514,7 @@ def build_morning_plan(
         "positions": positions,
         "macro_regime_scale": macro_scale,
         "control_dials": dials.model_dump(mode="json"),
+        "blackout": blackout.to_status_dict(),
         "earnings_blackouts": earnings_blackouts,
         "restatement_blackouts": restatement_blackouts,
         "overnight_model_news": overnight_news,
@@ -479,6 +541,7 @@ def build_daily_summary(
     app_cfg = _safe_load_config(resolved_config)
     asset_types = {u.symbol: u.asset_type for u in _safe_load_universe(resolved_config)}
     db = _open_readonly_db(resolved_data)
+    blackout = _resolve_ops_blackout(resolved_config, db, now)
 
     first_snap = db.get_first_portfolio_snapshot() if db is not None else None
     latest_snap = db.get_latest_portfolio_snapshot() if db is not None else None
@@ -585,6 +648,13 @@ def build_daily_summary(
     )
     spy_str = f"{spy_cum_pct:+.2f}%" if spy_cum_pct is not None else "N/A"
     ew_str = f"{ew_cum_pct:+.2f}%" if ew_cum_pct is not None else "N/A"
+    if blackout.halted:
+        blackout_summary_str = f"HALTED ({blackout.halt_reason})"
+    elif blackout.frozen_symbols:
+        etf_note = f" | {'; '.join(blackout.etf_weights_summary)}" if blackout.etf_weights_summary else ""
+        blackout_summary_str = f"Frozen={', '.join(sorted(blackout.frozen_symbols))}{etf_note}"
+    else:
+        blackout_summary_str = "None"
     md_lines = [
         f"# agy-trader Daily Close Summary ({today_str})",
         "",
@@ -593,6 +663,7 @@ def build_daily_summary(
         f"- **Drawdown:** {drawdown_pct:.2f}% (Headroom to {halt_pct:.1f}% halt: {drawdown_headroom_pct:.2f}%)",
         f"- **15:40 ET Fills:** {len(todays_fills)} order(s) | Mean Slippage: {slip_text}",
         f"- **Open Positions:** {len(enriched_positions)}",
+        f"- **BLACKOUT_PERIOD Compliance:** {blackout_summary_str}",
     ]
 
     return {
@@ -606,6 +677,7 @@ def build_daily_summary(
         "drawdown_pct": round(drawdown_pct, 4),
         "max_drawdown_halt_pct": halt_pct,
         "drawdown_headroom_pct": drawdown_headroom_pct,
+        "blackout": blackout.to_status_dict(),
         "todays_fills": todays_fills,
         "mean_realized_slippage_bps": mean_slip_bps,
         "mean_backtest_budget_bps": mean_budget_bps,
