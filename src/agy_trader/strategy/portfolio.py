@@ -14,6 +14,12 @@ from agy_trader.core.models import (
     SignalRow,
     ensure_utc,
 )
+from agy_trader.strategy.features import SAFE_HAVEN_SECTORS, SAFE_HAVEN_SYMBOLS
+
+
+def _is_safe_haven(sym: str, universe_meta: Mapping[str, AssetRiskMetadata]) -> bool:
+    meta = universe_meta.get(sym)
+    return (meta is not None and meta.sector in SAFE_HAVEN_SECTORS) or (sym in SAFE_HAVEN_SYMBOLS)
 
 
 class PortfolioConstructor:
@@ -99,6 +105,15 @@ class PortfolioConstructor:
         def _is_held_short(s: SignalRow) -> bool:
             return cur_w.get(s.symbol, 0.0) < -1e-9
 
+        def _corr_ok(cand: SignalRow, chosen: list[SignalRow]) -> bool:
+            max_corr = self.strategy.max_pair_corr_60d
+            if max_corr is None or not chosen:
+                return True
+            return not any(
+                cand.peer_corr_60d.get(q.symbol, q.peer_corr_60d.get(cand.symbol, 0.0)) > max_corr
+                for q in chosen
+            )
+
         def _select_with_hysteresis(
             cands: list[SignalRow],
             top_k: int,
@@ -112,7 +127,7 @@ class PortfolioConstructor:
             for s in cands:
                 if len(selected) >= top_k:
                     break
-                if s.symbol not in selected_syms:
+                if s.symbol not in selected_syms and _corr_ok(s, selected):
                     selected.append(s)
                     selected_syms.add(s.symbol)
             selected.sort(key=sort_key)
@@ -170,24 +185,196 @@ class PortfolioConstructor:
         for sym in set(cur_w.keys()) | {s.symbol for s in deduped}:
             targets[sym] = 0.0
 
-        # Allocate gross budget across selected longs and shorts proportional to inverse ATR
-        raw_inv_vol: dict[str, float] = {}
-        for s in selected_longs:
-            raw_inv_vol[s.symbol] = 1.0 / max(s.atr_pct, 0.005)
-        for s in selected_shorts:
-            cap_ratio = self.risk.max_short_position_pct / max(self.risk.max_long_position_pct, 1e-6)
-            raw_inv_vol[s.symbol] = cap_ratio / max(s.atr_pct, 0.005)
+        use_multi_sleeve = (
+            self.strategy.waterfill_weights
+            or self.strategy.exempt_safe_havens_from_macro_scale
+            or self.strategy.safe_haven_rotation_fraction > 0.0
+        )
 
-        total_inv_vol = sum(raw_inv_vol.values())
-        if total_inv_vol > 1e-12 and effective_gross_budget > 0.0:
+        if use_multi_sleeve:
+            self._allocate_multi_sleeve_weights(
+                targets=targets,
+                selected_longs=selected_longs,
+                selected_shorts=selected_shorts,
+                deduped_map=deduped_map,
+                blacklist=blacklist,
+                dials=dials,
+                macro_scale=macro_scale,
+                risk_scale=risk_scale,
+                universe_meta=universe_meta,
+            )
+            self._apply_sector_gross_cap(targets, universe_meta)
+            gross_cap = self.risk.max_gross_exposure * dials.exposure_multiplier
+            cur_gross = sum(abs(w) for w in targets.values())
+            if cur_gross > gross_cap and cur_gross > 1e-12:
+                gs = gross_cap / cur_gross
+                for sym in targets:
+                    targets[sym] *= gs
+            effective_max_net = min(
+                self.risk.max_net_exposure,
+                self.risk.max_net_exposure * dials.exposure_multiplier,
+            )
+            effective_min_net = max(
+                self.risk.min_net_exposure,
+                self.risk.min_net_exposure * dials.exposure_multiplier,
+            )
+            self._apply_net_exposure_bounds(targets, effective_max_net, effective_min_net)
+        else:
+            # Allocate gross budget across selected longs and shorts proportional to inverse ATR
+            raw_inv_vol: dict[str, float] = {}
             for s in selected_longs:
-                w = effective_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
-                targets[s.symbol] = min(w, self.risk.max_long_position_pct)
+                raw_inv_vol[s.symbol] = 1.0 / max(s.atr_pct, 0.005)
             for s in selected_shorts:
-                w = effective_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
-                targets[s.symbol] = -min(w, self.risk.max_short_position_pct)
+                cap_ratio = self.risk.max_short_position_pct / max(
+                    self.risk.max_long_position_pct, 1e-6
+                )
+                raw_inv_vol[s.symbol] = cap_ratio / max(s.atr_pct, 0.005)
 
-        # Enforce sector gross concentration cap smoothly on target weights
+            total_inv_vol = sum(raw_inv_vol.values())
+            if total_inv_vol > 1e-12 and effective_gross_budget > 0.0:
+                for s in selected_longs:
+                    w = effective_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
+                    targets[s.symbol] = min(w, self.risk.max_long_position_pct)
+                for s in selected_shorts:
+                    w = effective_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
+                    targets[s.symbol] = -min(w, self.risk.max_short_position_pct)
+
+            self._apply_sector_gross_cap(targets, universe_meta)
+            effective_max_net = min(
+                self.risk.max_net_exposure, self.risk.max_net_exposure * risk_scale
+            )
+            effective_min_net = max(
+                self.risk.min_net_exposure, self.risk.min_net_exposure * risk_scale
+            )
+            self._apply_net_exposure_bounds(targets, effective_max_net, effective_min_net)
+
+        # If ops paused new entries, clamp target magnitude so we never open or increase risk
+        if dials.pause_new_entries:
+            for sym, tgt in list(targets.items()):
+                cw = cur_w.get(sym, 0.0)
+                if sym in blacklist or cw == 0.0:
+                    targets[sym] = 0.0
+                elif cw > 0.0:
+                    targets[sym] = max(0.0, min(cw, tgt))
+                else:
+                    targets[sym] = min(0.0, max(cw, tgt))
+
+        return targets
+
+    def _allocate_multi_sleeve_weights(
+        self,
+        *,
+        targets: dict[str, float],
+        selected_longs: list[SignalRow],
+        selected_shorts: list[SignalRow],
+        deduped_map: Mapping[str, SignalRow],
+        blacklist: set[str],
+        dials: ControlDials,
+        macro_scale: float,
+        risk_scale: float,
+        universe_meta: Mapping[str, AssetRiskMetadata],
+    ) -> None:
+        max_total_long = max(
+            0.0,
+            min(self.risk.max_net_exposure, self.risk.max_gross_exposure)
+            * dials.exposure_multiplier,
+        )
+        short_syms = {s.symbol for s in selected_shorts}
+        sh_candidates = [
+            sym
+            for sym in ("GLD", "TLT")
+            if sym not in blacklist
+            and sym not in short_syms
+            and sym in universe_meta
+            and sym in deduped_map
+            and deduped_map[sym].safe_haven_trend_ok
+        ]
+
+        if selected_longs:
+            raw_w: dict[str, float] = {}
+            for s in selected_longs:
+                base = 1.0 / max(s.atr_pct, 0.005)
+                if self.strategy.score_tilt_power > 0.0:
+                    base *= max(0.25, s.composite_score + 0.5) ** self.strategy.score_tilt_power
+                if self.strategy.corr_penalty_eta > 0.0 and len(selected_longs) >= 2:
+                    others = [o.symbol for o in selected_longs if o.symbol != s.symbol]
+                    mc = sum(max(0.0, s.peer_corr_60d.get(o, 0.0)) for o in others) / len(others)
+                    base /= 1.0 + self.strategy.corr_penalty_eta * mc
+                raw_w[s.symbol] = base
+
+            rem = max_total_long
+            unalloc = [s.symbol for s in selected_longs]
+            assigned = {sym: 0.0 for sym in unalloc}
+            for _ in range(len(unalloc)):
+                if not unalloc or rem <= 1e-9:
+                    break
+                sub_sum = sum(raw_w[u] for u in unalloc)
+                if sub_sum <= 1e-12:
+                    break
+                capped = False
+                for u in list(unalloc):
+                    cw = rem * (raw_w[u] / sub_sum)
+                    if cw >= self.risk.max_long_position_pct:
+                        assigned[u] = self.risk.max_long_position_pct
+                        rem -= self.risk.max_long_position_pct
+                        unalloc.remove(u)
+                        capped = True
+                if not capped:
+                    for u in unalloc:
+                        assigned[u] = rem * (raw_w[u] / sub_sum)
+                    break
+
+            for sym, w_val in assigned.items():
+                eff_s = (
+                    1.0
+                    if (
+                        self.strategy.exempt_safe_havens_from_macro_scale
+                        and _is_safe_haven(sym, universe_meta)
+                    )
+                    else macro_scale
+                )
+                targets[sym] = min(w_val * eff_s, self.risk.max_long_position_pct)
+
+        used_total = sum(w for w in targets.values() if w > 0.0)
+        freed_budget = max(0.0, max_total_long - used_total)
+        if sh_candidates and freed_budget > 0.02 and self.strategy.safe_haven_rotation_fraction > 0.0:
+            rotate_budget = min(
+                freed_budget * self.strategy.safe_haven_rotation_fraction,
+                freed_budget,
+            )
+            if rotate_budget > 0.01:
+                sh_raw = {
+                    sym: (1.0 / max(deduped_map[sym].ann_vol, 0.05))
+                    * max(0.3, deduped_map[sym].safe_haven_strength)
+                    for sym in sh_candidates
+                }
+                tot_sh = sum(sh_raw.values())
+                if tot_sh > 1e-12:
+                    for sym in sh_candidates:
+                        targets[sym] = min(
+                            self.risk.max_long_position_pct,
+                            targets.get(sym, 0.0) + rotate_budget * (sh_raw[sym] / tot_sh),
+                        )
+
+        if selected_shorts:
+            short_inv_vol = {s.symbol: 1.0 / max(s.atr_pct, 0.005) for s in selected_shorts}
+            tot_short_iv = sum(short_inv_vol.values())
+            long_used = sum(w for w in targets.values() if w > 0.0)
+            gross_avail = max(0.0, self.risk.max_gross_exposure * risk_scale - long_used)
+            short_budget = min(
+                gross_avail,
+                len(selected_shorts) * self.risk.max_short_position_pct,
+            )
+            if tot_short_iv > 1e-12 and short_budget > 0.0:
+                for s in selected_shorts:
+                    w = short_budget * (short_inv_vol[s.symbol] / tot_short_iv)
+                    targets[s.symbol] = -min(w, self.risk.max_short_position_pct)
+
+    def _apply_sector_gross_cap(
+        self,
+        targets: dict[str, float],
+        universe_meta: Mapping[str, AssetRiskMetadata],
+    ) -> None:
         sector_totals: dict[str, float] = {}
         for sym, w in targets.items():
             if abs(w) <= 1e-12 or sym not in universe_meta:
@@ -201,9 +388,12 @@ class PortfolioConstructor:
                     if sym in universe_meta and universe_meta[sym].sector == sec:
                         targets[sym] *= sec_scale
 
-        # Enforce net exposure bounds smoothly by scaling the dominant side
-        effective_max_net = min(self.risk.max_net_exposure, self.risk.max_net_exposure * risk_scale)
-        effective_min_net = max(self.risk.min_net_exposure, self.risk.min_net_exposure * risk_scale)
+    @staticmethod
+    def _apply_net_exposure_bounds(
+        targets: dict[str, float],
+        effective_max_net: float,
+        effective_min_net: float,
+    ) -> None:
         long_sum = sum(w for w in targets.values() if w > 0.0)
         short_sum = sum(-w for w in targets.values() if w < 0.0)
         net_exp = long_sum - short_sum
@@ -219,19 +409,6 @@ class PortfolioConstructor:
             for sym, w in list(targets.items()):
                 if w < 0.0:
                     targets[sym] = w * s_scale
-
-        # If ops paused new entries, clamp target magnitude so we never open or increase risk
-        if dials.pause_new_entries:
-            for sym, tgt in list(targets.items()):
-                cw = cur_w.get(sym, 0.0)
-                if sym in blacklist or cw == 0.0:
-                    targets[sym] = 0.0
-                elif cw > 0.0:
-                    targets[sym] = max(0.0, min(cw, tgt))
-                else:
-                    targets[sym] = min(0.0, max(cw, tgt))
-
-        return targets
 
     def build_proposed_orders(
         self,

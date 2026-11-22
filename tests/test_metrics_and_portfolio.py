@@ -68,6 +68,9 @@ def _sig(
     ret_5d: float = 0.0,
     ann_vol: float = 0.25,
     abs_trend_raw: float | None = None,
+    peer_corr_60d: dict[str, float] | None = None,
+    safe_haven_trend_ok: bool = False,
+    safe_haven_strength: float = 0.0,
 ) -> SignalRow:
     return SignalRow(
         as_of=as_of,
@@ -82,6 +85,9 @@ def _sig(
         ann_vol=ann_vol,
         ret_5d=ret_5d,
         abs_trend_raw=abs_trend_raw,
+        peer_corr_60d=peer_corr_60d or {},
+        safe_haven_trend_ok=safe_haven_trend_ok,
+        safe_haven_strength=safe_haven_strength,
     )
 
 
@@ -878,3 +884,117 @@ def test_one_sided_net_bounds_tighten_never_widen() -> None:
     ]
     targets = ctor.compute_target_weights(sigs, ControlDials(allow_shorting=True), as_of, meta)
     assert sum(targets.values()) <= -0.10 + 1e-9
+
+
+def test_portfolio_greedy_pair_corr_60d_decorrelation() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(
+        top_k_long=2,
+        top_k_short=0,
+        min_signal_threshold=0.0,
+        hold_rank_buffer=2,
+        max_pair_corr_60d=0.70,
+    )
+    risk = RiskConfig(
+        max_long_position_pct=0.25,
+        max_sector_gross_pct=1.0,
+        max_gross_exposure=1.0,
+        max_net_exposure=1.0,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    meta = {
+        "A": _meta("A", sector="Tech"),
+        "B": _meta("B", sector="Finance"),
+        "C": _meta("C", sector="Energy"),
+    }
+    sigs = [
+        _sig("A", as_of, composite_score=0.90, peer_corr_60d={"B": 0.85, "C": 0.40}),
+        _sig("B", as_of, composite_score=0.85, peer_corr_60d={"A": 0.85, "C": 0.50}),
+        _sig("C", as_of, composite_score=0.70, peer_corr_60d={"A": 0.40, "B": 0.50}),
+    ]
+
+    # From flat: A is picked first; B has corr=0.85 > 0.70 with A so B is skipped and C is picked
+    w_flat = ctor.compute_target_weights(sigs, ControlDials(), as_of, meta)
+    assert w_flat["A"] > 0.0
+    assert w_flat["B"] == 0.0
+    assert w_flat["C"] > 0.0
+
+    # If B is already held and inside rank buffer, B keeps its slot via hysteresis
+    w_held = ctor.compute_target_weights(
+        sigs, ControlDials(), as_of, meta, current_weights={"B": 0.10}
+    )
+    assert w_held["B"] > 0.0
+
+
+def test_portfolio_multi_sleeve_safe_haven_exemption_rotation_and_controls() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(
+        top_k_long=3,
+        top_k_short=0,
+        min_signal_threshold=0.0,
+        max_pair_corr_60d=0.70,
+        corr_penalty_eta=0.30,
+        score_tilt_power=0.15,
+        waterfill_weights=True,
+        exempt_safe_havens_from_macro_scale=True,
+        safe_haven_rotation_fraction=0.85,
+    )
+    risk = RiskConfig(
+        max_long_position_pct=0.20,
+        max_short_position_pct=0.06,
+        max_sector_gross_pct=0.35,
+        max_gross_exposure=1.00,
+        max_net_exposure=1.00,
+        min_net_exposure=-0.35,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    meta = {
+        "EQ1": _meta("EQ1", sector="Technology"),
+        "EQ2": _meta("EQ2", sector="Industrials"),
+        "GLD": _meta("GLD", sector="Commodities", asset_type=AssetType.etf),
+        "TLT": _meta("TLT", sector="Fixed Income", asset_type=AssetType.etf),
+    }
+
+    # Under stressed macro_regime_scale=0.60:
+    # - EQ1, EQ2, GLD are top_k_long=3 with identical atr_pct/corr/score -> each waterfills to 0.20 raw
+    # - EQ1, EQ2 get throttled to 0.20 * 0.60 = 0.12; GLD is exempt -> stays 0.20!
+    # - freed_budget = 1.0 - (0.12 + 0.12 + 0.20) = 0.56 -> 0.85 * 0.56 = 0.476 rotates into trending GLD/TLT
+    # - GLD is already at 0.20 cap; TLT rises up to 0.20 cap!
+    sigs = [
+        _sig("EQ1", as_of, composite_score=0.90, atr_pct=0.02, macro_regime_scale=0.60, peer_corr_60d={"EQ2": 0.2, "GLD": 0.0, "TLT": 0.0}),
+        _sig("EQ2", as_of, composite_score=0.90, atr_pct=0.02, macro_regime_scale=0.60, peer_corr_60d={"EQ1": 0.2, "GLD": 0.0, "TLT": 0.0}),
+        _sig("GLD", as_of, composite_score=0.90, atr_pct=0.02, macro_regime_scale=0.60, ann_vol=0.15, safe_haven_trend_ok=True, safe_haven_strength=1.2, peer_corr_60d={"EQ1": 0.0, "EQ2": 0.0, "TLT": 0.1}),
+        _sig("TLT", as_of, composite_score=-0.50, atr_pct=0.02, macro_regime_scale=0.60, ann_vol=0.15, safe_haven_trend_ok=True, safe_haven_strength=1.0, peer_corr_60d={"EQ1": 0.0, "EQ2": 0.0, "GLD": 0.1}),
+    ]
+    w = ctor.compute_target_weights(sigs, ControlDials(), as_of, meta)
+    assert w["EQ1"] == pytest.approx(0.12, abs=1e-9)
+    assert w["EQ2"] == pytest.approx(0.12, abs=1e-9)
+    assert w["GLD"] == pytest.approx(0.20, abs=1e-9)
+    assert w["TLT"] == pytest.approx(0.20, abs=1e-9)
+
+    # Blacklisted TLT must NOT receive rotation
+    w_bl = ctor.compute_target_weights(
+        sigs,
+        ControlDials(blacklisted_symbols={"TLT": as_of + timedelta(hours=6)}),
+        as_of,
+        meta,
+    )
+    assert w_bl["TLT"] == 0.0
+
+    # exposure_multiplier=0.50 caps total exposure <= 0.50
+    w_mult = ctor.compute_target_weights(
+        sigs, ControlDials(exposure_multiplier=0.50), as_of, meta
+    )
+    assert sum(abs(v) for v in w_mult.values()) <= 0.50 + 1e-9
+
+    # pause_new_entries=True blocks new entries (EQ1, TLT) while allowing existing (GLD)
+    w_paused = ctor.compute_target_weights(
+        sigs,
+        ControlDials(pause_new_entries=True),
+        as_of,
+        meta,
+        current_weights={"GLD": 0.15},
+    )
+    assert w_paused["EQ1"] == 0.0
+    assert w_paused["TLT"] == 0.0
+    assert 0.0 < w_paused["GLD"] <= 0.15 + 1e-9

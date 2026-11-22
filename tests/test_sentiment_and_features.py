@@ -514,3 +514,200 @@ def test_finbert_scorer_rejects_non_finite_probabilities(monkeypatch: pytest.Mon
 
     with pytest.raises(ValueError, match="non-finite probability"):
         scorer.score_texts(["AAPL beats estimates"])
+
+
+# ---------------------------------------------------------------------------
+# m2_residual & fast equity crash regime tests
+# ---------------------------------------------------------------------------
+
+
+def test_m2_residual_strict_zero_lookahead_and_fields() -> None:
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError, match="m2_residual weights"):
+        StrategyConfig(
+            momentum_mode="m2_residual",
+            m2_w_long=0.0,
+            m2_w_med=0.0,
+            m2_w_residual=0.0,
+        )
+
+    rng = np.random.default_rng(123)
+    n_bars = 320
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2024, 1, 2), periods=n_bars)]
+    symbols = ["SPY", "AAPL", "MSFT", "NVDA", "GLD", "TLT"]
+
+    bars: dict[str, pd.DataFrame] = {}
+    for idx, sym in enumerate(symbols):
+        drift = 0.0012 if sym == "GLD" else 0.0004 * (idx + 1)
+        rets = rng.normal(drift, 0.012, size=n_bars)
+        closes = 100.0 * np.exp(np.cumsum(rets))
+        bars[sym] = _make_price_df(bdays, closes)
+
+    cutoff_idx = 279
+    as_of_cut = datetime.combine(bdays[cutoff_idx], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+
+    past_news = {
+        "AAPL": [
+            _scored_article(
+                "m2-past-1",
+                as_of_cut - timedelta(hours=8),
+                "AAPL strong iPhone cycle",
+                0.80,
+                0.9,
+            )
+        ]
+    }
+    past_macro = [
+        MacroPoint(as_of_date=bdays[cutoff_idx - 4], series_id="VIXCLS", value=15.0),
+    ]
+
+    cfg = StrategyConfig(
+        momentum_mode="m2_residual",
+        w_trend=0.80,
+        w_pullback=0.0,
+        w_news_sentiment=0.20,
+        news_half_life_hours=48.0,
+        news_lookback_hours=120.0,
+        spy_sma200_defensive_scale=0.60,
+        spy_ema50_dual_scale=0.75,
+        spy_vol_surge_scale=0.65,
+        spy_ret10_crash_scale=0.60,
+    )
+    engine = FeatureEngine(cfg)
+    baseline = engine.build_signals(
+        as_of=as_of_cut,
+        bars_by_symbol=bars,
+        news_by_symbol=past_news,
+        macro_points=past_macro,
+    )
+    assert len(baseline) == len(symbols)
+    by_sym = {s.symbol: s for s in baseline}
+    assert set(by_sym["AAPL"].peer_corr_60d.keys()) == {"SPY", "MSFT", "NVDA", "GLD", "TLT"}
+    assert by_sym["AAPL"].abs_trend_raw is not None
+    assert by_sym["GLD"].safe_haven_trend_ok is True
+    assert by_sym["GLD"].safe_haven_strength > 0.0
+    assert by_sym["AAPL"].safe_haven_trend_ok is False
+    assert by_sym["AAPL"].safe_haven_strength == 0.0
+
+    # Mutate all future bars after cutoff_idx + inject future news & macro
+    mutated_bars: dict[str, pd.DataFrame] = {}
+    for idx, (sym, df) in enumerate(bars.items()):
+        df_mut = df.copy()
+        mult = 4.0 if idx % 2 == 0 else 0.15
+        for col in ("open", "high", "low", "close", "vwap"):
+            df_mut.loc[cutoff_idx + 1 :, col] = df_mut.loc[cutoff_idx + 1 :, col] * mult
+        mutated_bars[sym] = df_mut
+
+    mutated_news = {
+        sym: [
+            *past_news.get(sym, []),
+            _scored_article(
+                f"m2-fut-{sym}",
+                as_of_cut + timedelta(seconds=1),
+                f"{sym} future shock",
+                -1.0 if sym == "AAPL" else 1.0,
+                1.0,
+            ),
+        ]
+        for sym in symbols
+    }
+    mutated_macro = [
+        *past_macro,
+        MacroPoint(as_of_date=bdays[cutoff_idx], series_id="VIXCLS", value=50.0),
+        MacroPoint(as_of_date=bdays[cutoff_idx + 1], series_id="VIXCLS", value=60.0),
+    ]
+
+    after_mutation = engine.build_signals(
+        as_of=as_of_cut,
+        bars_by_symbol=mutated_bars,
+        news_by_symbol=mutated_news,
+        macro_points=mutated_macro,
+    )
+    assert after_mutation == baseline
+
+
+def test_compute_macro_regime_scale_fast_equity_crash_checks() -> None:
+    n_bars = 220
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2024, 1, 2), periods=n_bars)]
+    as_of = datetime.combine(bdays[-1], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+
+    # 1. Dual EMA20/EMA50 breakdown while price stays above SMA200 and >= 0.97 * EMA50:
+    # Rally strongly for 170 days (100 -> 200), then pull back gently over 50 days (200 -> 187)
+    # so last_close > SMA200 and last_close >= 0.97 * EMA50 (legacy=1.0), yet last_close < EMA50 and EMA20 < EMA50.
+    closes_dual = np.concatenate([np.linspace(100.0, 200.0, 170), np.linspace(200.0, 187.0, 50)])
+    spy_dual = _make_price_df(bdays, closes_dual, spread=0.001)
+    ema50_val = float(spy_dual["close"].ewm(span=50, adjust=False).mean().iloc[-1])
+    ema20_val = float(spy_dual["close"].ewm(span=20, adjust=False).mean().iloc[-1])
+    assert float(spy_dual["close"].iloc[-1]) > float(spy_dual["close"].tail(200).mean())
+    assert float(spy_dual["close"].iloc[-1]) >= ema50_val * 0.97
+    assert float(spy_dual["close"].iloc[-1]) < ema50_val and ema20_val < ema50_val
+    assert (
+        compute_macro_regime_scale(
+            as_of,
+            spy_dual,
+            None,
+            spy_sma200_defensive_scale=0.60,
+            spy_ema50_dual_scale=0.75,
+        )
+        == 0.75
+    )
+    # Without fast-crash options, legacy path ignores EMA20<EMA50 and returns 1.0
+    assert (
+        compute_macro_regime_scale(as_of, spy_dual, None, spy_sma200_defensive_scale=0.60)
+        == 1.0
+    )
+
+    # 2. 10d vol surge vs 60d baseline when SPY < EMA20 (above SMA200, 20d vol < 0.20, last_c >= 0.97 * ema50 -> legacy=1.0)
+    closes_vol = np.concatenate([np.linspace(100.0, 200.0, 210), np.full(10, 200.0)])
+    for i in range(9):
+        closes_vol[-10 + i] = 200.0 * (0.992 if i % 2 == 0 else 1.008)
+    closes_vol[-1] = 197.0
+    spy_vol = _make_price_df(bdays, closes_vol, spread=0.001)
+    assert (
+        compute_macro_regime_scale(as_of, spy_vol, None, spy_sma200_defensive_scale=0.60)
+        == 1.0
+    )
+    assert (
+        compute_macro_regime_scale(
+            as_of,
+            spy_vol,
+            None,
+            spy_sma200_defensive_scale=0.60,
+            spy_vol_surge_scale=0.65,
+            spy_vol_surge_thresh=1.65,
+        )
+        == 0.65
+    )
+
+    # 3. 10d return crash brake <= -0.055 and 0.20 floor (above SMA200 and >= 0.97 * EMA50 -> legacy=1.0)
+    closes_crash = np.concatenate([np.linspace(100.0, 200.0, 210), np.linspace(200.0, 188.0, 10)])
+    spy_crash = _make_price_df(bdays, closes_crash, spread=0.001)
+    assert (
+        compute_macro_regime_scale(as_of, spy_crash, None, spy_sma200_defensive_scale=0.60)
+        == 1.0
+    )
+    assert (
+        compute_macro_regime_scale(
+            as_of,
+            spy_crash,
+            None,
+            spy_sma200_defensive_scale=0.60,
+            spy_ret10_crash_scale=0.60,
+        )
+        == 0.60
+    )
+    assert (
+        compute_macro_regime_scale(
+            as_of,
+            spy_crash,
+            None,
+            spy_sma200_defensive_scale=0.60,
+            spy_ret10_crash_scale=0.10,
+        )
+        == 0.20
+    )

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from agy_trader.cli.main import app
@@ -471,4 +472,88 @@ def test_cli_score_news_walk_forward_empty_data_and_rich_tables(tmp_path: Path) 
     )
     assert res_ops_rich.exit_code == 0, res_ops_rich.output
     assert "Active Ops Control Dials" in res_ops_rich.stdout
+
+
+def test_cli_honors_nlp_backend_env_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from datetime import UTC, datetime
+
+    from agy_trader.core.models import NewsArticle
+    from agy_trader.nlp.sentiment import SentimentPrediction
+    from agy_trader.storage.db import StateDB
+
+    data_dir = tmp_path / "data"
+    db = StateDB(data_dir / "state.db")
+    db.upsert_news_articles(
+        [
+            NewsArticle(
+                article_id="env-news-1",
+                published_at=datetime(2025, 5, 1, 14, 0, tzinfo=UTC),
+                headline="NVDA beats guidance",
+                symbols=["NVDA"],
+            )
+        ]
+    )
+
+    seen_backends: list[str] = []
+
+    class _StubScorer:
+        def __init__(self, backend: str) -> None:
+            self.model_name = f"{backend}-stub"
+
+        def score_articles(self, articles: list[NewsArticle]) -> list[SentimentPrediction]:
+            return [
+                SentimentPrediction(
+                    score=0.5,
+                    label="positive",
+                    confidence=0.9,
+                    scorer_model=self.model_name,
+                )
+                for _ in articles
+            ]
+
+    def _fake_create_scorer(backend: str) -> _StubScorer:
+        seen_backends.append(backend)
+        return _StubScorer(backend)
+
+    monkeypatch.setattr("agy_trader.cli.main.create_sentiment_scorer", _fake_create_scorer)
+    monkeypatch.setenv("NLP_BACKEND", "finbert")
+
+    # 1. score-news without --backend picks up NLP_BACKEND=finbert
+    res_score = runner.invoke(
+        app,
+        [
+            "score-news",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_score.exit_code == 0, res_score.output
+    payload_score = json.loads(res_score.stdout)
+    assert payload_score["backend"] == "finbert"
+    assert payload_score["scorer_model"] == "finbert-stub"
+
+    # 2. backfill --synthetic without --score-backend still defaults to lexicon
+    res_syn = runner.invoke(
+        app,
+        [
+            "backfill",
+            "--synthetic",
+            "--days",
+            "80",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--json",
+        ],
+    )
+    assert res_syn.exit_code == 0, res_syn.output
+    payload_syn = json.loads(res_syn.stdout)
+    assert payload_syn["score_backend"] == "lexicon-stub"
+    assert seen_backends == ["finbert", "lexicon"]
 

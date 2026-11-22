@@ -775,6 +775,7 @@ class BacktestEngine:
                 pit_bars: dict[str, pd.DataFrame] = {}
                 fresh_bar_ages: list[float] = []
 
+                feature_lb = max(_FEATURE_LOOKBACK_BARS, strat_cfg.m2_long_lookback + 48)
                 for sym, df in sorted_bars.items():
                     # Exclude stale/halted symbols that lack a fresh bar at ts!
                     sym_last_ts = last_bar_ts.get(sym)
@@ -785,7 +786,7 @@ class BacktestEngine:
                         continue
                     end_idx = int(np.searchsorted(ts_arrays[sym], ts_ns, side="right"))
                     if end_idx >= MIN_HISTORY_BARS:
-                        start_idx = max(0, end_idx - _FEATURE_LOOKBACK_BARS)
+                        start_idx = max(0, end_idx - feature_lb)
                         pit_bars[sym] = df.iloc[start_idx:end_idx]
                         fresh_bar_ages.append(max(0.0, age_min))
 

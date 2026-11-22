@@ -1,37 +1,54 @@
 strategy:
   rebalance_checkpoints_et:
-    - "10:00"
-    - "13:00"
     - "15:40"
-  w_trend: 0.64
-  w_pullback: 0.11
-  w_news_sentiment: 0.25
+  momentum_mode: "m2_residual"
+  m2_long_lookback: 252
+  m2_long_skip: 21
+  m2_med_lookback: 126
+  m2_med_skip: 10
+  m2_w_long: 0.50
+  m2_w_med: 0.25
+  m2_w_residual: 0.25
+  w_trend: 0.80
+  w_pullback: 0.00
+  w_news_sentiment: 0.20
   news_half_life_hours: 48.0
   news_lookback_hours: 120.0
-  top_k_long: 8
-  top_k_short: 6
-  min_signal_threshold: 0.35
-  exit_signal_threshold: 0.0
+  top_k_long: 6
+  top_k_short: 0
+  min_signal_threshold: 0.0
+  exit_signal_threshold: -0.4
   rebalance_deadband_pct: 0.04
-  rebalance_every_n_days: 3
-  hold_rank_buffer: 6
-  abs_momentum_filter: false
+  rebalance_every_n_days: 1
+  hold_rank_buffer: 5
+  abs_momentum_filter: true
   short_only_in_bear_regime: true
-  spy_sma200_defensive_scale: 0.35
+  max_pair_corr_60d: 0.70
+  corr_penalty_eta: 0.30
+  score_tilt_power: 0.15
+  waterfill_weights: true
+  exempt_safe_havens_from_macro_scale: true
+  safe_haven_rotation_fraction: 0.85
+  spy_sma200_defensive_scale: 0.60
+  spy_ema50_dual_scale: 0.75
+  spy_vol_surge_scale: 0.65
+  spy_vol_surge_thresh: 1.65
+  spy_ret10_crash_thresh: -0.055
+  spy_ret10_crash_scale: 0.60
   allow_fractional_longs: true
 
 risk:
-  max_long_position_pct: 0.10
+  max_long_position_pct: 0.20
   max_short_position_pct: 0.06
   max_gross_exposure: 1.00
-  min_net_exposure: -0.25
-  max_net_exposure: 0.60
-  max_sector_gross_pct: 0.25
-  daily_loss_halt_pct: 0.02
-  max_drawdown_halt_pct: 0.08
+  min_net_exposure: -0.35
+  max_net_exposure: 1.00
+  max_sector_gross_pct: 0.35
+  daily_loss_halt_pct: 0.035
+  max_drawdown_halt_pct: 0.14
   earnings_blackout_days: 2
-  stop_loss_atr_mult_long: 2.5
-  stop_loss_atr_mult_short: 2.0
+  stop_loss_atr_mult_long: 3.5
+  stop_loss_atr_mult_short: 3.0
   short_squeeze_5d_return_cap: 0.20
   short_squeeze_ann_vol_cap: 0.90
   max_data_staleness_minutes: 15

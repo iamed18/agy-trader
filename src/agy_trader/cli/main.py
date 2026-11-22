@@ -154,18 +154,29 @@ def backfill_cmd(
     seed: Annotated[int, typer.Option("--seed", help="Random seed for synthetic generation")] = 42,
     allow_overwrite: Annotated[bool, typer.Option("--allow-overwrite", help="Allow overwriting overlapping Parquet bars")] = False,
     skip_news: Annotated[bool, typer.Option("--skip-news", help="Skip fetching and scoring news articles")] = False,
-    score_backend: Annotated[str, typer.Option("--score-backend", help="Sentiment scorer backend: lexicon|finbert")] = "lexicon",
+    score_backend: Annotated[
+        str | None,
+        typer.Option(
+            "--score-backend",
+            help="Sentiment scorer backend: lexicon|finbert (default: NLP_BACKEND, or lexicon for --synthetic)",
+        ),
+    ] = None,
     data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
 ) -> None:
     """Backfill market bars, news, macro series, and earnings calendar."""
     settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+    effective_backend = (
+        score_backend
+        if score_backend is not None
+        else ("lexicon" if synthetic else settings.nlp_backend)
+    )
 
     try:
         _ = load_app_config(resolved_config)
         universe = load_universe(resolved_config)
-        scorer = create_sentiment_scorer(score_backend)
+        scorer = create_sentiment_scorer(effective_backend)
     except (FileNotFoundError, OSError, TypeError, ValueError, ValidationError, yaml.YAMLError) as exc:
         _fail(str(exc), json_output=json_output)
         return
@@ -245,7 +256,11 @@ def backfill_cmd(
         earnings_events = earnings_provider.fetch_earnings(symbols)
         earnings_saved = db.upsert_earnings(earnings_events)
 
-        news_scored = 0 if skip_news else _score_unscored_news(db, scorer)
+        try:
+            news_scored = 0 if skip_news else _score_unscored_news(db, scorer)
+        except RuntimeError as exc:
+            _fail(str(exc), json_output=json_output)
+            return
         result_payload = {
             "mode": "alpaca",
             "days": days,
@@ -273,24 +288,32 @@ def backfill_cmd(
 @app.command("score-news")
 def score_news_cmd(
     ctx: typer.Context,
-    backend: Annotated[str, typer.Option("--backend", help="Sentiment backend: lexicon|finbert")] = "lexicon",
+    backend: Annotated[
+        str | None,
+        typer.Option("--backend", help="Sentiment backend: lexicon|finbert (default: NLP_BACKEND)"),
+    ] = None,
     batch_size: Annotated[int, typer.Option("--batch-size", min=1, help="Batch size per DB query")] = 500,
     data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
 ) -> None:
     """Score all unscored news articles in SQLite using the chosen NLP backend."""
-    _, resolved_data, _ = _resolve_paths(ctx, data_dir, config_dir)
+    settings, resolved_data, _ = _resolve_paths(ctx, data_dir, config_dir)
+    effective_backend = backend if backend is not None else settings.nlp_backend
     try:
-        scorer = create_sentiment_scorer(backend)
+        scorer = create_sentiment_scorer(effective_backend)
     except ValueError as exc:
         _fail(str(exc), json_output=json_output)
         return
 
     db, _ = _open_stores(resolved_data)
-    scored_count = _score_unscored_news(db, scorer, batch_size=batch_size)
+    try:
+        scored_count = _score_unscored_news(db, scorer, batch_size=batch_size)
+    except RuntimeError as exc:
+        _fail(str(exc), json_output=json_output)
+        return
     payload = {
-        "backend": backend.strip().lower(),
+        "backend": effective_backend.strip().lower(),
         "scorer_model": scorer.model_name,
         "scored_count": scored_count,
     }

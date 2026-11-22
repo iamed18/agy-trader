@@ -56,6 +56,14 @@ class StrategyConfig(BaseModel):
         default_factory=lambda: ["10:00", "13:00", "15:40"],
         min_length=1,
     )
+    momentum_mode: Literal["legacy", "m2_residual"] = "legacy"
+    m2_long_lookback: int = Field(default=252, ge=60, le=504)
+    m2_long_skip: int = Field(default=21, ge=0, le=63)
+    m2_med_lookback: int = Field(default=126, ge=40, le=252)
+    m2_med_skip: int = Field(default=10, ge=0, le=42)
+    m2_w_long: float = Field(default=0.50, ge=0.0, le=1.0)
+    m2_w_med: float = Field(default=0.25, ge=0.0, le=1.0)
+    m2_w_residual: float = Field(default=0.25, ge=0.0, le=1.0)
     w_trend: float = Field(default=0.45, ge=0.0, le=1.0)
     w_pullback: float = Field(default=0.25, ge=0.0, le=1.0)
     w_news_sentiment: float = Field(default=0.30, ge=0.0, le=1.0)
@@ -71,7 +79,18 @@ class StrategyConfig(BaseModel):
     exit_signal_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
     abs_momentum_filter: bool = False
     short_only_in_bear_regime: bool = False
+    max_pair_corr_60d: float | None = Field(default=None, ge=-1.0, le=1.0)
+    corr_penalty_eta: float = Field(default=0.0, ge=0.0, le=5.0)
+    score_tilt_power: float = Field(default=0.0, ge=0.0, le=2.0)
+    waterfill_weights: bool = False
+    exempt_safe_havens_from_macro_scale: bool = False
+    safe_haven_rotation_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     spy_sma200_defensive_scale: float | None = Field(default=None, ge=0.0, le=1.0)
+    spy_ema50_dual_scale: float | None = Field(default=None, ge=0.0, le=1.0)
+    spy_vol_surge_scale: float | None = Field(default=None, ge=0.0, le=1.0)
+    spy_vol_surge_thresh: float = Field(default=1.65, gt=0.0)
+    spy_ret10_crash_thresh: float = Field(default=-0.055, lt=0.0)
+    spy_ret10_crash_scale: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @field_validator("rebalance_checkpoints_et")
     @classmethod
@@ -88,6 +107,12 @@ class StrategyConfig(BaseModel):
         total = self.w_trend + self.w_pullback + self.w_news_sentiment
         if total <= 0.0:
             raise ValueError("Strategy signal weights must sum to > 0")
+        if self.momentum_mode == "m2_residual":
+            m2_total = self.m2_w_long + self.m2_w_med + self.m2_w_residual
+            if m2_total <= 0.0:
+                raise ValueError(
+                    "m2_residual weights (m2_w_long, m2_w_med, m2_w_residual) must sum to > 0"
+                )
         if self.news_lookback_hours < self.news_half_life_hours:
             raise ValueError("news_lookback_hours must be >= news_half_life_hours")
         if (

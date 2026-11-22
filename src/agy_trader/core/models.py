@@ -247,6 +247,9 @@ class SignalRow(_StrictModel):
     ann_vol: float = Field(ge=0.0)
     ret_5d: float
     abs_trend_raw: float | None = None
+    peer_corr_60d: dict[str, float] = Field(default_factory=dict)
+    safe_haven_trend_ok: bool = False
+    safe_haven_strength: float = 0.0
 
     @field_validator("symbol")
     @classmethod

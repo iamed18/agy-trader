@@ -11,12 +11,13 @@
 - **Verification State:**
   - `uv run ruff check src tests` -> **0 errors**
   - `uv run mypy src tests` -> **0 errors across 34 files**
-  - `uv run pytest -v` -> **67/67 tests passing**
-- **Adversarial Audit State:** All 4 Phase 1 Independent Adversarial Audit Gates cleared with **0 `CRITICAL`, 0 `HIGH`, and 0 unresolved code `MEDIUM` findings**:
+  - `uv run pytest -v` -> **72/72 tests passing**
+- **Adversarial Audit State:** All 5 Phase 1 Independent Adversarial Audit Gates cleared with **0 `CRITICAL`, 0 `HIGH`, and 0 `MEDIUM` findings remaining**:
   - [docs/audits/phase1_gate_a.md](audits/phase1_gate_a.md) — Data & Lookahead Bias (`PASS`)
   - [docs/audits/phase1_gate_b.md](audits/phase1_gate_b.md) — Risk Engine & Short-Safety Invariants (`PASS`)
   - [docs/audits/phase1_gate_c.md](audits/phase1_gate_c.md) — Backtest Accounting & Test Rigor (`PASS`)
   - [docs/audits/phase1_tuning_audit.md](audits/phase1_tuning_audit.md) — Real-Data Tuning, FinBERT & Turnover Controls (`PASS`)
+  - [docs/audits/phase1_h3_sharpe2_audit.md](audits/phase1_h3_sharpe2_audit.md) — `H3` Multi-Sleeve Residual Momentum, Decorrelation & Safe-Haven Rotation (`PASS`)
 
 ---
 
@@ -82,13 +83,14 @@ All architectural decisions below were explicitly agreed with the user during di
    # uv run agy score-news --backend finbert
    uv run agy backtest --ablate --walk-forward --folds 3
    ```
-4. **Completed Real-Data Tuning & FinBERT Validation (5-Year IS `2022–2024` -> Blind OOS `2025–2026`):**
-   - Tuned `config/strategy.yaml` (`rebalance_every_n_days: 3`, `rebalance_deadband_pct: 0.04`, `hold_rank_buffer: 6`, `exit_signal_threshold: 0.0`, `w_trend: 0.64`, `w_pullback: 0.11`, `w_news_sentiment: 0.25`, `news_half_life_hours: 48.0`, `news_lookback_hours: 120.0`, `short_only_in_bear_regime: true`, `spy_sma200_defensive_scale: 0.35`) with all hard `risk:` caps untouched.
-   - **4.2-Year Continuous (`2022-09-12..2026-11-20`, once 200 SPY bars active):** Long-Only + FinBERT delivered **`+50.55%`** (`+10.29%` CAGR, **`1.277` Sharpe**, `1.924` Sortino, `-8.17%` Max DD, `6.22x` turnover) vs. `SPY` `+77.72%` (`0.946` Sharpe, `-18.74%` Max DD).
-   - **Blind OOS (`2025-01-02..2026-11-20`):** Long-Only + FinBERT delivered **`+22.54%`** (**`1.382` Sharpe**, `2.041` Sortino, **`-5.27%` Max DD**, `6.48x` turnover vs. baseline `25.6x`) beating `SPY` (`+20.47%`, `0.674` Sharpe, `-18.74%` Max DD).
-   - **Phase 2 Live-Parity Requirements (from tuning audit):**
-     - Persist the `rebalance_every_n_days` trading-session counter in `StateDB` (do not rely on in-memory counters across restarts) and run daily-bar signal evaluation at a single canonical session checkpoint (`15:40 ET`), reserving the 30s loop for stops/broker sync/drawdown guards.
-     - Ensure at least 200 historical daily bars for `SPY` are backfilled on startup so `spy_sma200_defensive_scale` is active from day 1.
+4. **Completed `H3` Sharpe > 2.0 Quantitative Upgrade (`H3_M2_MildFC_cad1_pos20`):**
+   - Upgraded `FeatureEngine`, `PortfolioConstructor`, and `config/strategy.yaml` with `momentum_mode: "m2_residual"` (`0.50*z(Shp_252_21) + 0.25*z(Shp_126_10) + 0.25*z(CAPM_ResidShp_252_21)`), `abs_momentum_filter: true` (`Shp_120 > 0`), daily `cad=1` evaluation (`rebalance_checkpoints_et: ["15:40"]`) with strong hysteresis (`hold_rank_buffer: 5`, `exit_signal_threshold: -0.4`, `rebalance_deadband_pct: 0.04`), greedy 60d pairwise decorrelation (`max_pair_corr_60d: 0.70`), conviction-tilted correlation-penalized water-filling (`max_long_position_pct: 0.20`, `max_sector_gross_pct: 0.35`, `max_net_exposure: 1.00`, `stop_loss_atr_mult_long: 3.5`, `max_drawdown_halt_pct: 0.14`), fast PIT equity crash brakes, and unthrottled `GLD`/`TLT` safe-haven rotation (`safe_haven_rotation_fraction: 0.85`). `.env` updated to `NLP_BACKEND=finbert`.
+   - **4.2-Year Continuous (`2022-09-12..2026-11-20`):** **`+227.49%`** (`+32.83%` CAGR, **`2.110` Sharpe**, `3.329` Sortino, **`-9.18%` Max DD**, `6.83x` turnover; 50-perturbation median Sharpe `2.082`) vs. `SPY` `+77.72%` (`0.946` Sharpe, `-18.74%` Max DD).
+   - **5-Year Continuous + 5-Fold Walk-Forward (`2022-02-28..2026-11-20`, incl. 2022 Bear):** **`+223.30%`** (**`1.905` Sharpe**, `2.969` Sortino, `-10.55%` Max DD vs. `SPY -22.11%`); all 5 walk-forward folds positive (`0.281 / 2.484 / 2.534 / 2.266 / 1.281`, mean **`1.769`**).
+   - **Held-Out OOS (`2025-01-02..2026-11-20`):** **`+49.27%`** (**`1.670` Sharpe**, 5-start-day mean `1.752`, continuous OOS `1.778`, `2.527` Sortino, `-9.85%` Max DD, `7.22x` turnover) vs. `SPY` `+20.47%` (`0.674` Sharpe, `-18.74%` Max DD).
+   - **Phase 2 Live-Parity Requirements:**
+     - Run daily-bar signal evaluation once per trading session at `15:40 ET` (`rebalance_every_n_days: 1` eliminates multi-day session-phase tracking), reserving the 30s loop for stops/broker sync/drawdown guards.
+     - Ensure `>=300` historical daily bars per symbol (and `SPY`) are backfilled on startup so `m2_long_lookback: 252` and `spy_sma200_defensive_scale` are active from day 1.
      - Filter `StateDB.get_all_scored_news()` by active `scorer_model` (`ProsusAI/finbert`) if mixed models exist in SQLite.
 
 ---
