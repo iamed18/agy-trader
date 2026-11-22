@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>agy-trader · Read-Only Portfolio & Ops Dashboard</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="dot"></span>
+      <h1>agy-trader</h1>
+      <span class="badge badge-ro">READ-ONLY · 127.0.0.1</span>
+    </div>
+    <div class="topbar-meta">
+      <span id="wal-pill" class="badge">WAL: checking…</span>
+      <span id="dials-pill" class="badge">Dials: —</span>
+      <span id="last-updated" class="muted">Last refresh: —</span>
+      <button id="refresh-btn" class="btn" type="button">Refresh</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="kpi-grid" aria-label="Portfolio Overview">
+      <article class="card kpi">
+        <div class="kpi-label">Portfolio Equity</div>
+        <div id="kpi-equity" class="kpi-value">—</div>
+        <div id="kpi-cash" class="kpi-sub">Cash: — · BP: —</div>
+      </article>
+      <article class="card kpi">
+        <div class="kpi-label">Total Return vs Baselines</div>
+        <div id="kpi-total-ret" class="kpi-value">—</div>
+        <div id="kpi-baselines" class="kpi-sub">SPY: — · EW-50: —</div>
+      </article>
+      <article class="card kpi">
+        <div class="kpi-label">Daily P&amp;L &amp; Drawdown</div>
+        <div id="kpi-daily-pnl" class="kpi-value">—</div>
+        <div id="kpi-drawdown" class="kpi-sub">DD: — · HWM: —</div>
+      </article>
+      <article class="card kpi">
+        <div class="kpi-label">Exposure &amp; Dials</div>
+        <div id="kpi-exposure" class="kpi-value">—</div>
+        <div id="kpi-dials-detail" class="kpi-sub">Multiplier: — · Shorts: —</div>
+      </article>
+    </section>
+
+    <section class="charts-grid">
+      <article class="card chart-card">
+        <div class="card-header">
+          <h2>Normalized Performance (Base = 100)</h2>
+          <div class="legend">
+            <span class="leg-item"><i class="swatch sw-port"></i>Portfolio</span>
+            <span class="leg-item"><i class="swatch sw-spy"></i>SPY</span>
+            <span class="leg-item"><i class="swatch sw-ew"></i>EW-50</span>
+          </div>
+        </div>
+        <div id="equity-chart" class="chart-box"></div>
+      </article>
+
+      <article class="card chart-card">
+        <div class="card-header">
+          <h2>Portfolio Drawdown (%)</h2>
+          <span class="muted">Kill-switch: -14.0%</span>
+        </div>
+        <div id="drawdown-chart" class="chart-box"></div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Daemon Health &amp; Store Telemetry</h2>
+        <span id="store-counts" class="muted">—</span>
+      </div>
+      <div id="daemon-grid" class="daemon-grid"></div>
+    </section>
+
+    <section class="tables-grid">
+      <article class="card">
+        <div class="card-header">
+          <h2>Open Positions &amp; GTC Protective Stops</h2>
+          <span id="positions-count" class="muted">0 open</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th class="num">Qty</th>
+                <th class="num">Entry</th>
+                <th class="num">Mark</th>
+                <th class="num">Unrealized</th>
+                <th class="num">Stop</th>
+                <th class="num">Dist</th>
+                <th>Sync</th>
+              </tr>
+            </thead>
+            <tbody id="positions-body">
+              <tr><td colspan="9" class="empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+
+      <article class="card">
+        <div class="card-header">
+          <h2>Recent Orders &amp; Slippage vs Budget</h2>
+          <span id="orders-count" class="muted">0 orders</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Time (UTC)</th>
+                <th>Symbol</th>
+                <th>Side</th>
+                <th>Type</th>
+                <th class="num">Qty</th>
+                <th class="num">Fill Px</th>
+                <th class="num">Slip (bps)</th>
+                <th>Status</th>
+              </tr>
+            </thead>
+            <tbody id="orders-body">
+              <tr><td colspan="8" class="empty">Loading…</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </article>
+    </section>
+
+    <section class="card">
+      <div class="card-header">
+        <h2>Intelligence &amp; Control Audit Log</h2>
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="model_news" type="button">Model News</button>
+          <button class="tab" data-tab="forward_only_news" type="button">Forward RSS/YF</button>
+          <button class="tab" data-tab="sec_filings" type="button">SEC 4 / 8-K</button>
+          <button class="tab" data-tab="audit_log" type="button">Control Audit</button>
+        </div>
+      </div>
+      <div id="intel-panel" class="intel-list"></div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

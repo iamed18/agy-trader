@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agy-ops"
+version = "0.1.0"
+description = "Always-on daemons, read-only dashboard, and operational reporting for agy-trader"
+requires-python = ">=3.12"
+dependencies = [
+    "agy-core",
+    "fastapi>=0.115",
+    "uvicorn>=0.32",
+]
+
+[project.scripts]
+agy-ops = "agy_ops.cli:app"
+
+[tool.uv.sources]
+agy-core = { workspace = true }
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agy_ops"]

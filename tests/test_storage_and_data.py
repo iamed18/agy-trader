@@ -1273,3 +1273,209 @@ def test_feeds_collector_rss_and_yfinance(monkeypatch: pytest.MonkeyPatch) -> No
     assert yf_arts[1].symbols == ["GOOGL"]
 
 
+def test_state_db_read_only_mode_wal_integrity_and_live_tables(tmp_path) -> None:
+    # 1. read_only=True must NOT create parent dirs or DB files
+    missing_dir = tmp_path / "nonexistent_dir"
+    ro_missing = StateDB(missing_dir / "state.db", read_only=True)
+    assert not missing_dir.exists()
+    with pytest.raises(sqlite3.OperationalError):
+        ro_missing.get_live_positions()
+
+    # 2. Populate all 4 live tables + heartbeats via writable StateDB
+    db_path = tmp_path / "live" / "state.db"
+    db = StateDB(db_path)
+    ok, msg = db.check_wal_integrity()
+    assert ok is True
+    assert msg == "ok"
+
+    t0 = datetime(2026, 11, 20, 15, 40, tzinfo=UTC)
+    db.upsert_live_order(
+        client_order_id="agy:20261120:1540:AAPL:B:main",
+        broker_order_id="brk-1",
+        run_id="run-1",
+        symbol="aapl",
+        side="buy",
+        order_type="limit",
+        qty=10.0,
+        limit_price=200.30,
+        status="filled",
+        filled_qty=10.0,
+        filled_avg_price=200.10,
+        reference_price=200.00,
+        realized_slippage_bps=5.0,
+        is_risk_reducing=False,
+        submitted_at=t0,
+        updated_at=t0,
+    )
+    fetched_ord = db.get_live_order("agy:20261120:1540:AAPL:B:main")
+    assert fetched_ord is not None
+    assert fetched_ord["symbol"] == "AAPL"
+    assert fetched_ord["realized_slippage_bps"] == pytest.approx(5.0)
+    assert fetched_ord["is_risk_reducing"] is False
+    assert len(db.get_recent_live_orders(limit=10)) == 1
+
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "AAPL",
+                "qty": 10.0,
+                "avg_entry_price": 200.10,
+                "market_price": 201.00,
+                "unrealized_pnl": 9.0,
+                "stop_order_id": "stp-1",
+                "stop_price": 190.00,
+                "updated_at": t0,
+            },
+            {
+                "symbol": "TSLA",
+                "qty": -5.0,
+                "avg_entry_price": 250.00,
+                "market_price": 248.00,
+                "unrealized_pnl": 10.0,
+                "stop_order_id": "stp-2",
+                "stop_price": 265.00,
+                "updated_at": t0,
+            },
+        ]
+    )
+    # Second replace atomically replaces stale positions
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "AAPL",
+                "qty": 10.0,
+                "avg_entry_price": 200.10,
+                "market_price": 202.00,
+                "unrealized_pnl": 19.0,
+                "stop_order_id": "stp-1",
+                "stop_price": 190.00,
+                "updated_at": t0,
+            }
+        ]
+    )
+    positions = db.get_live_positions()
+    assert [p["symbol"] for p in positions] == ["AAPL"]
+    assert positions[0]["stop_order_id"] == "stp-1"
+
+    db.insert_portfolio_snapshot(
+        timestamp=t0,
+        equity=100_500.0,
+        cash=50_000.0,
+        buying_power=100_000.0,
+        gross_exposure=0.505,
+        net_exposure=0.505,
+        daily_pnl_pct=0.005,
+        drawdown_pct=0.0,
+        high_water_mark=100_500.0,
+        spy_close=595.25,
+        ew50_index=101.2,
+    )
+    latest_snap = db.get_latest_portfolio_snapshot()
+    assert latest_snap is not None
+    assert latest_snap["equity"] == pytest.approx(100_500.0)
+    assert len(db.get_portfolio_snapshots(limit=100)) == 1
+
+    assert db.has_session_rebalance_completed("2026-11-20", "15:40") is False
+    db.record_daemon_event(
+        "agy-trader",
+        "rebalance",
+        {"session_date": "2026-11-20", "checkpoint": "15:40", "status": "started"},
+        timestamp=t0,
+    )
+    assert db.has_session_rebalance_completed("2026-11-20", "15:40") is False
+    db.record_daemon_event(
+        "agy-trader",
+        "rebalance",
+        {"session_date": "2026-11-20", "checkpoint": "15:40", "status": "completed"},
+        timestamp=t0 + timedelta(seconds=15),
+    )
+    assert db.has_session_rebalance_completed("2026-11-20", "15:40") is True
+    assert len(db.get_daemon_events(daemon_name="agy-trader", event_type="rebalance")) == 2
+
+    db.upsert_daemon_heartbeat("agy-trader", "ok", {"loop_ms": 42}, now_utc=t0)
+    heartbeats = db.get_daemon_heartbeats()
+    assert heartbeats["agy-trader"]["status"] == "ok"
+    assert heartbeats["agy-trader"]["details"]["loop_ms"] == 42
+
+    # 3. read_only=True reads all tables cleanly & blocks all writes at SQLite layer
+    ro_db = StateDB(db_path, read_only=True)
+    assert len(ro_db.get_live_positions()) == 1
+    assert ro_db.get_latest_portfolio_snapshot() is not None
+    assert ro_db.has_session_rebalance_completed("2026-11-20", "15:40") is True
+    with pytest.raises(sqlite3.OperationalError):
+        ro_db.record_daemon_event("dashboard", "boot", {})
+    with pytest.raises(sqlite3.OperationalError):
+        ro_db.upsert_daemon_heartbeat("dashboard", "ok")
+
+    # 4. Corrupted DB fails check_wal_integrity()
+    corrupt_path = tmp_path / "corrupt.db"
+    corrupt_path.write_bytes(b"not a valid sqlite database file at all")
+    ro_corrupt = StateDB(corrupt_path, read_only=True)
+    corrupt_ok, corrupt_msg = ro_corrupt.check_wal_integrity()
+    assert corrupt_ok is False
+    assert corrupt_msg
+
+    # 5. HIGH #6, MEDIUM #11, LOW #14: telemetry pruning, index, open statuses, busy_timeout
+    with closing(db._connect()) as conn:
+        busy = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+        assert int(busy) == 30000
+        indexes = {
+            str(r[1])
+            for r in conn.execute("PRAGMA index_list('daemon_events');").fetchall()
+        }
+        assert "idx_daemon_events_type_ts" in indexes
+
+    # Insert >500 non-rebalance events after an older rebalance to prove no 500-row scan bug
+    old_ts = t0 - timedelta(days=120)
+    db.record_daemon_event(
+        "agy-trader",
+        "rebalance",
+        {"session_date": "2026-07-23", "checkpoint": "15:40", "status": "completed"},
+        timestamp=old_ts,
+    )
+    for i in range(520):
+        db.record_daemon_event(
+            "agy-trader",
+            "reconcile",
+            {"seq": i},
+            timestamp=old_ts + timedelta(minutes=i),
+        )
+    assert db.has_session_rebalance_completed("2026-07-23", "15:40") is True
+
+    db.insert_portfolio_snapshot(
+        timestamp=old_ts,
+        equity=90_000.0,
+        cash=50_000.0,
+        buying_power=100_000.0,
+        gross_exposure=0.4,
+        net_exposure=0.4,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=90_000.0,
+    )
+    pruned = db.prune_old_telemetry(keep_days=90, now_utc=t0)
+    assert pruned["daemon_events"] == 520
+    assert pruned["portfolio_snapshots"] == 1
+    # Rebalance checkpoints & recent snapshots are preserved
+    assert db.has_session_rebalance_completed("2026-07-23", "15:40") is True
+    assert len(db.get_portfolio_snapshots(limit=100)) == 1
+
+    # MEDIUM #11: get_open_live_orders includes accepted_for_bidding and calculated
+    for idx, st in enumerate(("accepted_for_bidding", "calculated")):
+        db.upsert_live_order(
+            client_order_id=f"agy:20261120:1540:SPY:B:m{idx}",
+            run_id="r-open",
+            symbol="SPY",
+            side="buy",
+            order_type="limit",
+            qty=1.0,
+            status=st,
+            reference_price=500.0,
+            is_risk_reducing=False,
+        )
+    open_cids = {o["client_order_id"] for o in db.get_open_live_orders()}
+    assert "agy:20261120:1540:SPY:B:m0" in open_cids
+    assert "agy:20261120:1540:SPY:B:m1" in open_cids
+
+
+

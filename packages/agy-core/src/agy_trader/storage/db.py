@@ -33,27 +33,57 @@ def _iso_to_dt(raw: str) -> datetime:
     return ensure_utc(datetime.fromisoformat(raw))
 
 
+def _coerce_ts_iso(ts: datetime | str | None) -> str:
+    if ts is None:
+        return _dt_to_iso(datetime.now(UTC))
+    if isinstance(ts, datetime):
+        return _dt_to_iso(ts)
+    return _dt_to_iso(_iso_to_dt(ts))
+
+
 class StateDB:
     """SQLite WAL-backed state and metadata store."""
 
-    def __init__(self, db_path: Path) -> None:
+    def __init__(self, db_path: Path, *, read_only: bool = False) -> None:
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._init_schema()
+        self.read_only = read_only
+        if not self.read_only:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
+            self._init_schema()
 
     def _connect(
         self,
         *,
         isolation_level: Literal["DEFERRED", "EXCLUSIVE", "IMMEDIATE"] | None = "DEFERRED",
     ) -> sqlite3.Connection:
+        if self.read_only:
+            uri = f"{self.db_path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(
+                uri,
+                uri=True,
+                timeout=30.0,
+                isolation_level=isolation_level,
+            )
+            try:
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only = ON;")
+                conn.execute("PRAGMA busy_timeout = 30000;")
+            except Exception:
+                conn.close()
+                raise
+            return conn
         conn = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
             isolation_level=isolation_level,
         )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA busy_timeout = 5000;")
+        try:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA foreign_keys = ON;")
+            conn.execute("PRAGMA busy_timeout = 30000;")
+        except Exception:
+            conn.close()
+            raise
         return conn
 
     def _init_schema(self) -> None:
@@ -184,6 +214,75 @@ class StateDB:
 
                     CREATE INDEX IF NOT EXISTS idx_service_restart_log_service_ts
                         ON service_restart_log (service, restarted_at);
+
+                    CREATE TABLE IF NOT EXISTS live_orders (
+                        client_order_id TEXT PRIMARY KEY,
+                        broker_order_id TEXT,
+                        run_id TEXT NOT NULL,
+                        symbol TEXT NOT NULL,
+                        side TEXT NOT NULL,
+                        order_type TEXT NOT NULL,
+                        qty REAL NOT NULL,
+                        limit_price REAL,
+                        stop_price REAL,
+                        status TEXT NOT NULL,
+                        filled_qty REAL NOT NULL DEFAULT 0.0,
+                        filled_avg_price REAL,
+                        reference_price REAL NOT NULL,
+                        realized_slippage_bps REAL,
+                        is_risk_reducing INTEGER NOT NULL,
+                        submitted_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_live_orders_symbol_sub
+                        ON live_orders (symbol, submitted_at);
+
+                    CREATE INDEX IF NOT EXISTS idx_live_orders_status
+                        ON live_orders (status);
+
+                    CREATE TABLE IF NOT EXISTS live_positions (
+                        symbol TEXT PRIMARY KEY,
+                        qty REAL NOT NULL,
+                        avg_entry_price REAL NOT NULL,
+                        market_price REAL NOT NULL,
+                        unrealized_pnl REAL NOT NULL,
+                        stop_order_id TEXT,
+                        stop_price REAL,
+                        updated_at TEXT NOT NULL
+                    );
+
+                    CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        equity REAL NOT NULL,
+                        cash REAL NOT NULL,
+                        buying_power REAL NOT NULL,
+                        gross_exposure REAL NOT NULL,
+                        net_exposure REAL NOT NULL,
+                        daily_pnl_pct REAL NOT NULL,
+                        drawdown_pct REAL NOT NULL,
+                        high_water_mark REAL NOT NULL,
+                        spy_close REAL,
+                        ew50_index REAL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts
+                        ON portfolio_snapshots (timestamp);
+
+                    CREATE TABLE IF NOT EXISTS daemon_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp TEXT NOT NULL,
+                        daemon_name TEXT NOT NULL,
+                        event_type TEXT NOT NULL,
+                        details_json TEXT NOT NULL DEFAULT '{}'
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_daemon_events_name_type_ts
+                        ON daemon_events (daemon_name, event_type, timestamp);
+
+                    CREATE INDEX IF NOT EXISTS idx_daemon_events_type_ts
+                        ON daemon_events (event_type, timestamp, id);
                     """
             )
 
@@ -951,4 +1050,725 @@ class StateDB:
             "sec_filings": int(sec_filings),
             "macro_points": int(macro_points),
             "backtest_runs": int(backtest_runs),
+        }
+
+    # ------------------------------------------------------------------
+    # Phase 2 Live-Execution & Daemon Operations
+    # ------------------------------------------------------------------
+
+    def check_wal_integrity(self) -> tuple[bool, str]:
+        """Run PRAGMA quick_check to verify SQLite WAL database integrity."""
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute("PRAGMA quick_check;").fetchall()
+        except sqlite3.DatabaseError as exc:
+            return False, str(exc)
+        messages = [str(row[0]) for row in rows if row]
+        if messages == ["ok"]:
+            return True, "ok"
+        detail = "; ".join(messages) if messages else "empty quick_check result"
+        return False, detail
+
+    @staticmethod
+    def _row_to_live_order(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "client_order_id": str(row["client_order_id"]),
+            "broker_order_id": (
+                str(row["broker_order_id"]) if row["broker_order_id"] is not None else None
+            ),
+            "run_id": str(row["run_id"]),
+            "symbol": str(row["symbol"]),
+            "side": str(row["side"]),
+            "order_type": str(row["order_type"]),
+            "qty": float(row["qty"]),
+            "limit_price": (
+                float(row["limit_price"]) if row["limit_price"] is not None else None
+            ),
+            "stop_price": float(row["stop_price"]) if row["stop_price"] is not None else None,
+            "status": str(row["status"]),
+            "filled_qty": float(row["filled_qty"]),
+            "filled_avg_price": (
+                float(row["filled_avg_price"]) if row["filled_avg_price"] is not None else None
+            ),
+            "reference_price": float(row["reference_price"]),
+            "realized_slippage_bps": (
+                float(row["realized_slippage_bps"])
+                if row["realized_slippage_bps"] is not None
+                else None
+            ),
+            "is_risk_reducing": bool(row["is_risk_reducing"]),
+            "submitted_at": str(row["submitted_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+
+    def upsert_live_order(
+        self,
+        *,
+        client_order_id: str,
+        run_id: str,
+        symbol: str,
+        side: str,
+        order_type: str,
+        qty: float,
+        status: str,
+        reference_price: float,
+        is_risk_reducing: bool,
+        broker_order_id: str | None = None,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        filled_qty: float = 0.0,
+        filled_avg_price: float | None = None,
+        realized_slippage_bps: float | None = None,
+        submitted_at: datetime | str | None = None,
+        updated_at: datetime | str | None = None,
+    ) -> None:
+        clean_cid = client_order_id.strip()
+        if not clean_cid:
+            raise ValueError("client_order_id must not be empty")
+        clean_sym = symbol.strip().upper()
+        if not clean_sym:
+            raise ValueError("symbol must not be empty")
+        sub_iso = _coerce_ts_iso(submitted_at)
+        upd_iso = _coerce_ts_iso(updated_at)
+
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO live_orders (
+                    client_order_id, broker_order_id, run_id, symbol, side,
+                    order_type, qty, limit_price, stop_price, status,
+                    filled_qty, filled_avg_price, reference_price,
+                    realized_slippage_bps, is_risk_reducing, submitted_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(client_order_id) DO UPDATE SET
+                    broker_order_id = COALESCE(excluded.broker_order_id, live_orders.broker_order_id),
+                    status = excluded.status,
+                    limit_price = COALESCE(excluded.limit_price, live_orders.limit_price),
+                    stop_price = COALESCE(excluded.stop_price, live_orders.stop_price),
+                    filled_qty = excluded.filled_qty,
+                    filled_avg_price = COALESCE(excluded.filled_avg_price, live_orders.filled_avg_price),
+                    realized_slippage_bps = COALESCE(
+                        excluded.realized_slippage_bps, live_orders.realized_slippage_bps
+                    ),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    clean_cid,
+                    broker_order_id,
+                    run_id,
+                    clean_sym,
+                    side.strip().lower(),
+                    order_type.strip().lower(),
+                    float(qty),
+                    float(limit_price) if limit_price is not None else None,
+                    float(stop_price) if stop_price is not None else None,
+                    status.strip().lower(),
+                    float(filled_qty),
+                    float(filled_avg_price) if filled_avg_price is not None else None,
+                    float(reference_price),
+                    (
+                        float(realized_slippage_bps)
+                        if realized_slippage_bps is not None
+                        else None
+                    ),
+                    int(bool(is_risk_reducing)),
+                    sub_iso,
+                    upd_iso,
+                ),
+            )
+
+    @staticmethod
+    def _is_missing_table(exc: sqlite3.OperationalError) -> bool:
+        return "no such table" in str(exc).lower()
+
+    def get_live_order(self, client_order_id: str) -> dict[str, Any] | None:
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    "SELECT * FROM live_orders WHERE client_order_id = ?",
+                    (client_order_id.strip(),),
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return None
+            raise
+        if row is None:
+            return None
+        return self._row_to_live_order(row)
+
+    def get_recent_live_orders(self, limit: int = 100) -> list[dict[str, Any]]:
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM live_orders
+                    ORDER BY submitted_at DESC, rowid DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return []
+            raise
+        return [self._row_to_live_order(row) for row in rows]
+
+    def get_open_live_orders(self) -> list[dict[str, Any]]:
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                    FROM live_orders
+                    WHERE status IN (
+                        'new', 'accepted', 'partially_filled', 'pending_new',
+                        'pending_cancel', 'pending_replace', 'held', 'stopped',
+                        'accepted_for_bidding', 'calculated'
+                    )
+                    ORDER BY submitted_at ASC, rowid ASC
+                    """
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return []
+            raise
+        return [self._row_to_live_order(row) for row in rows]
+
+    def replace_live_positions(self, positions: Sequence[dict[str, Any]]) -> int:
+        now_iso = _dt_to_iso(datetime.now(UTC))
+        rows_to_insert: list[tuple[Any, ...]] = []
+        for pos in positions:
+            sym = str(pos["symbol"]).strip().upper()
+            if not sym:
+                raise ValueError("Position symbol must not be empty")
+            upd_iso = _coerce_ts_iso(pos.get("updated_at")) if pos.get("updated_at") else now_iso
+            stop_px_raw = pos.get("stop_price")
+            rows_to_insert.append(
+                (
+                    sym,
+                    float(pos["qty"]),
+                    float(pos["avg_entry_price"]),
+                    float(pos["market_price"]),
+                    float(pos["unrealized_pnl"]),
+                    str(pos["stop_order_id"]) if pos.get("stop_order_id") is not None else None,
+                    float(stop_px_raw) if stop_px_raw is not None else None,
+                    upd_iso,
+                )
+            )
+
+        with closing(self._connect(isolation_level=None)) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM live_positions")
+                if rows_to_insert:
+                    conn.executemany(
+                        """
+                        INSERT INTO live_positions (
+                            symbol, qty, avg_entry_price, market_price,
+                            unrealized_pnl, stop_order_id, stop_price, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        rows_to_insert,
+                    )
+                conn.execute("COMMIT")
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+        return len(rows_to_insert)
+
+    def get_live_positions(self) -> list[dict[str, Any]]:
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    "SELECT * FROM live_positions ORDER BY symbol ASC"
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return []
+            raise
+        return [
+            {
+                "symbol": str(row["symbol"]),
+                "qty": float(row["qty"]),
+                "avg_entry_price": float(row["avg_entry_price"]),
+                "market_price": float(row["market_price"]),
+                "unrealized_pnl": float(row["unrealized_pnl"]),
+                "stop_order_id": (
+                    str(row["stop_order_id"]) if row["stop_order_id"] is not None else None
+                ),
+                "stop_price": (
+                    float(row["stop_price"]) if row["stop_price"] is not None else None
+                ),
+                "updated_at": str(row["updated_at"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _row_to_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": int(row["id"]),
+            "timestamp": str(row["timestamp"]),
+            "equity": float(row["equity"]),
+            "cash": float(row["cash"]),
+            "buying_power": float(row["buying_power"]),
+            "gross_exposure": float(row["gross_exposure"]),
+            "net_exposure": float(row["net_exposure"]),
+            "daily_pnl_pct": float(row["daily_pnl_pct"]),
+            "drawdown_pct": float(row["drawdown_pct"]),
+            "high_water_mark": float(row["high_water_mark"]),
+            "spy_close": float(row["spy_close"]) if row["spy_close"] is not None else None,
+            "ew50_index": float(row["ew50_index"]) if row["ew50_index"] is not None else None,
+        }
+
+    def insert_portfolio_snapshot(
+        self,
+        *,
+        timestamp: datetime | str | None = None,
+        equity: float,
+        cash: float,
+        buying_power: float,
+        gross_exposure: float,
+        net_exposure: float,
+        daily_pnl_pct: float,
+        drawdown_pct: float,
+        high_water_mark: float,
+        spy_close: float | None = None,
+        ew50_index: float | None = None,
+    ) -> int:
+        required = (
+            equity,
+            cash,
+            buying_power,
+            gross_exposure,
+            net_exposure,
+            daily_pnl_pct,
+            drawdown_pct,
+            high_water_mark,
+        )
+        if not all(math.isfinite(float(v)) for v in required):
+            raise ValueError("Portfolio snapshot numeric fields must be finite")
+        ts_iso = _coerce_ts_iso(timestamp)
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                """
+                INSERT INTO portfolio_snapshots (
+                    timestamp, equity, cash, buying_power, gross_exposure,
+                    net_exposure, daily_pnl_pct, drawdown_pct, high_water_mark,
+                    spy_close, ew50_index
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    ts_iso,
+                    float(equity),
+                    float(cash),
+                    float(buying_power),
+                    float(gross_exposure),
+                    float(net_exposure),
+                    float(daily_pnl_pct),
+                    float(drawdown_pct),
+                    float(high_water_mark),
+                    float(spy_close) if spy_close is not None else None,
+                    float(ew50_index) if ew50_index is not None else None,
+                ),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_portfolio_snapshots(self, limit: int = 5000) -> list[dict[str, Any]]:
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM (
+                        SELECT *
+                        FROM portfolio_snapshots
+                        ORDER BY timestamp DESC, id DESC
+                        LIMIT ?
+                    )
+                    ORDER BY timestamp ASC, id ASC
+                    """,
+                    (limit,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return []
+            raise
+        return [self._row_to_snapshot(row) for row in rows]
+
+    def get_first_portfolio_snapshot(self) -> dict[str, Any] | None:
+        """Return the earliest portfolio snapshot in O(1) via primary key."""
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM portfolio_snapshots
+                    ORDER BY id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return None
+            raise
+        if row is None:
+            return None
+        return self._row_to_snapshot(row)
+
+    def get_latest_portfolio_snapshot(self) -> dict[str, Any] | None:
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM portfolio_snapshots
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT 1
+                    """
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return None
+            raise
+        if row is None:
+            return None
+        return self._row_to_snapshot(row)
+
+    def record_daemon_event(
+        self,
+        daemon_name: str,
+        event_type: str,
+        details: dict[str, Any] | None = None,
+        timestamp: datetime | str | None = None,
+    ) -> int:
+        clean_daemon = daemon_name.strip()
+        clean_type = event_type.strip().lower()
+        if not clean_daemon or not clean_type:
+            raise ValueError("daemon_name and event_type must be non-empty")
+        ts_iso = _coerce_ts_iso(timestamp)
+        details_json = json.dumps(details or {}, sort_keys=True, default=str)
+        with closing(self._connect()) as conn, conn:
+            cur = conn.execute(
+                """
+                INSERT INTO daemon_events (timestamp, daemon_name, event_type, details_json)
+                VALUES (?, ?, ?, ?)
+                """,
+                (ts_iso, clean_daemon, clean_type, details_json),
+            )
+            return int(cur.lastrowid or 0)
+
+    def get_daemon_events(
+        self,
+        daemon_name: str | None = None,
+        event_type: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if daemon_name is not None:
+            clauses.append("daemon_name = ?")
+            params.append(daemon_name.strip())
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type.strip().lower())
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(limit)
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    f"""
+                    SELECT id, timestamp, daemon_name, event_type, details_json
+                    FROM daemon_events
+                    {where_sql}
+                    ORDER BY timestamp DESC, id DESC
+                    LIMIT ?
+                    """,
+                    params,
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return []
+            raise
+        return [
+            {
+                "id": int(row["id"]),
+                "timestamp": str(row["timestamp"]),
+                "daemon_name": str(row["daemon_name"]),
+                "event_type": str(row["event_type"]),
+                "details": json.loads(str(row["details_json"])),
+            }
+            for row in rows
+        ]
+
+    def has_session_rebalance_completed(self, session_date: str, checkpoint: str) -> bool:
+        target_date = session_date.strip()
+        target_ckpt = checkpoint.strip()
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT details_json
+                FROM daemon_events
+                WHERE event_type = 'rebalance'
+                ORDER BY timestamp DESC, id DESC
+                LIMIT 50
+                """
+            ).fetchall()
+        for row in rows:
+            details = json.loads(str(row["details_json"]))
+            if (
+                str(details.get("session_date", "")) == target_date
+                and str(details.get("checkpoint", "")) == target_ckpt
+            ):
+                status = details.get("status")
+                if status is None or str(status).lower() in {"completed", "ok", "success"}:
+                    return True
+        return False
+
+    def prune_old_telemetry(
+        self,
+        keep_days: int = 90,
+        *,
+        now_utc: datetime | None = None,
+    ) -> dict[str, int]:
+        """Prune old non-rebalance daemon_events and old portfolio_snapshots."""
+        if keep_days < 1:
+            raise ValueError("keep_days must be >= 1")
+        ref_now = ensure_utc(now_utc) if now_utc is not None else datetime.now(UTC)
+        cutoff_iso = _dt_to_iso(ref_now - timedelta(days=keep_days))
+        with closing(self._connect()) as conn:
+            with conn:
+                ev_cur = conn.execute(
+                    """
+                    DELETE FROM daemon_events
+                    WHERE timestamp < ?
+                      AND event_type != 'rebalance'
+                    """,
+                    (cutoff_iso,),
+                )
+                snap_cur = conn.execute(
+                    """
+                    DELETE FROM portfolio_snapshots
+                    WHERE timestamp < ?
+                      AND id != (SELECT MIN(id) FROM portfolio_snapshots)
+                    """,
+                    (cutoff_iso,),
+                )
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        return {
+            "daemon_events": int(ev_cur.rowcount),
+            "portfolio_snapshots": int(snap_cur.rowcount),
+        }
+
+    def upsert_daemon_heartbeat(
+        self,
+        daemon_name: str,
+        status: str,
+        details: dict[str, Any] | None = None,
+        now_utc: datetime | None = None,
+    ) -> None:
+        clean_daemon = daemon_name.strip()
+        clean_status = status.strip().lower()
+        if not clean_daemon or not clean_status:
+            raise ValueError("daemon_name and status must be non-empty")
+        ts_iso = _dt_to_iso(now_utc) if now_utc is not None else _dt_to_iso(datetime.now(UTC))
+        details_json = json.dumps(details or {}, sort_keys=True, default=str)
+        with closing(self._connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO daemon_heartbeats (
+                    daemon_name, last_heartbeat_at, status, details_json
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(daemon_name) DO UPDATE SET
+                    last_heartbeat_at = excluded.last_heartbeat_at,
+                    status = excluded.status,
+                    details_json = excluded.details_json
+                """,
+                (clean_daemon, ts_iso, clean_status, details_json),
+            )
+
+    def get_daemon_heartbeats(self) -> dict[str, dict[str, Any]]:
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT daemon_name, last_heartbeat_at, status, details_json
+                FROM daemon_heartbeats
+                ORDER BY daemon_name ASC
+                """
+            ).fetchall()
+        return {
+            str(row["daemon_name"]): {
+                "daemon_name": str(row["daemon_name"]),
+                "last_heartbeat_at": str(row["last_heartbeat_at"]),
+                "status": str(row["status"]),
+                "details": json.loads(str(row["details_json"])),
+            }
+            for row in rows
+        }
+
+    def count_unscored_news(self, scorer_model: str | None = None) -> int:
+        """Return the exact count of unscored (or mismatched-model) news articles."""
+        with closing(self._connect()) as conn:
+            if scorer_model is not None:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM news_articles
+                    WHERE sentiment_score IS NULL
+                       OR scorer_model IS NULL
+                       OR scorer_model != ?
+                    """,
+                    (scorer_model,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM news_articles WHERE sentiment_score IS NULL"
+                ).fetchone()
+        return int(row["cnt"]) if row is not None else 0
+
+    def get_latest_news_timestamp(self, sources: Sequence[str] | None = None) -> datetime | None:
+        """Return the most recent published_at timestamp in news_articles, or None."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if sources is not None:
+            clean = [s.strip().lower() for s in sources if s.strip()]
+            if not clean:
+                return None
+            placeholders = ",".join("?" for _ in clean)
+            clauses.append(f"LOWER(source) IN ({placeholders})")
+            params.extend(clean)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with closing(self._connect()) as conn:
+            row = conn.execute(
+                f"SELECT MAX(published_at) AS max_ts FROM news_articles {where_sql}",
+                params,
+            ).fetchone()
+        if row is None or row["max_ts"] is None:
+            return None
+        return _iso_to_dt(str(row["max_ts"]))
+
+    def get_recent_news(
+        self,
+        *,
+        limit: int = 50,
+        forward_only: bool | None = None,
+        start_utc: datetime | None = None,
+        scorer_model: str | None = None,
+    ) -> list[NewsArticle]:
+        """Return bounded recent news articles ordered newest-first."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if forward_only is True:
+            clauses.append(
+                "(LOWER(TRIM(source)) = 'yfinance_news' OR LOWER(TRIM(source)) LIKE 'rss:%')"
+            )
+        elif forward_only is False:
+            clauses.append(
+                "(LOWER(TRIM(source)) != 'yfinance_news' AND LOWER(TRIM(source)) NOT LIKE 'rss:%')"
+            )
+        if start_utc is not None:
+            clauses.append("published_at >= ?")
+            params.append(_dt_to_iso(start_utc))
+        if scorer_model is not None:
+            clauses.append("scorer_model = ?")
+            params.append(scorer_model)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM news_articles
+                {where_sql}
+                ORDER BY published_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            return self._rows_to_news_articles(conn, rows)
+
+    def get_recent_sec_filings(
+        self,
+        *,
+        limit: int = 50,
+        start_utc: datetime | None = None,
+    ) -> list[SecFilingEvent]:
+        """Return bounded recent SEC Form 4 / 8-K filings ordered newest-first."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if start_utc is not None:
+            clauses.append("accepted_at >= ?")
+            params.append(_dt_to_iso(start_utc))
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT accession_number, symbol, cik, form_type, accepted_at,
+                       items_json, net_insider_buy_usd, insider_buyer_count,
+                       insider_seller_count
+                FROM sec_filings
+                {where_sql}
+                ORDER BY accepted_at DESC, rowid DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        events: list[SecFilingEvent] = []
+        for row in rows:
+            raw_form = str(row["form_type"])
+            form_type: Literal["4", "8-K"] = "4" if raw_form == "4" else "8-K"
+            events.append(
+                SecFilingEvent(
+                    accession_number=str(row["accession_number"]),
+                    symbol=str(row["symbol"]),
+                    cik=str(row["cik"]),
+                    form_type=form_type,
+                    accepted_at=_iso_to_dt(str(row["accepted_at"])),
+                    items=json.loads(str(row["items_json"])),
+                    net_insider_buy_usd=float(row["net_insider_buy_usd"]),
+                    insider_buyer_count=int(row["insider_buyer_count"]),
+                    insider_seller_count=int(row["insider_seller_count"]),
+                )
+            )
+        return events
+
+    def get_latest_macro_points(
+        self, series_ids: Sequence[str] | None = None
+    ) -> dict[str, MacroPoint]:
+        """Return the latest MacroPoint per series_id."""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if series_ids is not None:
+            clean = [s.strip() for s in series_ids if s.strip()]
+            if not clean:
+                return {}
+            placeholders = ",".join("?" for _ in clean)
+            clauses.append(f"series_id IN ({placeholders})")
+            params.extend(clean)
+        where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with closing(self._connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT m.series_id, m.as_of_date, m.value
+                FROM macro_snapshots AS m
+                INNER JOIN (
+                    SELECT series_id, MAX(as_of_date) AS max_date
+                    FROM macro_snapshots
+                    {where_sql}
+                    GROUP BY series_id
+                ) AS latest
+                    ON m.series_id = latest.series_id AND m.as_of_date = latest.max_date
+                ORDER BY m.series_id ASC
+                """,
+                params,
+            ).fetchall()
+        return {
+            str(row["series_id"]): MacroPoint(
+                as_of_date=date.fromisoformat(str(row["as_of_date"])),
+                series_id=str(row["series_id"]),
+                value=float(row["value"]),
+            )
+            for row in rows
         }

@@ -41,6 +41,7 @@ from agy_trader.data.macro_and_calendar import (
 from agy_trader.data.news_filters import is_forward_only_source
 from agy_trader.data.sec_edgar import SecEdgarProvider
 from agy_trader.data.synthetic import generate_synthetic_dataset
+from agy_trader.execution.alpaca_broker import AlpacaBroker
 from agy_trader.nlp.sentiment import SentimentScorer, create_sentiment_scorer
 from agy_trader.storage.db import StateDB
 from agy_trader.storage.parquet_store import ParquetBarStore
@@ -1054,6 +1055,61 @@ def ops_authorize_restart(
         f"Restart [green]authorized[/green] for [cyan]{payload['service']}[/cyan] "
         f"(actor={actor}, reason={payload['reason']})"
     )
+
+
+@app.command("emergency-flatten")
+def emergency_flatten_cmd(
+    ctx: typer.Context,
+    confirm: Annotated[
+        bool,
+        typer.Option("--confirm", help="Explicit confirmation flag required to flatten all positions"),
+    ] = False,
+    reason: Annotated[
+        str,
+        typer.Option("--reason", help="Audit reason for emergency flatten"),
+    ] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Actor identifier")] = "operator",
+    data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
+    config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Pause new entries, cancel all open orders, and market-close all open Alpaca positions."""
+    if not confirm:
+        _fail("Refusing emergency flatten without --confirm.", json_output=json_output)
+        return
+    if not reason.strip():
+        _fail("A non-empty --reason is required for emergency flatten.", json_output=json_output)
+        return
+
+    settings, resolved_data, _ = _resolve_paths(ctx, data_dir, config_dir)
+    db, _ = _open_stores(resolved_data)
+    try:
+        broker = AlpacaBroker(settings, db)
+        result = broker.emergency_flatten(confirm=confirm, reason=reason, actor=actor)
+    except (ControlPlaneError, ValidationError, ValueError, RuntimeError, OSError) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+    except Exception as exc:  # noqa: BLE001 - surface Alpaca SDK/network errors cleanly in CLI
+        _fail(str(exc), json_output=json_output)
+        return
+
+    if json_output:
+        _emit_json(result)
+        return
+
+    table = Table(title="Emergency Flatten Executed")
+    table.add_column("Field", style="cyan")
+    table.add_column("Value")
+    table.add_row("ok", str(result["ok"]))
+    table.add_row("paper_mode", str(result["paper_mode"]))
+    table.add_row("paused_new_entries", str(result["paused_new_entries"]))
+    table.add_row("canceled_orders", str(result["canceled_orders"]))
+    table.add_row("close_orders_submitted", str(len(result["close_orders"])))
+    table.add_row("errors", str(len(result["errors"])))
+    table.add_row("reason", str(result["reason"]))
+    console.print(table)
+    if not result["ok"]:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

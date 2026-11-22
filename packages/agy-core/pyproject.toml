@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agy-core"
+version = "0.1.0"
+description = "Core quantitative modeling, risk, backtesting, and broker execution for agy-trader"
+requires-python = ">=3.12"
+dependencies = [
+    "alpaca-py>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.2",
+    "pyyaml>=6.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "pyarrow>=15.0",
+    "duckdb>=1.0",
+    "typer>=0.12",
+    "rich>=13.7",
+    "httpx>=0.27",
+    "structlog>=24.1",
+    "yfinance>=0.2.40",
+]
+
+[project.optional-dependencies]
+nlp = [
+    "transformers>=4.40",
+    "torch>=2.2",
+    "scipy>=1.13",
+]
+
+[project.scripts]
+agy = "agy_trader.cli.main:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agy_trader"]
