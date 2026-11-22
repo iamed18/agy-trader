@@ -1118,3 +1118,79 @@ def test_ema50_window_parity_with_full_history_feature_engine(
         full_sigs = full_fe.build_signals(as_of=as_of, bars_by_symbol=bars, benchmark_symbol="SPY")
         assert engine_sigs == full_sigs
 
+
+def test_rebalance_every_n_days_cadence_and_intermediate_stoploss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # 65 warmup days + 12 active days = 77 business days
+    n_warmup = 65
+    n_active = 12
+    dates = [ts.date() for ts in pd.bdate_range(start=date(2025, 1, 2), periods=n_warmup + n_active)]
+    opens = [100.0] * len(dates)
+    highs = [101.0] * len(dates)
+    lows = [99.0] * len(dates)
+    closes = [100.0] * len(dates)
+
+    # Bar index 65 is sim bar_idx 0 (rebalance day). Entry fills at bar 66 (bar_idx 1) open=100.0.
+    # Bar index 68 is sim bar_idx 3 (non-rebalance day): trigger intraday stop-loss at low=90.0.
+    lows[68] = 90.0
+    closes[68] = 92.0
+
+    bars = {"AAPL": _build_ohlc_df(dates, opens, highs, lows, closes)}
+    universe = [UniverseSymbol(symbol="AAPL", asset_type=AssetType.equity, sector="Technology")]
+    cfg = AppConfig(
+        strategy=StrategyConfig(rebalance_every_n_days=5),
+        risk=RiskConfig(max_long_position_pct=0.25, max_short_position_pct=0.25),
+        backtest=BacktestConfig(
+            initial_capital=10_000.0,
+            equity_slippage_bps=0.0,
+            sec_sell_fee_bps=0.0,
+            short_borrow_apr=0.0,
+            benchmark_symbol="AAPL",
+        ),
+    )
+    engine = BacktestEngine(cfg, universe)
+
+    rebalance_dates_seen: list[date] = []
+    t0_ts = datetime(dates[65].year, dates[65].month, dates[65].day, 16, 0, tzinfo=NY_TZ).astimezone(UTC)
+
+    monkeypatch.setattr(
+        "agy_trader.backtest.engine.FeatureEngine.build_signals",
+        lambda self, as_of, **kwargs: [_dummy_signal("AAPL", as_of)],
+    )
+
+    def fake_propose(self, signals, current_positions, prices, equity, dials, as_of, universe_meta):
+        rebalance_dates_seen.append(as_of.date())
+        if as_of == t0_ts:
+            return [
+                ProposedOrder(
+                    symbol="AAPL",
+                    side=OrderSide.buy,
+                    qty=10.0,
+                    target_side=PositionSide.long,
+                    is_risk_reducing=False,
+                    reference_price=prices["AAPL"],
+                    stop_loss_price=95.0,
+                    reason="test_cadence_open",
+                )
+            ]
+        return []
+
+    def fake_eval(self, orders, state, dials, universe_meta, signals_by_symbol=None, earnings_by_symbol=None):
+        return [
+            RiskVerdict(approved=True, order=o, adjusted_qty=o.qty, stop_loss_price=o.stop_loss_price)
+            for o in orders
+        ]
+
+    monkeypatch.setattr("agy_trader.backtest.engine.PortfolioConstructor.build_proposed_orders", fake_propose)
+    monkeypatch.setattr("agy_trader.backtest.engine.HardRiskEngine.evaluate_batch", fake_eval)
+
+    res = engine.run(bars, use_news=False)
+    # Only bar_idx 0, 5, 10 (dates[65], dates[70], dates[75]) should propose rebalance orders
+    assert rebalance_dates_seen == [dates[65], dates[70], dates[75]]
+    # Stop-loss still executes immediately on intermediate non-rebalance day bar_idx 3 (dates[68])
+    assert res.metrics.stop_loss_exits == 1
+    assert len(res.trades) == 1
+    assert res.trades[0].exit_reason == "stop_loss_intraday"
+    assert res.trades[0].exit_time.date() == dates[68]
+

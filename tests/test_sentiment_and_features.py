@@ -9,7 +9,11 @@ import pytest
 
 from agy_trader.core.config import StrategyConfig
 from agy_trader.core.models import MacroPoint, NewsArticle
-from agy_trader.nlp.sentiment import LexiconSentimentScorer, SentimentAggregator
+from agy_trader.nlp.sentiment import (
+    FinBERTScorer,
+    LexiconSentimentScorer,
+    SentimentAggregator,
+)
 from agy_trader.strategy.features import (
     FeatureEngine,
     compute_macro_regime_scale,
@@ -370,3 +374,143 @@ def test_corrupt_spy_fallback_and_single_symbol_zscore_zero() -> None:
     assert single_signals[0].symbol == "AAPL"
     assert single_signals[0].trend_score == 0.0
     assert single_signals[0].pullback_score == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Missing-news renormalization & SPY SMA200 defensive scale tests
+# ---------------------------------------------------------------------------
+
+
+def test_feature_engine_missing_news_does_not_shrink_composite() -> None:
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2025, 1, 2), periods=80)]
+    as_of = datetime.combine(bdays[-1], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+
+    bars = {
+        "SPY": _make_price_df(bdays, np.linspace(400.0, 420.0, 80)),
+        "AAPL": _make_price_df(bdays, np.linspace(100.0, 140.0, 80)),
+        "MSFT": _make_price_df(bdays, np.linspace(200.0, 180.0, 80)),
+    }
+    # MSFT has 0 news articles; AAPL has 1 scored article.
+    news = {
+        "AAPL": [
+            _scored_article("a1", as_of - timedelta(hours=3), "AAPL strong beat", 0.75, 0.9),
+        ]
+    }
+
+    cfg_no_news_w = StrategyConfig(w_trend=0.45, w_pullback=0.25, w_news_sentiment=0.0)
+    cfg_with_news_w = StrategyConfig(w_trend=0.45, w_pullback=0.25, w_news_sentiment=0.30)
+
+    sig_w0 = {
+        s.symbol: s
+        for s in FeatureEngine(cfg_no_news_w).build_signals(
+            as_of=as_of, bars_by_symbol=bars, news_by_symbol=news
+        )
+    }
+    sig_w30 = {
+        s.symbol: s
+        for s in FeatureEngine(cfg_with_news_w).build_signals(
+            as_of=as_of, bars_by_symbol=bars, news_by_symbol=news
+        )
+    }
+
+    # MSFT (0 news) must have identical composite_score regardless of w_news_sentiment
+    assert sig_w30["MSFT"].composite_score == sig_w0["MSFT"].composite_score
+    # AAPL (>=1 news) blends news_score as expected
+    assert sig_w30["AAPL"].composite_score != sig_w0["AAPL"].composite_score
+    assert sig_w30["AAPL"].composite_score > sig_w0["AAPL"].composite_score
+
+    # Pure-news config (w_trend=0, w_pullback=0, w_news_sentiment=1.0) on symbol with 0 news -> 0.0 cleanly
+    cfg_pure_news = StrategyConfig(w_trend=0.0, w_pullback=0.0, w_news_sentiment=1.0)
+    sig_pure = {
+        s.symbol: s
+        for s in FeatureEngine(cfg_pure_news).build_signals(
+            as_of=as_of, bars_by_symbol=bars, news_by_symbol=news
+        )
+    }
+    assert sig_pure["MSFT"].composite_score == 0.0
+    assert sig_pure["AAPL"].composite_score > 0.0
+
+
+def test_compute_macro_regime_scale_spy_sma200_defensive_scale() -> None:
+    bdays = [ts.date() for ts in pd.bdate_range(start=date(2024, 1, 2), periods=210)]
+    as_of = datetime.combine(bdays[-1], datetime.min.time(), tzinfo=NY_TZ).replace(
+        hour=16
+    ).astimezone(UTC)
+
+    # Low-vol steady downtrend: last_close < sma_200, but 20d ann vol is tiny and close ~= ema_50
+    closes_below = np.linspace(500.0, 420.0, 210)
+    spy_below = _make_price_df(bdays, closes_below, spread=0.001)
+    assert float(spy_below["close"].iloc[-1]) < float(spy_below["close"].tail(200).mean())
+
+    # Without spy_sma200_defensive_scale (None), existing 0.4 floor and 1.0 scale apply
+    assert compute_macro_regime_scale(as_of, spy_below, None, spy_sma200_defensive_scale=None) == 1.0
+    # With VIX=40 -> 0.45, plus ema/vol drop would hit existing 0.40 floor when None
+    vix_high = [MacroPoint(as_of_date=bdays[-3], series_id="VIXCLS", value=40.0)]
+    assert (
+        compute_macro_regime_scale(as_of, spy_below, vix_high, spy_sma200_defensive_scale=None)
+        == 0.45
+    )
+
+    # With spy_sma200_defensive_scale=0.30 and last_close < sma_200 -> drops to 0.30
+    assert (
+        compute_macro_regime_scale(as_of, spy_below, None, spy_sma200_defensive_scale=0.30)
+        == 0.30
+    )
+
+    # Steady uptrend: last_close >= sma_200 -> defensive scale does NOT trigger
+    closes_above = np.linspace(400.0, 500.0, 210)
+    spy_above = _make_price_df(bdays, closes_above, spread=0.001)
+    assert float(spy_above["close"].iloc[-1]) >= float(spy_above["close"].tail(200).mean())
+    assert (
+        compute_macro_regime_scale(as_of, spy_above, None, spy_sma200_defensive_scale=0.30)
+        == 1.0
+    )
+
+    # Fewer than 200 bars -> SMA200 check does NOT trigger
+    spy_short = _make_price_df(bdays[-150:], closes_below[-150:], spread=0.001)
+    assert (
+        compute_macro_regime_scale(as_of, spy_short, None, spy_sma200_defensive_scale=0.30)
+        == 1.0
+    )
+
+
+def test_finbert_scorer_rejects_non_finite_probabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+    from types import SimpleNamespace
+
+    class _FakeTensor:
+        def __init__(self, data: list[list[float]]) -> None:
+            self._data = data
+
+        def cpu(self) -> _FakeTensor:
+            return self
+
+        def tolist(self) -> list[list[float]]:
+            return self._data
+
+    class _FakeBatch(dict):
+        def to(self, _device: str) -> _FakeBatch:
+            return self
+
+    class _FakeNoGrad:
+        def __enter__(self) -> None:
+            return None
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    fake_torch = SimpleNamespace(
+        no_grad=lambda: _FakeNoGrad(),
+        softmax=lambda logits, dim=-1: _FakeTensor([[float("nan"), 0.5, 0.5]]),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+
+    scorer = FinBERTScorer()
+    scorer._tokenizer = lambda *args, **kwargs: _FakeBatch()
+    scorer._model = lambda **kwargs: SimpleNamespace(logits=[[0.0, 0.0, 0.0]])
+    scorer._label_map = {0: "positive", 1: "negative", 2: "neutral"}
+
+    with pytest.raises(ValueError, match="non-finite probability"):
+        scorer.score_texts(["AAPL beats estimates"])

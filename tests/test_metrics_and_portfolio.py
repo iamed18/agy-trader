@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from agy_trader.backtest.metrics import (
     EquityPoint,
@@ -66,6 +67,7 @@ def _sig(
     macro_regime_scale: float = 1.0,
     ret_5d: float = 0.0,
     ann_vol: float = 0.25,
+    abs_trend_raw: float | None = None,
 ) -> SignalRow:
     return SignalRow(
         as_of=as_of,
@@ -79,6 +81,7 @@ def _sig(
         atr_pct=atr_pct,
         ann_vol=ann_vol,
         ret_5d=ret_5d,
+        abs_trend_raw=abs_trend_raw,
     )
 
 
@@ -525,3 +528,353 @@ def test_alpaca_market_rejects_corrupt_ohlcv() -> None:
         provider = AlpacaMarketDataProvider("k", "s", client=fake)  # type: ignore[arg-type]
         with pytest.raises(ValueError):
             provider.fetch_bars(["AAPL"], start=start, end=end, timeframe="1d")
+
+
+# ---------------------------------------------------------------------------
+# Turnover controls: config validation, hysteresis, dual momentum, bear shorts
+# ---------------------------------------------------------------------------
+
+
+def test_strategy_config_exit_threshold_validation() -> None:
+    # Valid: exit_signal_threshold <= min_signal_threshold
+    cfg_eq = StrategyConfig(min_signal_threshold=0.35, exit_signal_threshold=0.35)
+    assert cfg_eq.exit_signal_threshold == 0.35
+
+    cfg_low = StrategyConfig(min_signal_threshold=0.35, exit_signal_threshold=-0.10)
+    assert cfg_low.exit_signal_threshold == -0.10
+
+    # Invalid: exit_signal_threshold > min_signal_threshold
+    with pytest.raises(ValidationError, match="exit_signal_threshold must be <= min_signal_threshold"):
+        StrategyConfig(min_signal_threshold=0.35, exit_signal_threshold=0.40)
+
+
+def test_portfolio_rank_and_signal_hysteresis() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(
+        top_k_long=2,
+        top_k_short=1,
+        min_signal_threshold=0.40,
+        hold_rank_buffer=2,
+        exit_signal_threshold=0.15,
+    )
+    risk = RiskConfig(
+        max_long_position_pct=0.25,
+        max_short_position_pct=0.15,
+        max_sector_gross_pct=1.0,
+        max_gross_exposure=1.0,
+        max_net_exposure=1.0,
+        min_net_exposure=-1.0,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    meta = {
+        sym: _meta(sym, sector=f"Sec{i}")
+        for i, sym in enumerate(("L_NEW1", "L_NEW2", "L_NEW3", "L_HELD", "L_BELOW", "S_NEW", "S_HELD"))
+    }
+
+    # L_HELD has score 0.20 (between exit 0.15 and min 0.40) and ranks #4 <= top_k_long(2)+buffer(2)=4.
+    # L_NEW3 has score 0.50 and ranks #3, so L_HELD keeps its slot over L_NEW3!
+    # L_BELOW has score 0.10 (< exit 0.15) so even if held it must exit.
+    sigs = [
+        _sig("L_NEW1", as_of, composite_score=0.80),
+        _sig("L_NEW2", as_of, composite_score=0.60),
+        _sig("L_NEW3", as_of, composite_score=0.50),
+        _sig("L_HELD", as_of, composite_score=0.20),
+        _sig("L_BELOW", as_of, composite_score=0.10),
+        _sig("S_NEW", as_of, composite_score=-0.70),
+        _sig("S_HELD", as_of, composite_score=-0.25),
+    ]
+    w_keep = ctor.compute_target_weights(
+        sigs,
+        ControlDials(),
+        as_of,
+        meta,
+        current_weights={"L_HELD": 0.10, "L_BELOW": 0.10, "S_HELD": -0.05},
+    )
+    assert w_keep["L_HELD"] > 0.0
+    assert w_keep["L_NEW1"] > 0.0
+    assert w_keep["L_NEW2"] == 0.0  # displaced because top_k_long=2 (L_HELD + L_NEW1)
+    assert w_keep["L_BELOW"] == 0.0
+    assert w_keep["S_HELD"] < 0.0  # retained inside buffer (rank 2 <= 1+2) and <= -0.15
+    assert w_keep["S_NEW"] == 0.0
+
+    # Push L_HELD outside buffer (rank #5 > 2+2=4) -> must exit
+    sigs_outside = [
+        _sig("L_NEW1", as_of, composite_score=0.80),
+        _sig("L_NEW2", as_of, composite_score=0.70),
+        _sig("L_NEW3", as_of, composite_score=0.60),
+        _sig("L_BELOW", as_of, composite_score=0.50),
+        _sig("L_HELD", as_of, composite_score=0.20),
+    ]
+    w_outside = ctor.compute_target_weights(
+        sigs_outside,
+        ControlDials(),
+        as_of,
+        meta,
+        current_weights={"L_HELD": 0.10},
+    )
+    assert w_outside["L_HELD"] == 0.0
+    assert w_outside["L_NEW1"] > 0.0
+    assert w_outside["L_NEW2"] > 0.0
+
+    # Blacklist & allow_shorting=False still force-exit held positions inside buffer
+    dials_restricted = ControlDials(
+        allow_shorting=False,
+        blacklisted_symbols={"L_HELD": as_of + timedelta(hours=6)},
+    )
+    w_forced = ctor.compute_target_weights(
+        sigs,
+        dials_restricted,
+        as_of,
+        meta,
+        current_weights={"L_HELD": 0.10, "S_HELD": -0.05},
+    )
+    assert w_forced["L_HELD"] == 0.0
+    assert w_forced["S_HELD"] == 0.0
+
+
+def test_portfolio_abs_momentum_and_bear_regime_short_gate() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(
+        top_k_long=3,
+        top_k_short=3,
+        min_signal_threshold=0.30,
+        abs_momentum_filter=True,
+        short_only_in_bear_regime=True,
+    )
+    risk = RiskConfig(
+        max_long_position_pct=0.25,
+        max_short_position_pct=0.15,
+        max_sector_gross_pct=1.0,
+        max_gross_exposure=1.0,
+        max_net_exposure=1.0,
+        min_net_exposure=-1.0,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    meta = {
+        sym: _meta(sym, sector=f"Sec{i}")
+        for i, sym in enumerate(("L_POS", "L_NEG", "L_NONE", "S_NEG", "S_POS"))
+    }
+
+    # Bull regime (macro_regime_scale == 1.0): shorts blocked even if abs_trend_raw < 0;
+    # Long with abs_trend_raw <= 0 blocked; None stays permissive.
+    bull_sigs = [
+        _sig("L_POS", as_of, composite_score=0.80, macro_regime_scale=1.0, abs_trend_raw=0.5),
+        _sig("L_NEG", as_of, composite_score=0.90, macro_regime_scale=1.0, abs_trend_raw=-0.2),
+        _sig("L_NONE", as_of, composite_score=0.70, macro_regime_scale=1.0, abs_trend_raw=None),
+        _sig("S_NEG", as_of, composite_score=-0.85, macro_regime_scale=1.0, abs_trend_raw=-0.4),
+        _sig("S_POS", as_of, composite_score=-0.95, macro_regime_scale=1.0, abs_trend_raw=0.3),
+    ]
+    w_bull = ctor.compute_target_weights(bull_sigs, ControlDials(), as_of, meta)
+    assert w_bull["L_POS"] > 0.0
+    assert w_bull["L_NEG"] == 0.0
+    assert w_bull["L_NONE"] > 0.0
+    assert w_bull["S_NEG"] == 0.0
+    assert w_bull["S_POS"] == 0.0
+
+    # Bear regime (macro_regime_scale < 1.0): shorts enabled, only S_NEG (abs_trend_raw < 0) allowed
+    bear_sigs = [
+        _sig("L_POS", as_of, composite_score=0.80, macro_regime_scale=0.6, abs_trend_raw=0.5),
+        _sig("S_NEG", as_of, composite_score=-0.85, macro_regime_scale=0.6, abs_trend_raw=-0.4),
+        _sig("S_POS", as_of, composite_score=-0.95, macro_regime_scale=0.6, abs_trend_raw=0.3),
+    ]
+    w_bear = ctor.compute_target_weights(bear_sigs, ControlDials(), as_of, meta)
+    assert w_bear["L_POS"] > 0.0
+    assert w_bear["S_NEG"] < 0.0
+    assert w_bear["S_POS"] == 0.0
+
+
+def test_portfolio_long_only_macro_and_dial_net_exposure_scaling() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(min_signal_threshold=0.25, top_k_long=8, top_k_short=6)
+    risk = RiskConfig(
+        max_long_position_pct=0.10,
+        max_short_position_pct=0.06,
+        max_sector_gross_pct=0.25,
+        max_gross_exposure=1.00,
+        max_net_exposure=0.60,
+        min_net_exposure=-0.25,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    sectors = ["Tech", "Finance", "Energy", "Healthcare", "Industrials", "Consumer", "Utilities", "Materials"]
+    meta = {f"L{i}": _meta(f"L{i}", sector=sectors[i]) for i in range(8)}
+
+    base_sigs = [_sig(f"L{i}", as_of, composite_score=0.80, atr_pct=0.02, macro_regime_scale=1.0) for i in range(8)]
+    w_base = ctor.compute_target_weights(
+        base_sigs, ControlDials(allow_shorting=False, exposure_multiplier=1.0), as_of, meta
+    )
+    assert sum(w_base.values()) == pytest.approx(0.60, abs=1e-9)
+
+    macro_sigs = [_sig(f"L{i}", as_of, composite_score=0.80, atr_pct=0.02, macro_regime_scale=0.5) for i in range(8)]
+    w_macro = ctor.compute_target_weights(
+        macro_sigs, ControlDials(allow_shorting=False, exposure_multiplier=1.0), as_of, meta
+    )
+    assert sum(w_macro.values()) <= 0.30 + 1e-9
+    assert sum(w_macro.values()) == pytest.approx(0.30, abs=1e-9)
+
+    w_dial = ctor.compute_target_weights(
+        base_sigs, ControlDials(allow_shorting=False, exposure_multiplier=0.5), as_of, meta
+    )
+    assert sum(w_dial.values()) <= 0.30 + 1e-9
+    assert sum(w_dial.values()) == pytest.approx(0.30, abs=1e-9)
+
+    w_both = ctor.compute_target_weights(
+        macro_sigs, ControlDials(allow_shorting=False, exposure_multiplier=0.5), as_of, meta
+    )
+    assert sum(w_both.values()) <= 0.15 + 1e-9
+    assert sum(w_both.values()) == pytest.approx(0.15, abs=1e-9)
+
+
+def test_deadband_bypassed_for_ops_and_macro_derisking_trims() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(
+        min_signal_threshold=0.25,
+        rebalance_deadband_pct=0.04,
+        top_k_long=8,
+        top_k_short=6,
+    )
+    risk = RiskConfig(
+        max_long_position_pct=0.10,
+        max_short_position_pct=0.06,
+        max_sector_gross_pct=0.25,
+        max_gross_exposure=1.00,
+        max_net_exposure=0.60,
+        min_net_exposure=-0.25,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    sectors = [
+        "Tech",
+        "Finance",
+        "Energy",
+        "Healthcare",
+        "Industrials",
+        "Consumer",
+        "Utilities",
+        "Materials",
+    ]
+    meta = {f"L{i}": _meta(f"L{i}", sector=sectors[i]) for i in range(8)}
+    equity = 100_000.0
+    prices = {f"L{i}": 100.0 for i in range(8)}
+    # 8 longs at 7.5% each = 60% net & gross exposure
+    cur_positions = {f"L{i}": 75.0 for i in range(8)}
+    base_sigs = [
+        _sig(f"L{i}", as_of, composite_score=0.80, atr_pct=0.02, macro_regime_scale=1.0)
+        for i in range(8)
+    ]
+
+    # 1. Ops exposure_multiplier=0.5 -> tgt_w = 0.0375, |delta| = 0.0375 < deadband 0.04
+    # Must STILL emit all 8 risk-reducing sell trim orders, bringing net exposure to 30%
+    ops_orders = ctor.build_proposed_orders(
+        signals=base_sigs,
+        current_positions=cur_positions,
+        prices=prices,
+        equity=equity,
+        dials=ControlDials(allow_shorting=False, exposure_multiplier=0.5),
+        as_of=as_of,
+        universe_meta=meta,
+    )
+    assert len(ops_orders) == 8
+    assert all(o.side == OrderSide.sell and o.is_risk_reducing for o in ops_orders)
+    assert all(o.reason == "rebalance_reduce" for o in ops_orders)
+    post_ops_net = sum((cur_positions[o.symbol] - o.qty) * 100.0 / equity for o in ops_orders)
+    assert post_ops_net == pytest.approx(0.30, abs=1e-6)
+
+    # 2. macro_regime_scale=0.5 with exposure_multiplier=1.0 -> must also emit all 8 trims
+    macro_sigs = [
+        _sig(f"L{i}", as_of, composite_score=0.80, atr_pct=0.02, macro_regime_scale=0.5)
+        for i in range(8)
+    ]
+    macro_orders = ctor.build_proposed_orders(
+        signals=macro_sigs,
+        current_positions=cur_positions,
+        prices=prices,
+        equity=equity,
+        dials=ControlDials(allow_shorting=False, exposure_multiplier=1.0),
+        as_of=as_of,
+        universe_meta=meta,
+    )
+    assert len(macro_orders) == 8
+    assert all(o.side == OrderSide.sell and o.is_risk_reducing for o in macro_orders)
+    post_macro_net = sum((cur_positions[o.symbol] - o.qty) * 100.0 / equity for o in macro_orders)
+    assert post_macro_net == pytest.approx(0.30, abs=1e-6)
+
+    # 3. Normal minor drift inside deadband (0.04) while within budget & position caps -> suppressed
+    drifted_positions = dict(cur_positions)
+    drifted_positions["L0"] = 80.0  # 8.0% (+0.5% drift, <= 10% cap)
+    drifted_positions["L1"] = 70.0  # 7.0% (-0.5% drift)
+    # Total net & gross remain 60.0% <= effective caps (60% net, 100% gross)
+    suppressed = ctor.build_proposed_orders(
+        signals=base_sigs,
+        current_positions=drifted_positions,
+        prices=prices,
+        equity=equity,
+        dials=ControlDials(allow_shorting=False, exposure_multiplier=1.0),
+        as_of=as_of,
+        universe_meta=meta,
+    )
+    assert suppressed == []
+
+
+def test_no_dual_selection_overlap_when_exit_threshold_negative() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(
+        top_k_long=2,
+        top_k_short=2,
+        min_signal_threshold=0.35,
+        exit_signal_threshold=-0.50,
+        hold_rank_buffer=1,
+    )
+    risk = RiskConfig(
+        max_long_position_pct=0.25,
+        max_short_position_pct=0.15,
+        max_sector_gross_pct=1.0,
+        max_gross_exposure=1.0,
+        max_net_exposure=1.0,
+        min_net_exposure=-1.0,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    meta = {
+        "HELD_L": _meta("HELD_L", sector="Tech"),
+        "L_STRONG": _meta("L_STRONG", sector="Finance"),
+        "S_CAND": _meta("S_CAND", sector="Energy"),
+    }
+    # HELD_L is currently held long with composite_score=-0.40:
+    # - Passes long_cands because -0.40 >= exit_signal_threshold (-0.50)
+    # - Would also pass short_cands (-0.40 <= -0.35) unless excluded by selected_long_syms!
+    sigs = [
+        _sig("L_STRONG", as_of, composite_score=0.80),
+        _sig("HELD_L", as_of, composite_score=-0.40),
+        _sig("S_CAND", as_of, composite_score=-0.38),
+    ]
+    targets = ctor.compute_target_weights(
+        sigs,
+        ControlDials(allow_shorting=True),
+        as_of,
+        meta,
+        current_weights={"HELD_L": 0.10},
+    )
+    assert targets["HELD_L"] > 0.0
+    assert targets["L_STRONG"] > 0.0
+    assert targets["S_CAND"] < 0.0
+
+
+def test_one_sided_net_bounds_tighten_never_widen() -> None:
+    as_of = datetime(2025, 4, 1, 20, 0, tzinfo=UTC)
+    strat = StrategyConfig(min_signal_threshold=0.25, top_k_long=2, top_k_short=2)
+    # Long-only positive min_net_exposure (0.20) under macro_scale=0.5 should remain 0.20, not shrink to 0.10;
+    # and negative max_net_exposure (-0.10) under macro_scale=0.5 should remain -0.10, not relax to -0.05.
+    risk = RiskConfig(
+        max_long_position_pct=0.50,
+        max_short_position_pct=0.50,
+        max_sector_gross_pct=1.0,
+        max_gross_exposure=1.0,
+        max_net_exposure=-0.10,
+        min_net_exposure=-0.50,
+    )
+    ctor = PortfolioConstructor(strat, risk)
+    meta = {"L1": _meta("L1", sector="Tech"), "S1": _meta("S1", sector="Finance")}
+    sigs = [
+        _sig("L1", as_of, composite_score=0.80, macro_regime_scale=0.5),
+        _sig("S1", as_of, composite_score=-0.80, macro_regime_scale=0.5),
+    ]
+    targets = ctor.compute_target_weights(sigs, ControlDials(allow_shorting=True), as_of, meta)
+    assert sum(targets.values()) <= -0.10 + 1e-9

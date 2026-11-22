@@ -3,15 +3,21 @@ strategy:
     - "10:00"
     - "13:00"
     - "15:40"
-  w_trend: 0.45
-  w_pullback: 0.25
-  w_news_sentiment: 0.30
-  news_half_life_hours: 24.0
-  news_lookback_hours: 72.0
+  w_trend: 0.64
+  w_pullback: 0.11
+  w_news_sentiment: 0.25
+  news_half_life_hours: 48.0
+  news_lookback_hours: 120.0
   top_k_long: 8
   top_k_short: 6
   min_signal_threshold: 0.35
-  rebalance_deadband_pct: 0.015
+  exit_signal_threshold: 0.0
+  rebalance_deadband_pct: 0.04
+  rebalance_every_n_days: 3
+  hold_rank_buffer: 6
+  abs_momentum_filter: false
+  short_only_in_bear_regime: true
+  spy_sma200_defensive_scale: 0.35
   allow_fractional_longs: true
 
 risk:

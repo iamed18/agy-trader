@@ -153,6 +153,7 @@ def backfill_cmd(
     synthetic: Annotated[bool, typer.Option("--synthetic", help="Generate deterministic synthetic dataset")] = False,
     seed: Annotated[int, typer.Option("--seed", help="Random seed for synthetic generation")] = 42,
     allow_overwrite: Annotated[bool, typer.Option("--allow-overwrite", help="Allow overwriting overlapping Parquet bars")] = False,
+    skip_news: Annotated[bool, typer.Option("--skip-news", help="Skip fetching and scoring news articles")] = False,
     score_backend: Annotated[str, typer.Option("--score-backend", help="Sentiment scorer backend: lexicon|finbert")] = "lexicon",
     data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
@@ -221,12 +222,15 @@ def backfill_cmd(
                     allow_overwrite=allow_overwrite,
                 )
 
-        news_provider = AlpacaNewsProvider(
-            api_key=settings.alpaca_api_key,
-            secret_key=settings.alpaca_secret_key,
-        )
-        articles = news_provider.fetch_news(symbols=symbols, start=start_utc, end=now_utc)
-        news_saved = db.upsert_news_articles(articles)
+        if skip_news:
+            news_saved = 0
+        else:
+            news_provider = AlpacaNewsProvider(
+                api_key=settings.alpaca_api_key,
+                secret_key=settings.alpaca_secret_key,
+            )
+            articles = news_provider.fetch_news(symbols=symbols, start=start_utc, end=now_utc)
+            news_saved = db.upsert_news_articles(articles)
 
         macro_saved = 0
         if settings.fred_api_key.strip():
@@ -241,7 +245,7 @@ def backfill_cmd(
         earnings_events = earnings_provider.fetch_earnings(symbols)
         earnings_saved = db.upsert_earnings(earnings_events)
 
-        news_scored = _score_unscored_news(db, scorer)
+        news_scored = 0 if skip_news else _score_unscored_news(db, scorer)
         result_payload = {
             "mode": "alpaca",
             "days": days,

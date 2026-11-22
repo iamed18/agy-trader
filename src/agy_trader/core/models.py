@@ -246,6 +246,7 @@ class SignalRow(_StrictModel):
     atr_pct: float = Field(gt=0.0)
     ann_vol: float = Field(ge=0.0)
     ret_5d: float
+    abs_trend_raw: float | None = None
 
     @field_validator("symbol")
     @classmethod

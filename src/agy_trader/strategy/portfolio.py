@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 
 from agy_trader.core.config import RiskConfig, StrategyConfig
@@ -74,42 +74,97 @@ class PortfolioConstructor:
             )
 
         macro_scale = min(s.macro_regime_scale for s in deduped)
-        effective_gross_budget = (
-            self.risk.max_gross_exposure * macro_scale * dials.exposure_multiplier
-        )
-        effective_gross_budget = max(0.0, min(self.risk.max_gross_exposure, effective_gross_budget))
+        risk_scale = max(0.0, min(1.0, macro_scale * dials.exposure_multiplier))
+        effective_gross_budget = self.risk.max_gross_exposure * risk_scale
 
-        # Eligible long candidates
+        exit_thresh = (
+            self.strategy.exit_signal_threshold
+            if self.strategy.exit_signal_threshold is not None
+            else self.strategy.min_signal_threshold
+        )
+
+        def _long_abs_ok(s: SignalRow) -> bool:
+            if not self.strategy.abs_momentum_filter or s.abs_trend_raw is None:
+                return True
+            return s.abs_trend_raw > 0.0
+
+        def _short_abs_ok(s: SignalRow) -> bool:
+            if not self.strategy.abs_momentum_filter or s.abs_trend_raw is None:
+                return True
+            return s.abs_trend_raw < 0.0
+
+        def _is_held_long(s: SignalRow) -> bool:
+            return cur_w.get(s.symbol, 0.0) > 1e-9
+
+        def _is_held_short(s: SignalRow) -> bool:
+            return cur_w.get(s.symbol, 0.0) < -1e-9
+
+        def _select_with_hysteresis(
+            cands: list[SignalRow],
+            top_k: int,
+            is_held: Callable[[SignalRow], bool],
+            sort_key: Callable[[SignalRow], tuple[float, str]],
+        ) -> list[SignalRow]:
+            cands.sort(key=sort_key)
+            buffered = cands[: top_k + self.strategy.hold_rank_buffer]
+            selected = [s for s in buffered if is_held(s)][:top_k]
+            selected_syms = {s.symbol for s in selected}
+            for s in cands:
+                if len(selected) >= top_k:
+                    break
+                if s.symbol not in selected_syms:
+                    selected.append(s)
+                    selected_syms.add(s.symbol)
+            selected.sort(key=sort_key)
+            return selected
+
+        # Eligible long candidates with hysteresis & optional dual-momentum filter
         long_cands = [
             s
             for s in deduped
             if s.symbol not in blacklist
             and s.symbol in universe_meta
-            and s.composite_score >= self.strategy.min_signal_threshold
+            and _long_abs_ok(s)
+            and s.composite_score
+            >= (exit_thresh if _is_held_long(s) else self.strategy.min_signal_threshold)
         ]
-        long_cands.sort(key=lambda s: (-s.composite_score, s.symbol))
-        selected_longs = long_cands[: self.strategy.top_k_long]
+        selected_longs = _select_with_hysteresis(
+            long_cands,
+            top_k=self.strategy.top_k_long,
+            is_held=_is_held_long,
+            sort_key=lambda s: (-s.composite_score, s.symbol),
+        )
+        selected_long_syms = {s.symbol for s in selected_longs}
 
-        # Eligible short candidates (pre-filter squeeze guards so slots aren't wasted)
+        # Eligible short candidates (pre-filter squeeze guards + optional bear-regime gate)
         selected_shorts: list[SignalRow] = []
+        shorts_regime_ok = (macro_scale < 1.0) if self.strategy.short_only_in_bear_regime else True
         if (
             dials.allow_shorting
             and self.strategy.top_k_short > 0
             and self.risk.max_short_position_pct > 0.0
+            and shorts_regime_ok
         ):
             short_cands = [
                 s
                 for s in deduped
                 if s.symbol not in blacklist
+                and s.symbol not in selected_long_syms
                 and s.symbol in universe_meta
                 and universe_meta[s.symbol].shortable
                 and universe_meta[s.symbol].easy_to_borrow
                 and s.ret_5d < self.risk.short_squeeze_5d_return_cap
                 and s.ann_vol < self.risk.short_squeeze_ann_vol_cap
-                and s.composite_score <= -self.strategy.min_signal_threshold
+                and _short_abs_ok(s)
+                and s.composite_score
+                <= (-exit_thresh if _is_held_short(s) else -self.strategy.min_signal_threshold)
             ]
-            short_cands.sort(key=lambda s: (s.composite_score, s.symbol))
-            selected_shorts = short_cands[: self.strategy.top_k_short]
+            selected_shorts = _select_with_hysteresis(
+                short_cands,
+                top_k=self.strategy.top_k_short,
+                is_held=_is_held_short,
+                sort_key=lambda s: (s.composite_score, s.symbol),
+            )
 
         targets: dict[str, float] = {}
         for sym in set(cur_w.keys()) | {s.symbol for s in deduped}:
@@ -147,17 +202,19 @@ class PortfolioConstructor:
                         targets[sym] *= sec_scale
 
         # Enforce net exposure bounds smoothly by scaling the dominant side
+        effective_max_net = min(self.risk.max_net_exposure, self.risk.max_net_exposure * risk_scale)
+        effective_min_net = max(self.risk.min_net_exposure, self.risk.min_net_exposure * risk_scale)
         long_sum = sum(w for w in targets.values() if w > 0.0)
         short_sum = sum(-w for w in targets.values() if w < 0.0)
         net_exp = long_sum - short_sum
-        if net_exp > self.risk.max_net_exposure and long_sum > 1e-12:
-            target_long_sum = max(0.0, short_sum + self.risk.max_net_exposure)
+        if net_exp > effective_max_net and long_sum > 1e-12:
+            target_long_sum = max(0.0, short_sum + effective_max_net)
             l_scale = target_long_sum / long_sum
             for sym, w in list(targets.items()):
                 if w > 0.0:
                     targets[sym] = w * l_scale
-        elif net_exp < self.risk.min_net_exposure and short_sum > 1e-12:
-            target_short_sum = max(0.0, long_sum - self.risk.min_net_exposure)
+        elif net_exp < effective_min_net and short_sum > 1e-12:
+            target_short_sum = max(0.0, long_sum - effective_min_net)
             s_scale = target_short_sum / short_sum
             for sym, w in list(targets.items()):
                 if w < 0.0:
@@ -212,6 +269,19 @@ class PortfolioConstructor:
             current_weights=current_weights,
         )
 
+        macro_scale = min((s.macro_regime_scale for s in signal_map.values()), default=1.0)
+        risk_scale = max(0.0, min(1.0, macro_scale * dials.exposure_multiplier))
+        effective_gross_cap = self.risk.max_gross_exposure * risk_scale
+        effective_max_net = min(self.risk.max_net_exposure, self.risk.max_net_exposure * risk_scale)
+        effective_min_net = max(self.risk.min_net_exposure, self.risk.min_net_exposure * risk_scale)
+        cur_gross = sum(abs(w) for w in current_weights.values())
+        cur_net = sum(current_weights.values())
+        portfolio_over_budget = (
+            (cur_gross > effective_gross_cap + 1e-6)
+            or (cur_net > effective_max_net + 1e-6)
+            or (cur_net < effective_min_net - 1e-6)
+        )
+
         orders: list[ProposedOrder] = []
         all_symbols = sorted(set(current_positions.keys()) | set(target_weights.keys()))
         deadband = self.strategy.rebalance_deadband_pct
@@ -225,12 +295,27 @@ class PortfolioConstructor:
             cur_w = (cur_qty * px) / equity
             tgt_w = float(target_weights.get(sym, 0.0))
 
-            # Skip small adjustments inside deadband unless closing fully or flipping sides
+            # Skip small adjustments inside deadband unless closing fully, flipping sides,
+            # or performing a risk-reducing trim while portfolio/position exceeds effective limits
             is_full_close = abs(tgt_w) <= 1e-9 and abs(cur_qty) > 1e-9
             is_side_flip = (cur_qty > 1e-9 and tgt_w < -1e-9) or (
                 cur_qty < -1e-9 and tgt_w > 1e-9
             )
-            if not is_full_close and not is_side_flip and abs(tgt_w - cur_w) < deadband:
+            is_trim = (cur_w > 1e-9 and 0.0 <= tgt_w < cur_w - 1e-9) or (
+                cur_w < -1e-9 and cur_w + 1e-9 < tgt_w <= 0.0
+            )
+            pos_cap = (
+                self.risk.max_long_position_pct
+                if cur_w > 0.0
+                else self.risk.max_short_position_pct
+            )
+            pos_over_cap = abs(cur_w) > pos_cap + 1e-6
+            bypass_deadband = (
+                is_full_close
+                or is_side_flip
+                or (is_trim and (portfolio_over_budget or pos_over_cap))
+            )
+            if not bypass_deadband and abs(tgt_w - cur_w) < deadband:
                 continue
 
             sig = signal_map.get(sym)

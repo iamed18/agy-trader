@@ -257,7 +257,7 @@ class LexiconSentimentScorer(SentimentScorer):
 class FinBERTScorer(SentimentScorer):
     """Local ProsusAI/finbert sentiment scorer (CPU or GPU auto-detect, lazy-loaded)."""
 
-    def __init__(self, model_id: str = "ProsusAI/finbert", batch_size: int = 16) -> None:
+    def __init__(self, model_id: str = "ProsusAI/finbert", batch_size: int = 32) -> None:
         from typing import Any
 
         self._model_id = model_id
@@ -283,7 +283,12 @@ class FinBERTScorer(SentimentScorer):
                 "Install with: uv sync --extra nlp"
             ) from exc
 
-        self._device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            self._device = "cuda"
+        elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+            self._device = "mps"
+        else:
+            self._device = "cpu"
         self._tokenizer = AutoTokenizer.from_pretrained(self._model_id)
         self._model = AutoModelForSequenceClassification.from_pretrained(self._model_id)
         self._model.to(self._device)
@@ -319,9 +324,14 @@ class FinBERTScorer(SentimentScorer):
                 prob_by_label = {self._label_map[i]: float(p) for i, p in enumerate(row)}
                 p_pos = prob_by_label.get("positive", 0.0)
                 p_neg = prob_by_label.get("negative", 0.0)
-                score = max(-1.0, min(1.0, p_pos - p_neg))
                 best_label = max(prob_by_label, key=lambda lbl: prob_by_label[lbl])
-                confidence = max(0.0, min(1.0, prob_by_label[best_label]))
+                raw_conf = prob_by_label[best_label]
+                if not (
+                    math.isfinite(p_pos) and math.isfinite(p_neg) and math.isfinite(raw_conf)
+                ):
+                    raise ValueError("FinBERT produced non-finite probability")
+                score = max(-1.0, min(1.0, p_pos - p_neg))
+                confidence = max(0.0, min(1.0, raw_conf))
                 predictions.append(
                     SentimentPrediction(
                         score=round(score, 6),

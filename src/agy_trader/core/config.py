@@ -66,6 +66,12 @@ class StrategyConfig(BaseModel):
     min_signal_threshold: float = Field(default=0.35, ge=0.0, le=1.0)
     rebalance_deadband_pct: float = Field(default=0.015, ge=0.0, le=0.5)
     allow_fractional_longs: bool = True
+    rebalance_every_n_days: int = Field(default=1, ge=1, le=21)
+    hold_rank_buffer: int = Field(default=0, ge=0, le=50)
+    exit_signal_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
+    abs_momentum_filter: bool = False
+    short_only_in_bear_regime: bool = False
+    spy_sma200_defensive_scale: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @field_validator("rebalance_checkpoints_et")
     @classmethod
@@ -84,6 +90,11 @@ class StrategyConfig(BaseModel):
             raise ValueError("Strategy signal weights must sum to > 0")
         if self.news_lookback_hours < self.news_half_life_hours:
             raise ValueError("news_lookback_hours must be >= news_half_life_hours")
+        if (
+            self.exit_signal_threshold is not None
+            and self.exit_signal_threshold > self.min_signal_threshold
+        ):
+            raise ValueError("exit_signal_threshold must be <= min_signal_threshold")
         return self
 
 

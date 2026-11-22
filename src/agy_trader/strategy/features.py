@@ -62,6 +62,7 @@ class _RawSymbolFeatures:
     pullback_raw: float
     news_raw: float
     news_velocity_z: float
+    news_article_count: int
     atr_pct: float
     ann_vol: float
     ret_5d: float
@@ -121,12 +122,14 @@ def compute_macro_regime_scale(
     as_of: datetime,
     spy_bars: pd.DataFrame | None,
     macro_points: Sequence[MacroPoint] | None = None,
+    spy_sma200_defensive_scale: float | None = None,
 ) -> float:
-    """Compute strictly point-in-time macro risk scaling in [0.4, 1.0].
+    """Compute strictly point-in-time macro risk scaling in [floor, 1.0].
 
     Uses conservative America/New_York business-day release timestamps for FRED macro
     series (`macro_point_available_at_utc(pt) <= as_of_utc`) and blends with SPY 20d
-    realized volatility / 50d EMA trend computed strictly on bars with `timestamp <= as_of_utc`.
+    realized volatility / 50d EMA / optional 200d SMA trend computed strictly on bars
+    with `timestamp <= as_of_utc`.
     """
     as_of_utc = ensure_utc(as_of)
     scale = 1.0
@@ -151,6 +154,12 @@ def compute_macro_regime_scale(
                         scale = min(scale, 0.85)
                 if math.isfinite(ema_50) and last_close < ema_50 * 0.97:
                     scale = min(scale, scale * 0.85)
+                if spy_sma200_defensive_scale is not None and len(hist) >= 200:
+                    closes_200 = hist["close"].astype(float).tail(200)
+                    if _is_valid_price_series(closes_200):
+                        sma_200 = float(closes_200.mean())
+                        if math.isfinite(sma_200) and last_close < sma_200:
+                            scale = min(scale, spy_sma200_defensive_scale)
 
     # 2. FRED macro series gated by exact conservative release availability UTC timestamp
     if macro_points:
@@ -179,7 +188,8 @@ def compute_macro_regime_scale(
         if yield_curve is not None and yield_curve.value < -0.5 and scale < 0.85:
             scale = min(scale, 0.50)
 
-    return round(max(0.4, min(1.0, scale)), 4)
+    floor = 0.4 if spy_sma200_defensive_scale is None else min(0.4, spy_sma200_defensive_scale)
+    return round(max(floor, min(1.0, scale)), 4)
 
 
 class FeatureEngine:
@@ -220,6 +230,7 @@ class FeatureEngine:
             as_of=as_of_utc,
             spy_bars=spy_df,
             macro_points=macro_points,
+            spy_sma200_defensive_scale=self.config.spy_sma200_defensive_scale,
         )
 
         raw_rows: list[_RawSymbolFeatures] = []
@@ -303,6 +314,7 @@ class FeatureEngine:
                     pullback_raw=pullback_raw,
                     news_raw=agg_sent.news_score,
                     news_velocity_z=agg_sent.velocity_z,
+                    news_article_count=agg_sent.article_count_window,
                     atr_pct=atr_pct,
                     ann_vol=ann_vol,
                     ret_5d=ret_5d,
@@ -320,14 +332,19 @@ class FeatureEngine:
         w_t = self.config.w_trend
         w_p = self.config.w_pullback
         w_n = self.config.w_news_sentiment
-        w_sum = w_t + w_p + w_n
 
         signals: list[SignalRow] = []
         for idx, r in enumerate(raw_rows):
             t_z = trend_zs[idx]
             p_z = pullback_zs[idx]
             n_z = news_zs[idx]
-            composite = (w_t * t_z + w_p * p_z + w_n * n_z) / w_sum
+            effective_w_n = w_n if r.news_article_count > 0 else 0.0
+            row_w_sum = w_t + w_p + effective_w_n
+            composite = (
+                (w_t * t_z + w_p * p_z + effective_w_n * n_z) / row_w_sum
+                if row_w_sum > 0.0
+                else 0.0
+            )
             signals.append(
                 SignalRow(
                     as_of=as_of_utc,
@@ -341,6 +358,7 @@ class FeatureEngine:
                     atr_pct=round(r.atr_pct, 6),
                     ann_vol=round(r.ann_vol, 6),
                     ret_5d=round(r.ret_5d, 6),
+                    abs_trend_raw=round(r.trend_raw, 6),
                 )
             )
         return signals

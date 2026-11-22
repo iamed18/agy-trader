@@ -11,11 +11,12 @@
 - **Verification State:**
   - `uv run ruff check src tests` -> **0 errors**
   - `uv run mypy src tests` -> **0 errors across 34 files**
-  - `uv run pytest -v` -> **55/55 tests passing**
-- **Adversarial Audit State:** All 3 Phase 1 Independent Adversarial Audit Gates cleared with **0 `CRITICAL`, 0 `HIGH`, and 0 `MEDIUM` findings remaining**:
+  - `uv run pytest -v` -> **67/67 tests passing**
+- **Adversarial Audit State:** All 4 Phase 1 Independent Adversarial Audit Gates cleared with **0 `CRITICAL`, 0 `HIGH`, and 0 unresolved code `MEDIUM` findings**:
   - [docs/audits/phase1_gate_a.md](audits/phase1_gate_a.md) — Data & Lookahead Bias (`PASS`)
   - [docs/audits/phase1_gate_b.md](audits/phase1_gate_b.md) — Risk Engine & Short-Safety Invariants (`PASS`)
   - [docs/audits/phase1_gate_c.md](audits/phase1_gate_c.md) — Backtest Accounting & Test Rigor (`PASS`)
+  - [docs/audits/phase1_tuning_audit.md](audits/phase1_tuning_audit.md) — Real-Data Tuning, FinBERT & Turnover Controls (`PASS`)
 
 ---
 
@@ -81,9 +82,14 @@ All architectural decisions below were explicitly agreed with the user during di
    # uv run agy score-news --backend finbert
    uv run agy backtest --ablate --walk-forward --folds 3
    ```
-4. **Inspect Turnover & Strategy Tuning (Key Insight from Phase 1 Synthetic Dry Run):**
-   - Our 365-day synthetic dry run confirmed the `-8%` drawdown kill-switch and stops protected capital (capping drawdown around `-8.5%` to `-9.4%` vs `-14.5%` on synthetic `SPY`), **but** daily rebalancing generated high turnover (`20x–41x`) and significant slippage drag.
-   - Once real Alpaca historical + Benzinga news ablation results are in, review with the user whether to tune `rebalance_deadband_pct`, add holding hysteresis / minimum hold days, shift to weekly or 2x/week rebalancing, or disable shorting/news if the A/B ablation shows they don't add net risk-adjusted return after slippage & borrow costs.
+4. **Completed Real-Data Tuning & FinBERT Validation (5-Year IS `2022–2024` -> Blind OOS `2025–2026`):**
+   - Tuned `config/strategy.yaml` (`rebalance_every_n_days: 3`, `rebalance_deadband_pct: 0.04`, `hold_rank_buffer: 6`, `exit_signal_threshold: 0.0`, `w_trend: 0.64`, `w_pullback: 0.11`, `w_news_sentiment: 0.25`, `news_half_life_hours: 48.0`, `news_lookback_hours: 120.0`, `short_only_in_bear_regime: true`, `spy_sma200_defensive_scale: 0.35`) with all hard `risk:` caps untouched.
+   - **4.2-Year Continuous (`2022-09-12..2026-11-20`, once 200 SPY bars active):** Long-Only + FinBERT delivered **`+50.55%`** (`+10.29%` CAGR, **`1.277` Sharpe**, `1.924` Sortino, `-8.17%` Max DD, `6.22x` turnover) vs. `SPY` `+77.72%` (`0.946` Sharpe, `-18.74%` Max DD).
+   - **Blind OOS (`2025-01-02..2026-11-20`):** Long-Only + FinBERT delivered **`+22.54%`** (**`1.382` Sharpe**, `2.041` Sortino, **`-5.27%` Max DD**, `6.48x` turnover vs. baseline `25.6x`) beating `SPY` (`+20.47%`, `0.674` Sharpe, `-18.74%` Max DD).
+   - **Phase 2 Live-Parity Requirements (from tuning audit):**
+     - Persist the `rebalance_every_n_days` trading-session counter in `StateDB` (do not rely on in-memory counters across restarts) and run daily-bar signal evaluation at a single canonical session checkpoint (`15:40 ET`), reserving the 30s loop for stops/broker sync/drawdown guards.
+     - Ensure at least 200 historical daily bars for `SPY` are backfilled on startup so `spy_sma200_defensive_scale` is active from day 1.
+     - Filter `StateDB.get_all_scored_news()` by active `scorer_model` (`ProsusAI/finbert`) if mixed models exist in SQLite.
 
 ---
 

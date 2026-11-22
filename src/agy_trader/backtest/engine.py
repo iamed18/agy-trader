@@ -242,7 +242,7 @@ class BacktestEngine:
                 last_known_close[sym] = float(df["close"].iloc[pos - 1])
                 last_bar_ts[sym] = ensure_utc(df["timestamp"].iloc[pos - 1].to_pydatetime())
 
-        for ts in sim_timestamps:
+        for bar_idx, ts in enumerate(sim_timestamps):
             # 1. Accrue short borrow cost using exact elapsed calendar days / 365
             if prev_ts is not None and bt_cfg.short_borrow_apr > 0.0 and not bankrupt:
                 elapsed_days = max(0.0, (ts - prev_ts).total_seconds() / 86400.0)
@@ -768,8 +768,9 @@ class BacktestEngine:
             # 6. Compute strictly point-in-time signals & queue approved orders for bar t+1 open
             pending_queue = list(carried_exits)
             carried_symbols = {item.verdict.order.symbol for item in carried_exits}
+            is_rebalance_day = (bar_idx % strat_cfg.rebalance_every_n_days) == 0
 
-            if ts != sim_timestamps[-1] and not bankrupt and equity > 0.0:
+            if is_rebalance_day and ts != sim_timestamps[-1] and not bankrupt and equity > 0.0:
                 ts_ns = int(pd.Timestamp(ts).as_unit("ns").value)
                 pit_bars: dict[str, pd.DataFrame] = {}
                 fresh_bar_ages: list[float] = []
