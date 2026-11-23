@@ -1,5 +1,7 @@
 from .discord import (
     ALLOWED_DISCORD_HOSTS,
+    DEFAULT_DISCORD_CHANNEL_LABEL,
+    DEFAULT_DISCORD_FOOTER,
     DiscordWebhookNotifier,
     build_blackout_alert_discord_embed,
     build_daily_summary_discord_embed,
@@ -12,6 +14,8 @@ from .discord import (
 
 __all__ = [
     "ALLOWED_DISCORD_HOSTS",
+    "DEFAULT_DISCORD_CHANNEL_LABEL",
+    "DEFAULT_DISCORD_FOOTER",
     "DiscordWebhookNotifier",
     "build_blackout_alert_discord_embed",
     "build_daily_summary_discord_embed",

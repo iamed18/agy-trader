@@ -36,6 +36,9 @@ COLOR_AMBER = 0xF59E0B
 COLOR_RED = 0xEF4444
 COLOR_BLUE = 0x3B82F6
 
+DEFAULT_DISCORD_FOOTER = "agy-trader"
+DEFAULT_DISCORD_CHANNEL_LABEL = "Discord alerts"
+
 _WEBHOOK_PATH_RE = re.compile(r"^/api/webhooks/(\d+)/([A-Za-z0-9_-]+)$")
 _WEBHOOK_REDACT_RE = re.compile(r"(/webhooks/[^/\s]+/)([^/?#\s]+)", re.IGNORECASE)
 _WEBHOOK_URL_REDACT_RE = re.compile(r"(/webhooks/[^/?#]+/)([^?#]+)", re.IGNORECASE)
@@ -132,7 +135,7 @@ def normalize_discord_embed(
     description: str,
     color: int,
     fields: Sequence[Mapping[str, Any]] = (),
-    footer: str = "agy-trader",
+    footer: str = DEFAULT_DISCORD_FOOTER,
 ) -> dict[str, Any]:
     """Normalize and truncate embed fields to strictly satisfy Discord API limits."""
     norm_title = _truncate(str(title), DISCORD_MAX_TITLE_LEN)
@@ -312,7 +315,7 @@ class DiscordWebhookNotifier:
         description: str,
         color: int,
         fields: Sequence[dict[str, Any]] = (),
-        footer: str = "agy-trader",
+        footer: str = DEFAULT_DISCORD_FOOTER,
     ) -> dict[str, Any]:
         """Post a single Discord embed to the configured webhook URL."""
         embed = normalize_discord_embed(
@@ -509,14 +512,14 @@ def build_morning_discord_embed(
         description=description,
         color=color,
         fields=raw_fields,
-        footer="agy-trader",
+        footer=DEFAULT_DISCORD_FOOTER,
     )
     return {
         "title": norm["title"],
         "description": norm["description"],
         "color": norm["color"],
         "fields": norm.get("fields", []),
-        "footer": str((norm.get("footer") or {}).get("text", "agy-trader")),
+        "footer": str((norm.get("footer") or {}).get("text", DEFAULT_DISCORD_FOOTER)),
     }
 
 
@@ -634,18 +637,18 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
         description=description,
         color=color,
         fields=raw_fields,
-        footer="agy-trader",
+        footer=DEFAULT_DISCORD_FOOTER,
     )
     return {
         "title": norm["title"],
         "description": norm["description"],
         "color": norm["color"],
         "fields": norm.get("fields", []),
-        "footer": str((norm.get("footer") or {}).get("text", "agy-trader")),
+        "footer": str((norm.get("footer") or {}).get("text", DEFAULT_DISCORD_FOOTER)),
     }
 
 
-def build_test_discord_embed(channel_label: str = "Discord alerts") -> dict[str, Any]:
+def build_test_discord_embed(channel_label: str = DEFAULT_DISCORD_CHANNEL_LABEL) -> dict[str, Any]:
     """Build a connectivity verification Discord embed."""
     now_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     raw_fields = [
@@ -658,14 +661,14 @@ def build_test_discord_embed(channel_label: str = "Discord alerts") -> dict[str,
         description=f"Connectivity check for **{channel_label}**.",
         color=COLOR_BLUE,
         fields=raw_fields,
-        footer="agy-trader",
+        footer=DEFAULT_DISCORD_FOOTER,
     )
     return {
         "title": norm["title"],
         "description": norm["description"],
         "color": norm["color"],
         "fields": norm.get("fields", []),
-        "footer": str((norm.get("footer") or {}).get("text", "agy-trader")),
+        "footer": str((norm.get("footer") or {}).get("text", DEFAULT_DISCORD_FOOTER)),
     }
 
 
@@ -741,12 +744,12 @@ def build_blackout_alert_discord_embed(
         description=description,
         color=color,
         fields=raw_fields,
-        footer="agy-trader",
+        footer=DEFAULT_DISCORD_FOOTER,
     )
     return {
         "title": norm["title"],
         "description": norm["description"],
         "color": norm["color"],
         "fields": norm.get("fields", []),
-        "footer": str((norm.get("footer") or {}).get("text", "agy-trader")),
+        "footer": str((norm.get("footer") or {}).get("text", DEFAULT_DISCORD_FOOTER)),
     }

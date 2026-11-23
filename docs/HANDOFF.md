@@ -1,6 +1,6 @@
 # `agy-trader` — Agent & Local Host Handoff Document
 
-> **For a new local agent session on `local-host`:** Read this entire file before taking action. It captures every locked-in design decision, the completed Phase 1 state, mandatory engineering/quota/audit policies, immediate next steps on real Alpaca data, and the Phase 2–3 blueprint.
+> **For a new local agent session:** Read this entire file before taking action. It captures every locked-in design decision, the completed Phase 1 state, mandatory engineering/quota/audit policies, immediate next steps on real Alpaca data, and the Phase 2–3 blueprint.
 
 ---
 
@@ -36,7 +36,7 @@ All architectural decisions below were explicitly agreed with the user during di
 | **Monitoring Agent Power** | **Active Ops Agent** constrained strictly to bounded, audited `agy ops ...` commands: read telemetry/P&L/news, pause/resume new entries, dial `exposure_multiplier` strictly in `[0.0, 1.0]`, toggle `allow_shorting`, add TTL symbol blacklists, and restart stuck daemons (max 2/hr/service via atomic SQLite `service_restart_log`). **Cannot** place arbitrary trades, raise hard risk caps, or edit strategy code (writes Markdown proposals instead) |
 | **Data Tier & Budget** | **\$0/mo starter**: Alpaca Paper + Basic IEX bars + Benzinga News + free FRED macro + free `yfinance` earnings, behind pluggable provider interfaces (`ALPACA_DATA_FEED=sip` flip later) |
 | **Observability** | `agy` CLI (`--json` on every command) + read-only local FastAPI web dashboard (`127.0.0.1:8080`, Phase 3) + webhook alerts (Discord/Slack/Telegram/email, Phase 3) |
-| **Target Host & Packaging** | Always-on Linux host (`local-host`) running **native Python 3.12 services managed by `systemd`** (with optional Docker Compose) |
+| **Target Host & Packaging** | Always-on host running **native Python 3.12+ services managed by `launchd` / `systemd`** (with optional Docker Compose) |
 | **User Communication** | User is new to systematic/algorithmic trading — explain quant/trading concepts clearly in plain language and recommend safe defaults when asking design questions |
 
 ---
@@ -59,9 +59,9 @@ All architectural decisions below were explicitly agreed with the user during di
 
 ---
 
-## 4. Immediate Next Steps on `local-host` (Before Starting Phase 2)
+## 4. Immediate Next Steps on the Local Host (Before Starting Phase 2)
 
-1. **Environment & Secrets Setup (stay strictly local on `local-host` — `.env` is gitignored):**
+1. **Environment & Secrets Setup (stay strictly local — `.env` is gitignored):**
    ```bash
    cd ~/src/agy-trader
    uv sync
@@ -98,13 +98,13 @@ All architectural decisions below were explicitly agreed with the user during di
 
 ## 5. Deferred Roadmap (Plan & Execute Only After User Approves)
 
-### Phase 2 — Live Paper Daemons & Broker Execution (on `local-host`)
+### Phase 2 — Live Paper Daemons & Broker Execution (Local Host)
 - **`src/agy_trader/execution/alpaca_broker.py`:** `TradingClient` wrapper enforcing `validate_trading_mode`, startup & per-cycle broker-to-SQLite reconciliation, deterministic `client_order_id` (`{run_id}:{symbol}:{side}`) idempotency, limit orders near NBBO with timeout fallback, mandatory broker-side hard stop-loss sync, and `agy emergency-flatten --confirm`.
 - **Native Python Daemons (`src/agy_trader/daemons/`):**
   - `agy-market-data`: Alpaca `StockDataStream` WebSocket + reconnect/REST gap-fill to Parquet + daily macro/earnings refresh + SQLite heartbeat.
   - `agy-news-nlp`: Alpaca `NewsDataStream` Benzinga WebSocket + deduplication + local FinBERT/lexicon scoring to SQLite + heartbeat.
   - `agy-trader`: 30s fast loop (broker sync, stop-loss audit, drawdown kill-switches, `portfolio_snapshots`, heartbeat) + scheduled ET swing rebalance checkpoints (`10:00`, `13:00`, `15:40` ET via Alpaca market clock) running the exact Phase 1 `FeatureEngine -> PortfolioConstructor -> HardRiskEngine -> AlpacaBroker` pipeline.
-- **Deployment (`deploy/systemd/*.service`, `deploy/docker-compose.yml`):** Ready-to-enable `systemd` units for `local-host` with `Restart=on-failure`, memory/CPU limits, and journald logging.
+- **Deployment (`deploy/macos/`, `deploy/systemd/*.service`, `deploy/docker-compose.yml`):** Ready-to-enable service units with automatic restart, memory/CPU limits, and log rotation.
 - **Recommended Phase 2 Adversarial Audit Gates:**
   - *Gate D:* Order Idempotency, Broker Reconciliation & Live Double-Lock Audit.
   - *Gate E:* Daemon Crash-Recovery, WebSocket Gap-Fill & Stop-Sync Audit.

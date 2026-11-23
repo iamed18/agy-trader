@@ -715,14 +715,14 @@ def test_trader_daemon_reconcile_stop_repair_crash_idempotency_and_kill_switch(
 
 
 def test_service_manifests_launchd_and_systemd(tmp_path: Path) -> None:
-    repo_root = Path("/path/to/agy-trader")
+    repo_root = Path("/Users/testtrader/src/agy-trader")
     for spec in DEFAULT_SERVICE_SPECS:
-        plist_xml = render_launchd_plist(spec, repo_root=repo_root, username="trader")
+        plist_xml = render_launchd_plist(spec, repo_root=repo_root, username="testtrader")
         parsed = plistlib.loads(plist_xml.encode("utf-8"))
         assert parsed["Label"] == spec.label
-        assert parsed["UserName"] == "trader"
+        assert parsed["UserName"] == "testtrader"
         assert parsed["GroupName"] == "staff"
-        assert parsed["EnvironmentVariables"]["HOME"] == "/Users/<user>"
+        assert parsed["EnvironmentVariables"]["HOME"] == "/Users/testtrader"
         assert parsed["RunAtLoad"] is True
         assert parsed["KeepAlive"] is True
         assert parsed["ThrottleInterval"] == 15
@@ -734,19 +734,23 @@ def test_service_manifests_launchd_and_systemd(tmp_path: Path) -> None:
             render_launchd_plist(
                 spec,
                 repo_root=repo_root,
-                username="trader",
+                username="testtrader",
                 log_dir=Path("/private/var/log/agy-trader"),
             ).encode("utf-8")
         )
         assert with_logs["StandardOutPath"] == f"/private/var/log/agy-trader/{spec.name}.stdout.log"
         assert with_logs["StandardErrorPath"] == f"/private/var/log/agy-trader/{spec.name}.stderr.log"
 
-        unit = render_systemd_unit(spec, repo_root=repo_root, username="trader")
+        unit = render_systemd_unit(spec, repo_root=repo_root, username="testtrader")
         assert f"Description={spec.description}" in unit
         assert "Restart=always" in unit
 
-    written_mac = write_service_manifests("macos", tmp_path / "mac", repo_root=repo_root)
-    written_lin = write_service_manifests("systemd", tmp_path / "lin", repo_root=repo_root)
+    written_mac = write_service_manifests(
+        "macos", tmp_path / "mac", repo_root=repo_root, username="testtrader"
+    )
+    written_lin = write_service_manifests(
+        "systemd", tmp_path / "lin", repo_root=repo_root, username="testtrader"
+    )
     assert len(written_mac) == 4
     assert len(written_lin) == 4
     assert all(p.exists() for p in written_mac + written_lin)

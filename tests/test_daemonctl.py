@@ -15,10 +15,14 @@ import pytest
 from typer.testing import CliRunner
 
 from agy_ops.cli import app
+from agy_ops.deploy.service_manifests import DEFAULT_SERVICE_SPECS, render_launchd_plist
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEPLOY_MACOS_DIR = REPO_ROOT / "deploy" / "macos"
 DAEMONCTL_PATH = DEPLOY_MACOS_DIR / "agy-daemonctl.py"
+TEST_RUN_USER = "testtrader"
+TEST_REPO_ROOT = Path("/Users/testtrader/src/agy-trader")
+TEST_VENV_AGY_OPS = "/Users/testtrader/src/agy-trader/.venv/bin/agy-ops"
 
 runner = CliRunner()
 
@@ -35,20 +39,30 @@ def _load_daemonctl() -> Any:
 daemonctl = _load_daemonctl()
 
 
+@pytest.fixture(autouse=True)
+def _configure_daemonctl_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stamp synthetic non-PII host config onto the daemonctl template for unit tests."""
+    monkeypatch.setattr(daemonctl, "RUN_USER", TEST_RUN_USER)
+    monkeypatch.setattr(daemonctl, "RUN_GROUP", "staff")
+    monkeypatch.setattr(daemonctl, "REPO_ROOT", TEST_REPO_ROOT)
+    monkeypatch.setattr(daemonctl, "PLIST_SRC_DIR", TEST_REPO_ROOT / "deploy" / "macos")
+    monkeypatch.setattr(daemonctl, "VENV_AGY_OPS", TEST_VENV_AGY_OPS)
+
+
 def _valid_plist_dict(service: str = "trader", log_dir: Path | None = None) -> dict[str, Any]:
     resolved_logs = log_dir or daemonctl.LOG_DIR
     extra_args = ["--host", "127.0.0.1", "--port", "8080"] if service == "dashboard" else []
     return {
         "Label": f"com.agytrader.{service}",
-        "UserName": "trader",
+        "UserName": TEST_RUN_USER,
         "GroupName": "staff",
-        "WorkingDirectory": str(REPO_ROOT),
-        "ProgramArguments": [daemonctl.VENV_AGY_OPS, "daemon", service, *extra_args],
+        "WorkingDirectory": str(TEST_REPO_ROOT),
+        "ProgramArguments": [TEST_VENV_AGY_OPS, "daemon", service, *extra_args],
         "EnvironmentVariables": {
-            "AGY_CONFIG_DIR": str(REPO_ROOT / "config"),
-            "AGY_DATA_DIR": str(REPO_ROOT / "data"),
-            "HOME": "/Users/<user>",
-            "PATH": "/path/to/agy-trader/.venv/bin:/usr/bin:/bin",
+            "AGY_CONFIG_DIR": str(TEST_REPO_ROOT / "config"),
+            "AGY_DATA_DIR": str(TEST_REPO_ROOT / "data"),
+            "HOME": f"/Users/{TEST_RUN_USER}",
+            "PATH": f"{TEST_REPO_ROOT / '.venv/bin'}:/usr/bin:/bin",
             "PYTHONUNBUFFERED": "1",
         },
         "RunAtLoad": True,
@@ -59,25 +73,33 @@ def _valid_plist_dict(service: str = "trader", log_dir: Path | None = None) -> d
     }
 
 
-def test_real_repo_plists_and_newsyslog_use_root_var_log_dir() -> None:
+def test_rendered_plists_and_newsyslog_template_use_root_var_log_dir(tmp_path: Path) -> None:
     assert daemonctl.LOG_DIR == Path("/private/var/log/agy-trader")
-    for service in daemonctl.ALLOWED_SERVICES:
-        plist_path = DEPLOY_MACOS_DIR / f"com.agytrader.{service}.plist"
+    plist_dir = tmp_path.resolve() / "plists"
+    plist_dir.mkdir()
+    for spec in DEFAULT_SERVICE_SPECS:
+        rendered = render_launchd_plist(
+            spec,
+            repo_root=TEST_REPO_ROOT,
+            username=TEST_RUN_USER,
+        )
+        plist_path = plist_dir / f"{spec.label}.plist"
+        plist_path.write_text(rendered, encoding="utf-8")
         raw = daemonctl.read_plist_nosymlink(plist_path)
         parsed = plistlib.loads(raw, fmt=plistlib.FMT_XML)
-        canonical = daemonctl.validate_and_canonicalize_plist(service, raw)
+        canonical = daemonctl.validate_and_canonicalize_plist(spec.name, raw)
         reparsed = plistlib.loads(canonical, fmt=plistlib.FMT_XML)
         assert reparsed == parsed
-        assert reparsed["UserName"] == "trader"
+        assert reparsed["UserName"] == TEST_RUN_USER
         assert reparsed["GroupName"] == "staff"
-        assert reparsed["ProgramArguments"][0] == daemonctl.VENV_AGY_OPS
-        assert reparsed["ProgramArguments"][1:3] == ["daemon", service]
+        assert reparsed["ProgramArguments"][0] == TEST_VENV_AGY_OPS
+        assert reparsed["ProgramArguments"][1:3] == ["daemon", spec.name]
         assert "StandardOutPath" not in reparsed
         assert "StandardErrorPath" not in reparsed
 
     newsyslog_lines = [
         line.strip()
-        for line in (DEPLOY_MACOS_DIR / "com.agytrader.newsyslog.conf")
+        for line in (DEPLOY_MACOS_DIR / "com.agytrader.newsyslog.conf.tmpl")
         .read_text(encoding="utf-8")
         .splitlines()
         if line.strip() and not line.strip().startswith("#")
@@ -88,9 +110,19 @@ def test_real_repo_plists_and_newsyslog_use_root_var_log_dir() -> None:
             expected_log = f"/private/var/log/agy-trader/{svc}.{stream}.log"
             matching = [ln for ln in newsyslog_lines if ln.startswith(expected_log)]
             assert len(matching) == 1
-            assert "<user>:staff" in matching[0]
+            assert "__RUN_USER__:__RUN_GROUP__" in matching[0]
             assert matching[0].endswith("JN")
             assert "G" not in matching[0].split()[-1]
+
+
+def test_daemonctl_fails_closed_when_template_unrendered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(daemonctl, "RUN_USER", "__AGY_RUN_USER__")
+    raw = plistlib.dumps(_valid_plist_dict("trader"), fmt=plistlib.FMT_XML)
+    with pytest.raises(daemonctl.PlistValidationError, match="unrendered template placeholder"):
+        daemonctl.validate_and_canonicalize_plist("trader", raw)
+    assert daemonctl.main(["status", "trader", "--json"]) == 1
 
 
 def test_daemonctl_uses_isolated_python3_shebang() -> None:
@@ -238,9 +270,17 @@ def test_read_plist_and_log_reject_symlinks_ancestors_hardlinks_and_wrong_uid(
 
     monkeypatch.setattr(daemonctl.os, "geteuid", lambda: 0)
     monkeypatch.setattr(daemonctl.os, "fstat", fake_fstat_root_owned)
-    with pytest.raises(daemonctl.PlistValidationError, match="must be owned by trader"):
+    monkeypatch.setattr(
+        daemonctl.pwd, "getpwnam", lambda _user: SimpleNamespace(pw_uid=501)
+    )
+    with pytest.raises(daemonctl.PlistValidationError, match=f"must be owned by {TEST_RUN_USER}"):
         daemonctl.read_plist_nosymlink(single_plist)
     monkeypatch.undo()
+    monkeypatch.setattr(daemonctl, "RUN_USER", TEST_RUN_USER)
+    monkeypatch.setattr(daemonctl, "RUN_GROUP", "staff")
+    monkeypatch.setattr(daemonctl, "REPO_ROOT", TEST_REPO_ROOT)
+    monkeypatch.setattr(daemonctl, "PLIST_SRC_DIR", TEST_REPO_ROOT / "deploy" / "macos")
+    monkeypatch.setattr(daemonctl, "VENV_AGY_OPS", TEST_VENV_AGY_OPS)
 
     # Symlinked target log file rejected
     log_dir = root / "logs"

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import plistlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,18 +53,19 @@ def render_launchd_plist(
     spec: ServiceSpec,
     *,
     repo_root: Path,
-    username: str = "trader",
+    username: str | None = None,
     executable_path: Path | None = None,
     log_dir: Path | None = None,
 ) -> str:
     """Render a macOS pre-login LaunchDaemon XML plist for a ServiceSpec."""
+    resolved_user = username or getpass.getuser()
     root = Path(repo_root)
     exe = executable_path or (root / ".venv" / "bin" / "agy-ops")
     program_args = [str(exe), "daemon", spec.daemon_arg, *spec.extra_args]
     env_vars = {
-        "HOME": f"/Users/{username}",
+        "HOME": f"/Users/{resolved_user}",
         "PATH": (
-            f"{root / '.venv' / 'bin'}:/Users/{username}/.local/bin:"
+            f"{root / '.venv' / 'bin'}:/Users/{resolved_user}/.local/bin:"
             "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
         ),
         "PYTHONUNBUFFERED": "1",
@@ -72,7 +74,7 @@ def render_launchd_plist(
     }
     payload: dict[str, object] = {
         "Label": spec.label,
-        "UserName": username,
+        "UserName": resolved_user,
         "GroupName": "staff",
         "WorkingDirectory": str(root),
         "ProgramArguments": program_args,
@@ -92,10 +94,11 @@ def render_systemd_unit(
     spec: ServiceSpec,
     *,
     repo_root: Path,
-    username: str = "trader",
+    username: str | None = None,
     executable_path: Path | None = None,
 ) -> str:
     """Render a portable Linux systemd service unit for a ServiceSpec."""
+    resolved_user = username or getpass.getuser()
     root = Path(repo_root)
     exe = executable_path or (root / ".venv" / "bin" / "agy-ops")
     exec_cmd = " ".join([str(exe), "daemon", spec.daemon_arg, *spec.extra_args])
@@ -106,7 +109,7 @@ def render_systemd_unit(
         f"Wants=network-online.target\n\n"
         f"[Service]\n"
         f"Type=simple\n"
-        f"User={username}\n"
+        f"User={resolved_user}\n"
         f"WorkingDirectory={root}\n"
         f"Environment=PYTHONUNBUFFERED=1\n"
         f"Environment=AGY_DATA_DIR={root / 'data'}\n"
@@ -124,19 +127,20 @@ def write_service_manifests(
     out_dir: Path,
     *,
     repo_root: Path,
-    username: str = "trader",
+    username: str | None = None,
 ) -> list[Path]:
     """Generate and write all 4 service manifest files for the given OS target."""
+    resolved_user = username or getpass.getuser()
     dest = Path(out_dir)
     dest.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
     for spec in DEFAULT_SERVICE_SPECS:
         if target == "macos":
             filename = f"{spec.label}.plist"
-            content = render_launchd_plist(spec, repo_root=repo_root, username=username)
+            content = render_launchd_plist(spec, repo_root=repo_root, username=resolved_user)
         elif target == "systemd":
             filename = f"agytrader-{spec.name}.service"
-            content = render_systemd_unit(spec, repo_root=repo_root, username=username)
+            content = render_systemd_unit(spec, repo_root=repo_root, username=resolved_user)
         else:
             raise ValueError(f"Unsupported target {target!r}: expected 'macos' or 'systemd'")
         path = dest / filename

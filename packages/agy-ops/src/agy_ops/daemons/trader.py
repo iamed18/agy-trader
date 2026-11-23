@@ -18,6 +18,7 @@ from alpaca.data.enums import DataFeed
 from alpaca.data.requests import StockSnapshotRequest
 
 from agy_ops.notifications import (
+    DEFAULT_DISCORD_FOOTER,
     DiscordWebhookNotifier,
     build_blackout_alert_discord_embed,
 )
@@ -352,7 +353,7 @@ class TraderDaemon(DaemonRunner):
                     description=embed["description"],
                     color=embed["color"],
                     fields=embed.get("fields", ()),
-                    footer=embed.get("footer", "agy-trader"),
+                    footer=embed.get("footer", DEFAULT_DISCORD_FOOTER),
                 )
             else:
                 with DiscordWebhookNotifier(webhook_url) as notifier:
@@ -361,7 +362,7 @@ class TraderDaemon(DaemonRunner):
                         description=embed["description"],
                         color=embed["color"],
                         fields=embed.get("fields", ()),
-                        footer=embed.get("footer", "agy-trader"),
+                        footer=embed.get("footer", DEFAULT_DISCORD_FOOTER),
                     )
         except Exception as exc:  # noqa: BLE001 - retry on next eligible cooldown tick
             logger.warning("blackout_discord_alert_failed", error=str(exc))

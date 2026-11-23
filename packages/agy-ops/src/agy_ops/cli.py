@@ -23,6 +23,7 @@ from agy_ops.daemons import (
 from agy_ops.dashboard.app import create_dashboard_app, serve_dashboard, validate_dashboard_host
 from agy_ops.deploy.service_manifests import write_service_manifests
 from agy_ops.notifications import (
+    DEFAULT_DISCORD_FOOTER,
     DiscordWebhookNotifier,
     build_daily_summary_discord_embed,
     build_morning_discord_embed,
@@ -39,9 +40,7 @@ from agy_trader.core.control_plane import ControlPlane, ControlPlaneError
 from agy_trader.storage.db import StateDB
 
 DAEMONCTL_PATH = "/usr/local/sbin/agy-daemonctl"
-INSTALL_LAUNCHDAEMONS_CMD = (
-    "sudo /path/to/agy-trader/deploy/macos/install_launchdaemons.sh"
-)
+INSTALL_LAUNCHDAEMONS_CMD = "sudo ./deploy/macos/install_launchdaemons.sh"
 SERVICE_TARGETS = ("market-data", "news-nlp", "trader", "dashboard", "all")
 CONTROL_PLANE_RESTART_SERVICES = ("market-data", "news-nlp", "trader")
 
@@ -52,7 +51,7 @@ app = typer.Typer(
 )
 notify_app = typer.Typer(
     name="notify",
-    help="Send operational Discord notifications to agy-trader",
+    help="Send operational Discord notifications to the configured webhook",
     no_args_is_help=True,
 )
 service_app = typer.Typer(
@@ -298,7 +297,10 @@ def render_manifests_cmd(
         Path | None,
         typer.Option("--repo-root", help="Repository root path embedded in manifests"),
     ] = None,
-    username: Annotated[str, typer.Option("--username", help="OS user running the services")] = "trader",
+    username: Annotated[
+        str | None,
+        typer.Option("--username", help="OS user running the services (defaults to current user)"),
+    ] = None,
 ) -> None:
     """Render macOS LaunchDaemon plists or Linux systemd unit files."""
     resolved_root = (repo_root or Path.cwd()).resolve()
@@ -333,7 +335,7 @@ def _post_discord_embed(
                 description=embed["description"],
                 color=embed["color"],
                 fields=embed.get("fields", ()),
-                footer=embed.get("footer", "agy-trader"),
+                footer=embed.get("footer", DEFAULT_DISCORD_FOOTER),
             )
     except (ValueError, RuntimeError) as exc:
         err_console.print(f"[red]Error:[/red] {exc}")
@@ -473,7 +475,7 @@ def notify_test_cmd(
     ] = False,
     json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
 ) -> None:
-    """Send a connectivity verification embed to agy-trader."""
+    """Send a connectivity verification embed to the configured Discord webhook."""
     settings = EnvSettings()
     embed = build_test_discord_embed()
     sent, redacted_url = _post_discord_embed(settings, embed, dry_run=dry_run)
@@ -492,7 +494,7 @@ def notify_test_cmd(
 
     prefix = "[DRY RUN] " if dry_run else ""
     action = "prepared" if dry_run else "sent"
-    typer.echo(f"{prefix}Test notification {action} for agy-trader")
+    typer.echo(f"{prefix}Test notification {action} for configured Discord webhook")
 
 
 def _service_fail(

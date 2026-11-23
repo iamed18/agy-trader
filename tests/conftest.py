@@ -42,7 +42,7 @@ def _isolate_tests_from_live_repo_dotenv(
 
 @pytest.fixture(autouse=True)
 def _forbid_live_discord_webhook(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Hard-fail any test that tries to build a notifier for the live Discord alerts webhook.
+    """Hard-fail any test that tries to build a notifier for the live Discord webhook.
 
     Belt-and-braces on top of .env isolation: even if the live URL leaks into settings by
     another path, no test may construct a DiscordWebhookNotifier pointed at it. Tests using

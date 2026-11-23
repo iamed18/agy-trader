@@ -17,12 +17,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-RUN_USER = "trader"
-RUN_GROUP = "staff"
-REPO_ROOT = Path("/path/to/agy-trader")
+RUN_USER = "__AGY_RUN_USER__"
+RUN_GROUP = "__AGY_RUN_GROUP__"
+REPO_ROOT = Path("__AGY_REPO_ROOT__")
 PLIST_SRC_DIR = REPO_ROOT / "deploy" / "macos"
 LOG_DIR = Path("/private/var/log/agy-trader")
-VENV_AGY_OPS = "/path/to/agy-trader/.venv/bin/agy-ops"
+VENV_AGY_OPS = "__AGY_VENV_AGY_OPS__"
 TARGET_DIR = Path("/Library/LaunchDaemons")
 ALLOWED_SERVICES = ("market-data", "news-nlp", "trader", "dashboard")
 ALLOWED_PLIST_KEYS = frozenset(
@@ -59,6 +59,7 @@ _SANITIZED_SUBPROCESS_ENV: dict[str, str] = {
 _STATE_RE = re.compile(r"^\s*state\s*=\s*(.+)$", re.MULTILINE)
 _PID_RE = re.compile(r"^\s*pid\s*=\s*(\d+)\s*$", re.MULTILINE)
 _LAST_EXIT_RE = re.compile(r"^\s*last exit code\s*=\s*(.+)$", re.MULTILINE)
+_VALID_USERNAME_RE = re.compile(r"^[a-z_][a-z0-9_-]*$")
 
 
 class PlistValidationError(ValueError):
@@ -67,6 +68,33 @@ class PlistValidationError(ValueError):
 
 class DaemonCtlError(RuntimeError):
     """Raised when a launchctl, plutil, or filesystem operation fails."""
+
+
+def _assert_configured() -> None:
+    """Fail closed if template placeholders were not stamped at install time."""
+    for name, val in (
+        ("RUN_USER", RUN_USER),
+        ("RUN_GROUP", RUN_GROUP),
+        ("REPO_ROOT", str(REPO_ROOT)),
+        ("VENV_AGY_OPS", VENV_AGY_OPS),
+    ):
+        if not val or (val.startswith("__AGY_") and val.endswith("__")):
+            raise PlistValidationError(
+                f"agy-daemonctl is not configured ({name} is an unrendered template placeholder); "
+                "install via sudo ./deploy/macos/install_launchdaemons.sh"
+            )
+    if RUN_USER == "root" or _VALID_USERNAME_RE.fullmatch(RUN_USER) is None:
+        raise PlistValidationError(f"Invalid RUN_USER configured: {RUN_USER!r}")
+    if not Path(REPO_ROOT).is_absolute():
+        raise PlistValidationError(f"REPO_ROOT must be an absolute path: {REPO_ROOT!r}")
+    if not Path(VENV_AGY_OPS).is_absolute():
+        raise PlistValidationError(f"VENV_AGY_OPS must be an absolute path: {VENV_AGY_OPS!r}")
+
+
+def _effective_plist_src_dir() -> Path:
+    if str(PLIST_SRC_DIR).startswith("__AGY_"):
+        return Path(REPO_ROOT) / "deploy" / "macos"
+    return PLIST_SRC_DIR
 
 
 def _service_label(service: str) -> str:
@@ -116,6 +144,7 @@ def _verify_no_symlink_log_target(log_dir: Path, log_file: Path) -> None:
 
 def read_plist_nosymlink(path: Path) -> bytes:
     """Read plist bytes safely without following symlinks, hardlinks, or root-owned files."""
+    _assert_configured()
     for ancestor in path.parents:
         if ancestor.is_symlink():
             raise PlistValidationError(
@@ -170,6 +199,7 @@ def validate_and_canonicalize_plist(
     log_dir: Path = LOG_DIR,
 ) -> bytes:
     """Strictly validate a LaunchDaemon plist and re-serialize it canonically."""
+    _assert_configured()
     expected_label = _service_label(service)
 
     if not isinstance(raw_bytes, bytes) or not raw_bytes:
@@ -433,12 +463,14 @@ def sync_service_plist(
     service: str,
     *,
     canonical_bytes: bytes | None = None,
-    plist_src_dir: Path = PLIST_SRC_DIR,
+    plist_src_dir: Path | None = None,
     target_dir: Path = TARGET_DIR,
     log_dir: Path = LOG_DIR,
 ) -> dict[str, Any]:
+    _assert_configured()
+    src_dir = plist_src_dir if plist_src_dir is not None else _effective_plist_src_dir()
     label = _service_label(service)
-    src_plist = plist_src_dir / f"{label}.plist"
+    src_plist = src_dir / f"{label}.plist"
     dst_plist = target_dir / f"{label}.plist"
 
     if target_dir.is_symlink():
@@ -552,6 +584,7 @@ def main(argv: list[str] | None = None) -> int:
     json_output: bool = bool(args.json_output)
 
     try:
+        _assert_configured()
         services = _resolve_targets(target)
         results: list[dict[str, Any]] = []
 
@@ -565,9 +598,10 @@ def main(argv: list[str] | None = None) -> int:
             results = [restart_service(svc) for svc in services]
         elif action == "sync-plists":
             # Validate all source plists before touching /Library/LaunchDaemons
+            src_dir = _effective_plist_src_dir()
             validated: dict[str, bytes] = {}
             for svc in services:
-                src_plist = PLIST_SRC_DIR / f"{_service_label(svc)}.plist"
+                src_plist = src_dir / f"{_service_label(svc)}.plist"
                 raw = read_plist_nosymlink(src_plist)
                 validated[svc] = validate_and_canonicalize_plist(svc, raw, log_dir=LOG_DIR)
             for svc in services:
