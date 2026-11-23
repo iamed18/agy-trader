@@ -455,9 +455,16 @@ class FeatureEngine:
         fallback_rf_apr: float = 0.045,
         sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
         restatement_blackout_days: int = 10,
+        *,
+        universe_symbols: set[str] | frozenset[str] | None = None,
     ) -> list[SignalRow]:
         """Compute cross-sectional SignalRows strictly using data <= as_of (UTC)."""
         as_of_utc = ensure_utc(as_of)
+        norm_universe: frozenset[str] | None = (
+            frozenset(s.strip().upper() for s in universe_symbols if s.strip())
+            if universe_symbols is not None
+            else None
+        )
         if self.config.momentum_mode == "m2_residual":
             return self._build_signals_m2_residual(
                 as_of_utc=as_of_utc,
@@ -468,6 +475,7 @@ class FeatureEngine:
                 fallback_rf_apr=fallback_rf_apr,
                 sec_filings_by_symbol=sec_filings_by_symbol,
                 restatement_blackout_days=restatement_blackout_days,
+                universe_symbols=norm_universe,
             )
 
         news_map = news_by_symbol or {}
@@ -504,6 +512,8 @@ class FeatureEngine:
 
         raw_rows: list[_RawSymbolFeatures] = []
         for symbol in sorted(bars_by_symbol.keys()):
+            if norm_universe is not None and symbol not in norm_universe:
+                continue
             df = bars_by_symbol[symbol]
             if df.empty:
                 continue
@@ -658,6 +668,7 @@ class FeatureEngine:
         fallback_rf_apr: float = 0.045,
         sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
         restatement_blackout_days: int = 10,
+        universe_symbols: set[str] | frozenset[str] | None = None,
     ) -> list[SignalRow]:
         """Compute multi-horizon OPUS-M2 + CAPM residual Sharpe + 60d peer correlations."""
         as_of_ns = np.int64(pd.Timestamp(as_of_utc).value)
@@ -710,6 +721,8 @@ class FeatureEngine:
         med_skip = self.config.m2_med_skip
 
         for symbol in sorted(bars_by_symbol.keys()):
+            if universe_symbols is not None and symbol not in universe_symbols:
+                continue
             arrs = _sorted_bars_arrays(bars_by_symbol[symbol], as_of_ns)
             if arrs is None:
                 continue

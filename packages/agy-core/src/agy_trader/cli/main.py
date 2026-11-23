@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
+import httpx
 import typer
 import yaml
 from pydantic import ValidationError
@@ -20,6 +22,17 @@ from agy_trader.backtest.metrics import (
     BacktestResult,
     CPCVSummary,
     render_ablation_markdown,
+)
+from agy_trader.backtest.sp500_cohorts import (
+    atomic_write_text,
+    fetch_and_cache_sp500_bars,
+    filter_active_for_duration,
+    generate_sp500_cohort_plots,
+    load_or_fetch_sp500_constituents,
+    render_sp500_cohort_markdown,
+    run_sp500_cohort_study,
+    select_point_in_time_candidates,
+    validate_research_dir,
 )
 from agy_trader.core.blackout import (
     NON_EQUITY_ETF_SECTORS,
@@ -777,6 +790,187 @@ def backtest_cmd(
         console.print(cpcv_table)
 
     console.print(f"Markdown report saved to [green]{report_path}[/green]")
+
+
+@app.command("sp500-cohorts")
+def sp500_cohorts_cmd(
+    ctx: typer.Context,
+    n_cohorts: Annotated[int, typer.Option("--n-cohorts", min=1, help="Number of cohorts to sample")] = 20,
+    cohort_size: Annotated[int, typer.Option("--cohort-size", min=1, help="Symbols per cohort")] = 50,
+    seed: Annotated[int, typer.Option("--seed", help="Deterministic sampling RNG seed")] = 20261122,
+    cutoff_date: Annotated[str, typer.Option("--cutoff-date", help="Point-in-time constituent cutoff (YYYY-MM-DD)")] = "2021-11-23",
+    research_dir: Annotated[Path, typer.Option("--research-dir", help="Isolated Parquet/constituent cache directory")] = Path("data/parquet_sp500_cohorts"),
+    output_dir: Annotated[Path, typer.Option("--output-dir", help="Output directory for summary JSON/MD and plots")] = Path("reports/sp500_cohorts"),
+    refresh_bars: Annotated[bool, typer.Option("--refresh-bars", help="Re-fetch bars from Alpaca even if cached")] = False,
+    execution_timing: Annotated[
+        str | None,
+        typer.Option("--execution-timing", help="Override execution timing: same_close|next_open"),
+    ] = None,
+    data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory for read-only macro_snapshots")] = None,
+    config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON output")] = False,
+) -> None:
+    """Run S&P 500 multi-cohort backtest study with isolated research cache and plots."""
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+
+    eff_timing: Literal["same_close", "next_open"] | None = None
+    try:
+        cutoff_dt = _parse_iso_date(cutoff_date, "cutoff-date")
+        if cutoff_dt is None:
+            raise ValueError("cutoff-date is required")
+        if execution_timing is not None:
+            cleaned_timing = execution_timing.strip().lower()
+            if cleaned_timing not in {"same_close", "next_open"}:
+                raise ValueError(
+                    f"Invalid execution timing {execution_timing!r}: expected 'same_close' or 'next_open'"
+                )
+            eff_timing = "same_close" if cleaned_timing == "same_close" else "next_open"
+        app_cfg: AppConfig = load_app_config(resolved_config)
+        validate_research_dir(research_dir, data_dir=resolved_data)
+    except (FileNotFoundError, OSError, TypeError, ValueError, ValidationError, yaml.YAMLError) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    try:
+        macro_points: list[MacroPoint] = []
+        state_db_path = resolved_data / "state.db"
+        if state_db_path.exists():
+            ro_db = StateDB(state_db_path, read_only=True)
+            try:
+                for series_id in FRED_SERIES_IDS:
+                    macro_points.extend(ro_db.get_macro_series(series_id))
+            except sqlite3.OperationalError as db_exc:
+                if "no such table" in str(db_exc).lower():
+                    macro_points = []
+                else:
+                    raise
+
+        constituents_path = research_dir / "sp500_constituents.json"
+        all_constituents = load_or_fetch_sp500_constituents(constituents_path, refresh=refresh_bars)
+        candidates, pre_cutoff_count = select_point_in_time_candidates(
+            all_constituents,
+            cutoff_date=cutoff_dt,
+        )
+
+        start_utc = datetime(cutoff_dt.year, cutoff_dt.month, cutoff_dt.day, 0, 0, tzinfo=UTC)
+        end_utc = datetime.now(UTC)
+        bars_by_symbol = fetch_and_cache_sp500_bars(
+            [c.symbol for c in candidates],
+            research_dir,
+            api_key=settings.alpaca_api_key,
+            secret_key=settings.alpaca_secret_key,
+            feed=settings.alpaca_data_feed,
+            start_utc=start_utc,
+            end_utc=end_utc,
+            benchmark_symbol=app_cfg.backtest.benchmark_symbol,
+            refresh=refresh_bars,
+        )
+
+        eligible = filter_active_for_duration(
+            bars_by_symbol,
+            candidates,
+            benchmark_symbol=app_cfg.backtest.benchmark_symbol,
+        )
+        report, ts_bundle = run_sp500_cohort_study(
+            app_config=app_cfg,
+            constituents_total_count=len(all_constituents),
+            pre_cutoff_count=pre_cutoff_count,
+            deduped_count=len(candidates),
+            eligible=eligible,
+            bars_by_symbol=bars_by_symbol,
+            macro_points=macro_points,
+            n_cohorts=n_cohorts,
+            cohort_size=cohort_size,
+            seed=seed,
+            cutoff_date=cutoff_dt,
+            execution_timing=eff_timing,
+        )
+        plot_paths = generate_sp500_cohort_plots(report, ts_bundle, output_dir)
+        report = report.model_copy(update={"plot_paths": [str(p) for p in plot_paths]})
+
+        output_dir.mkdir(parents=True, exist_ok=True)
+        summary_json_path = output_dir / "summary.json"
+        summary_md_path = output_dir / "summary.md"
+        manifest_path = output_dir / "cohorts_manifest.json"
+
+        atomic_write_text(summary_json_path, report.model_dump_json(indent=2))
+        atomic_write_text(summary_md_path, render_sp500_cohort_markdown(report))
+        manifest_payload = {
+            "seed": report.seed,
+            "cutoff_date": report.cutoff_date,
+            "n_cohorts": report.n_cohorts,
+            "cohort_size": report.cohort_size,
+            "active_eligible_pool_size": report.active_eligible_pool_size,
+            "unique_symbols_across_cohorts": report.unique_symbols_across_cohorts,
+            "cohorts": [
+                {
+                    "cohort_id": c.cohort_id,
+                    "label": c.label,
+                    "symbols": c.symbols,
+                    "sector_counts": c.sector_counts,
+                }
+                for c in report.cohorts
+            ],
+        }
+        atomic_write_text(manifest_path, json.dumps(manifest_payload, indent=2))
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        ValidationError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    if json_output:
+        _emit_json(
+            {
+                "summary_json": str(summary_json_path),
+                "summary_md": str(summary_md_path),
+                "cohorts_manifest": str(manifest_path),
+                "plot_paths": report.plot_paths,
+                "n_cohorts": report.n_cohorts,
+                "cohort_size": report.cohort_size,
+                "active_eligible_pool_size": report.active_eligible_pool_size,
+                "strategy_median_cagr_pct": report.strategy_stats.cagr_pct.median,
+                "strategy_median_sharpe": report.strategy_stats.sharpe_ratio.median,
+            }
+        )
+        return
+
+    table = Table(
+        title=f"S&P 500 {report.n_cohorts}-Cohort Summary ({report.start_date} .. {report.end_date})"
+    )
+    table.add_column("Series", style="cyan")
+    table.add_column("Median CAGR", justify="right")
+    table.add_column("Median Ret", justify="right")
+    table.add_column("Median Sharpe", justify="right")
+    table.add_column("Median Ex-Sharpe", justify="right")
+    table.add_column("Median Max DD", justify="right")
+    for name, agg in (
+        ("Strategy", report.strategy_stats),
+        (f"EW-{report.cohort_size} Daily", report.ew_cohort_stats),
+        (f"EW-{report.cohort_size} B&H", report.ew_buy_hold_stats),
+        ("SPY Buy & Hold", report.spy_stats),
+    ):
+        table.add_row(
+            name,
+            f"{agg.cagr_pct.median:+.2f}%",
+            f"{agg.total_return_pct.median:+.2f}%",
+            f"{agg.sharpe_ratio.median:.3f}",
+            f"{agg.excess_sharpe_ratio.median:.3f}",
+            f"{agg.max_drawdown_pct.median:.2f}%",
+        )
+    console.print(table)
+    console.print(
+        f"Outputs saved to [green]{output_dir}[/green] "
+        f"(summary.json, summary.md, cohorts_manifest.json, {len(plot_paths)} plots)"
+    )
 
 
 @app.command("status")

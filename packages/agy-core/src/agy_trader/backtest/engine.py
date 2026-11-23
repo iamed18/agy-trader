@@ -45,6 +45,16 @@ from .metrics import (
 _FEATURE_LOOKBACK_BARS = 300
 
 
+@dataclass(frozen=True, slots=True)
+class BacktestRunSeries:
+    """Backtest result bundled with aligned daily RF, benchmark, and equal-weight series."""
+
+    result: BacktestResult
+    daily_rf_rates: list[float]
+    benchmark_closes: list[float]
+    ew_universe_equities: list[float]
+
+
 @dataclass
 class _PositionLot:
     symbol: str
@@ -150,6 +160,48 @@ class BacktestEngine:
             n_trials=n_trials,
         )
         return res
+
+    def run_with_series(
+        self,
+        bars_by_symbol: Mapping[str, pd.DataFrame],
+        *,
+        news_by_symbol: Mapping[str, Sequence[NewsArticle]] | None = None,
+        macro_points: Sequence[MacroPoint] | None = None,
+        earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
+        sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
+        label: str = "Strategy",
+        allow_shorting: bool = True,
+        use_news: bool = True,
+        exposure_multiplier: float = 1.0,
+        close_open_positions_at_end: bool = False,
+        execution_timing: Literal["same_close", "next_open"] | None = None,
+        n_trials: int = 1,
+    ) -> BacktestRunSeries:
+        """Run backtest and return result alongside aligned RF, benchmark, and EW series."""
+        res, daily_rf_rates, benchmark_closes, ew_universe_equities = self._run_with_series(
+            bars_by_symbol,
+            news_by_symbol=news_by_symbol,
+            macro_points=macro_points,
+            earnings_by_symbol=earnings_by_symbol,
+            sec_filings_by_symbol=sec_filings_by_symbol,
+            start_date=start_date,
+            end_date=end_date,
+            label=label,
+            allow_shorting=allow_shorting,
+            use_news=use_news,
+            exposure_multiplier=exposure_multiplier,
+            close_open_positions_at_end=close_open_positions_at_end,
+            execution_timing=execution_timing,
+            n_trials=n_trials,
+        )
+        return BacktestRunSeries(
+            result=res,
+            daily_rf_rates=daily_rf_rates,
+            benchmark_closes=benchmark_closes,
+            ew_universe_equities=ew_universe_equities,
+        )
 
     def _run_with_series(
         self,
@@ -485,19 +537,27 @@ class BacktestEngine:
             if bt_cfg.benchmark_symbol in live_close_prices:
                 benchmark_closes.append(live_close_prices[bt_cfg.benchmark_symbol])
 
-            # Track equal-weight universe index across live bars on day t
+            # Track equal-weight universe index using MTM prices so missing bars
+            # hold 0% return on day t and realize exact multi-day return on day t+1
+            ew_mtm_prices = {
+                sym: px
+                for sym, px in mtm_prices.items()
+                if (not self.universe_meta or sym in self.universe_meta)
+                and math.isfinite(px)
+                and px > 0.0
+            }
             if bar_idx == 0:
                 ew_universe_equities.append(ew_equity)
             else:
                 sym_rets = [
                     close_px / prev_ew_closes[sym] - 1.0
-                    for sym, close_px in live_close_prices.items()
-                    if sym in prev_ew_closes and prev_ew_closes[sym] > 0.0 and close_px > 0.0
+                    for sym, close_px in ew_mtm_prices.items()
+                    if sym in prev_ew_closes and prev_ew_closes[sym] > 0.0
                 ]
                 if sym_rets:
                     ew_equity = max(0.0, ew_equity * (1.0 + float(np.mean(sym_rets))))
                 ew_universe_equities.append(ew_equity)
-            prev_ew_closes = dict(live_close_prices)
+            prev_ew_closes = ew_mtm_prices
 
             if eff_timing == "next_open":
                 # 6. Compute strictly point-in-time signals & queue approved orders for bar t+1 open
@@ -1159,6 +1219,7 @@ class BacktestEngine:
             fallback_rf_apr=bt_cfg.risk_free_rate_apr,
             sec_filings_by_symbol=pit_sec if pit_sec else None,
             restatement_blackout_days=risk_cfg.restatement_blackout_days,
+            universe_symbols=frozenset(self.universe_meta.keys()) if self.universe_meta else None,
         )
 
         dials = ControlDials(
