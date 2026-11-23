@@ -103,6 +103,7 @@ class StrategyConfig(BaseModel):
     exempt_safe_havens_from_macro_scale: bool = False
     safe_haven_rotation_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
     exclude_safe_havens_from_equity_slots: bool = False
+    exclude_etfs_from_equity_slots: bool = False
     spy_sma200_defensive_scale: float | None = Field(default=None, ge=0.0, le=1.0)
     spy_ema50_dual_scale: float | None = Field(default=None, ge=0.0, le=1.0)
     spy_vol_surge_scale: float | None = Field(default=None, ge=0.0, le=1.0)

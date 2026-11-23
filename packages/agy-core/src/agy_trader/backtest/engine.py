@@ -1427,7 +1427,16 @@ class BacktestEngine:
                 else active_universe_syms
             )
         elif self.universe_meta:
-            eff_universe_syms = frozenset(self.universe_meta.keys())
+            if strat_cfg.exclude_etfs_from_equity_slots:
+                eq_syms = {
+                    s for s, m in self.universe_meta.items() if m.asset_type != AssetType.etf
+                }
+                if strat_cfg.safe_haven_rotation_fraction > 0.0 and safe_havens_in_meta:
+                    eff_universe_syms = frozenset(eq_syms | set(safe_havens_in_meta))
+                else:
+                    eff_universe_syms = frozenset(eq_syms)
+            else:
+                eff_universe_syms = frozenset(self.universe_meta.keys())
         else:
             eff_universe_syms = None
 

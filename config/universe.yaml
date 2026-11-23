@@ -1,204 +1,863 @@
+# 15 Core Benchmark & Sector ETFs (protected by exclude_etfs_from_equity_slots + blackout ETF verification)
+# + 200 Dynamic PIT S&P 500 Top-200 Liquid Equities (reconstituted 2026-11-02)
 symbols:
-  # 15 ETFs
-  - symbol: SPY
-    asset_type: etf
-    sector: Broad Market
-    shortable_default: true
-  - symbol: QQQ
-    asset_type: etf
-    sector: Broad Market
-    shortable_default: true
-  - symbol: IWM
-    asset_type: etf
-    sector: Broad Market
-    shortable_default: true
-  - symbol: TLT
-    asset_type: etf
-    sector: Fixed Income
-    shortable_default: true
-  - symbol: GLD
-    asset_type: etf
-    sector: Commodities
-    shortable_default: true
-  - symbol: XLK
-    asset_type: etf
-    sector: Technology
-    shortable_default: true
-  - symbol: XLF
-    asset_type: etf
-    sector: Financials
-    shortable_default: true
-  - symbol: XLE
-    asset_type: etf
-    sector: Energy
-    shortable_default: true
-  - symbol: XLV
-    asset_type: etf
-    sector: Healthcare
-    shortable_default: true
-  - symbol: XLI
-    asset_type: etf
-    sector: Industrials
-    shortable_default: true
-  - symbol: XLY
-    asset_type: etf
-    sector: Consumer Discretionary
-    shortable_default: true
-  - symbol: XLP
-    asset_type: etf
-    sector: Consumer Staples
-    shortable_default: true
-  - symbol: XLU
-    asset_type: etf
-    sector: Utilities
-    shortable_default: true
-  - symbol: XLB
-    asset_type: etf
-    sector: Materials
-    shortable_default: true
-  - symbol: XLC
-    asset_type: etf
-    sector: Communication Services
-    shortable_default: true
-
-  # 35 liquid large-cap stocks
-  - symbol: AAPL
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: MSFT
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: NVDA
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: GOOGL
-    asset_type: equity
-    sector: Communication Services
-    shortable_default: true
-  - symbol: AMZN
-    asset_type: equity
-    sector: Consumer Discretionary
-    shortable_default: true
-  - symbol: META
-    asset_type: equity
-    sector: Communication Services
-    shortable_default: true
-  - symbol: AVGO
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: ORCL
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: CRM
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: AMD
-    asset_type: equity
-    sector: Technology
-    shortable_default: true
-  - symbol: JPM
-    asset_type: equity
-    sector: Financials
-    shortable_default: true
-  - symbol: BAC
-    asset_type: equity
-    sector: Financials
-    shortable_default: true
-  - symbol: GS
-    asset_type: equity
-    sector: Financials
-    shortable_default: true
-  - symbol: MS
-    asset_type: equity
-    sector: Financials
-    shortable_default: true
-  - symbol: V
-    asset_type: equity
-    sector: Financials
-    shortable_default: true
-  - symbol: UNH
-    asset_type: equity
-    sector: Healthcare
-    shortable_default: true
-  - symbol: LLY
-    asset_type: equity
-    sector: Healthcare
-    shortable_default: true
-  - symbol: JNJ
-    asset_type: equity
-    sector: Healthcare
-    shortable_default: true
-  - symbol: ABBV
-    asset_type: equity
-    sector: Healthcare
-    shortable_default: true
-  - symbol: MRK
-    asset_type: equity
-    sector: Healthcare
-    shortable_default: true
-  - symbol: XOM
-    asset_type: equity
-    sector: Energy
-    shortable_default: true
-  - symbol: CVX
-    asset_type: equity
-    sector: Energy
-    shortable_default: true
-  - symbol: COP
-    asset_type: equity
-    sector: Energy
-    shortable_default: true
-  - symbol: CAT
-    asset_type: equity
-    sector: Industrials
-    shortable_default: true
-  - symbol: HON
-    asset_type: equity
-    sector: Industrials
-    shortable_default: true
-  - symbol: GE
-    asset_type: equity
-    sector: Industrials
-    shortable_default: true
-  - symbol: UNP
-    asset_type: equity
-    sector: Industrials
-    shortable_default: true
-  - symbol: HD
-    asset_type: equity
-    sector: Consumer Discretionary
-    shortable_default: true
-  - symbol: COST
-    asset_type: equity
-    sector: Consumer Staples
-    shortable_default: true
-  - symbol: WMT
-    asset_type: equity
-    sector: Consumer Staples
-    shortable_default: true
-  - symbol: PG
-    asset_type: equity
-    sector: Consumer Staples
-    shortable_default: true
-  - symbol: KO
-    asset_type: equity
-    sector: Consumer Staples
-    shortable_default: true
-  - symbol: PEP
-    asset_type: equity
-    sector: Consumer Staples
-    shortable_default: true
-  - symbol: DIS
-    asset_type: equity
-    sector: Communication Services
-    shortable_default: true
-  - symbol: NFLX
-    asset_type: equity
-    sector: Communication Services
-    shortable_default: true
+- symbol: SPY
+  asset_type: etf
+  sector: Broad Market
+  shortable_default: true
+- symbol: QQQ
+  asset_type: etf
+  sector: Broad Market
+  shortable_default: true
+- symbol: IWM
+  asset_type: etf
+  sector: Broad Market
+  shortable_default: true
+- symbol: TLT
+  asset_type: etf
+  sector: Fixed Income
+  shortable_default: true
+- symbol: GLD
+  asset_type: etf
+  sector: Commodities
+  shortable_default: true
+- symbol: XLK
+  asset_type: etf
+  sector: Technology
+  shortable_default: true
+- symbol: XLF
+  asset_type: etf
+  sector: Financials
+  shortable_default: true
+- symbol: XLE
+  asset_type: etf
+  sector: Energy
+  shortable_default: true
+- symbol: XLV
+  asset_type: etf
+  sector: Healthcare
+  shortable_default: true
+- symbol: XLI
+  asset_type: etf
+  sector: Industrials
+  shortable_default: true
+- symbol: XLY
+  asset_type: etf
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: XLP
+  asset_type: etf
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: XLU
+  asset_type: etf
+  sector: Utilities
+  shortable_default: true
+- symbol: XLB
+  asset_type: etf
+  sector: Materials
+  shortable_default: true
+- symbol: XLC
+  asset_type: etf
+  sector: Communication Services
+  shortable_default: true
+- symbol: AAPL
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ABBV
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: ABNB
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: ABT
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: ACN
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ADBE
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ADI
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ADP
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: ADSK
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: AMAT
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: AMD
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: AMGN
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: AMT
+  asset_type: equity
+  sector: Real Estate
+  shortable_default: true
+- symbol: AMZN
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: ANET
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: AON
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: APH
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: APO
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: APP
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: AVGO
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: AXP
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: AZO
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: BA
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: BAC
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: BE
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: BKNG
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: BLK
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: BMY
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: BRK.B
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: BSX
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: BX
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: C
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: CAT
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: CB
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: CCL
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: CDNS
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: CEG
+  asset_type: equity
+  sector: Utilities
+  shortable_default: true
+- symbol: CI
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: CIEN
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: CL
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: CMCSA
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: CME
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: CMG
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: COF
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: COHR
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: COIN
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: COP
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: COR
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: COST
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: CRM
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: CRWD
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: CSCO
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: CSX
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: CVNA
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: CVS
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: CVX
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: DAL
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: DASH
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: DDOG
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: DE
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: DELL
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: DHR
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: DIS
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: DUK
+  asset_type: equity
+  sector: Utilities
+  shortable_default: true
+- symbol: ELV
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: EOG
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: EQIX
+  asset_type: equity
+  sector: Real Estate
+  shortable_default: true
+- symbol: ETN
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: F
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: FCX
+  asset_type: equity
+  sector: Materials
+  shortable_default: true
+- symbol: FDX
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: FIX
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: FLEX
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: FSLR
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: FTNT
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: GD
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: GE
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: GEV
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: GILD
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: GLW
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: GM
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: GOOGL
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: GS
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: HCA
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: HD
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: HLT
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: HON
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: HOOD
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: HPE
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: HWM
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: IBM
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ICE
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: INTC
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: INTU
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ISRG
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: JCI
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: JNJ
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: JPM
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: KKR
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: KLAC
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: KO
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: KR
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: LIN
+  asset_type: equity
+  sector: Materials
+  shortable_default: true
+- symbol: LITE
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: LLY
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: LMT
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: LOW
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: LRCX
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: MA
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: MAR
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: MCD
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: MCHP
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: MCK
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: MCO
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: MDLZ
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: MDT
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: META
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: MMM
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: MNST
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: MO
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: MPC
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: MPWR
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: MRK
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: MRNA
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: MRVL
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: MS
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: MSFT
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: MSI
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: MU
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: NEE
+  asset_type: equity
+  sector: Utilities
+  shortable_default: true
+- symbol: NEM
+  asset_type: equity
+  sector: Materials
+  shortable_default: true
+- symbol: NFLX
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: NKE
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: NOC
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: NOW
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: NVDA
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: NXPI
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: 'ON'
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ORCL
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: ORLY
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: OXY
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: PANW
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: PEP
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: PFE
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: PG
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: PGR
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: PH
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: PLD
+  asset_type: equity
+  sector: Real Estate
+  shortable_default: true
+- symbol: PLTR
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: PM
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: PNC
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: PWR
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: PYPL
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: QCOM
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: RCL
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: RDDT
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: REGN
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: ROST
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: RTX
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: SBUX
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: SCHW
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: SHW
+  asset_type: equity
+  sector: Materials
+  shortable_default: true
+- symbol: SLB
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: SMCI
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: SNDK
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: SNPS
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: SO
+  asset_type: equity
+  sector: Utilities
+  shortable_default: true
+- symbol: SPGI
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: STX
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: SYK
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: T
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: TER
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: TGT
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: TJX
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: TMO
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: TMUS
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: TSLA
+  asset_type: equity
+  sector: Consumer Discretionary
+  shortable_default: true
+- symbol: TT
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: TXN
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: UAL
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: UBER
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: UNH
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: UNP
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: UPS
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: URI
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: USB
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: V
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: VLO
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: VRT
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: VRTX
+  asset_type: equity
+  sector: Healthcare
+  shortable_default: true
+- symbol: VST
+  asset_type: equity
+  sector: Utilities
+  shortable_default: true
+- symbol: VZ
+  asset_type: equity
+  sector: Communication Services
+  shortable_default: true
+- symbol: WDAY
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: WDC
+  asset_type: equity
+  sector: Technology
+  shortable_default: true
+- symbol: WELL
+  asset_type: equity
+  sector: Real Estate
+  shortable_default: true
+- symbol: WFC
+  asset_type: equity
+  sector: Financials
+  shortable_default: true
+- symbol: WM
+  asset_type: equity
+  sector: Industrials
+  shortable_default: true
+- symbol: WMB
+  asset_type: equity
+  sector: Energy
+  shortable_default: true
+- symbol: WMT
+  asset_type: equity
+  sector: Consumer Staples
+  shortable_default: true
+- symbol: XOM
+  asset_type: equity
+  sector: Energy
+  shortable_default: true

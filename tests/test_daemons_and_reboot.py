@@ -32,7 +32,7 @@ from agy_ops.deploy.service_manifests import (
     render_systemd_unit,
     write_service_manifests,
 )
-from agy_trader.core.config import EnvSettings, load_universe
+from agy_trader.core.config import EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import (
     EarningsEvent,
     MacroPoint,
@@ -679,8 +679,10 @@ def test_trader_daemon_reconcile_stop_repair_crash_idempotency_and_kill_switch(
     assert res2["snapshot_recorded"] is False  # bounded 5-min snapshot cadence!
     assert len(tc.submitted_requests) == submits_before_second_tick
 
-    # Trigger daily-loss kill-switch (-4% <= -3.5% halt) -> auto-pauses ControlPlane!
-    tc.account = _FakeAccount(equity="96000.00", last_equity="100000.00")
+    # Trigger daily-loss kill-switch past live daily_loss_halt_pct -> auto-pauses ControlPlane!
+    halt_pct = load_app_config(REPO_CONFIG_DIR).risk.daily_loss_halt_pct
+    breach_eq = round(100_000.0 * (1.0 - halt_pct - 0.01), 2)
+    tc.account = _FakeAccount(equity=f"{breach_eq:.2f}", last_equity="100000.00")
     res_ks = daemon2.run_once(now_utc=rebal_now + timedelta(minutes=6))
     assert res_ks["paused"] is True
     assert db.get_control_dials().pause_new_entries is True
@@ -900,9 +902,10 @@ def test_c1_per_symbol_staleness_filtering_coverage_and_daily_bar_proxy(tmp_path
     )
     assert spy_stale_age is not None and spy_stale_age > 15.0
 
-    # 4) Coverage < 80% (12 stale symbols out of 50 -> 76%) MUST fail closed
+    # 4) Coverage < 80% (>20% stale non-SPY symbols) MUST fail closed
     low_cov_snaps = dict(base_snapshots)
-    for u in universe[10:22]:
+    stale_batch = [u for u in universe if u.symbol != "SPY"][: max(12, len(universe) // 4)]
+    for u in stale_batch:
         px = float(bar_store.load_bars(u.symbol, "1d")["close"].iloc[-1])
         low_cov_snaps[u.symbol] = types.SimpleNamespace(
             latest_trade=types.SimpleNamespace(price=px, timestamp=rebal_now - timedelta(minutes=45)),
@@ -992,6 +995,7 @@ def test_m6_rebalance_every_n_days_and_custom_checkpoint(tmp_path: Path) -> None
     raw_cfg = yaml.safe_load((cfg_dir / "strategy.yaml").read_text(encoding="utf-8"))
     raw_cfg["strategy"]["rebalance_checkpoints_et"] = ["10:00"]
     raw_cfg["strategy"]["rebalance_every_n_days"] = 3
+    raw_cfg["strategy"]["rebalance_schedule"] = "every_n_days"
     (cfg_dir / "strategy.yaml").write_text(yaml.safe_dump(raw_cfg), encoding="utf-8")
 
     data_dir = tmp_path / "data"

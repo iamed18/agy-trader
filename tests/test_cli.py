@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 from agy_trader.cli.main import app
+from agy_trader.core.config import load_universe
 
 runner = CliRunner()
 REPO_CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
@@ -732,7 +733,7 @@ def test_cli_collect_feeds_and_backfill_source_validation(
     assert len(seen_yf_symbols[0]) == 15
     assert "AAPL" not in seen_yf_symbols[0]
 
-    # --all-symbols collects for all 50 universe symbols
+    # --all-symbols collects for all universe symbols
     res_all = runner.invoke(
         app,
         [
@@ -748,7 +749,7 @@ def test_cli_collect_feeds_and_backfill_source_validation(
     assert res_all.exit_code == 0, res_all.output
     assert "Ops Intelligence Feeds" in res_all.stdout
     assert "yfinance_symbols" in res_all.stdout
-    assert len(seen_yf_symbols[1]) == 50
+    assert len(seen_yf_symbols[1]) == len(load_universe(REPO_CONFIG_DIR))
 
     # Verify DB holds sec_filings + forward-only feeds, and invalid --news-sources fails cleanly
     db = StateDB(data_dir / "state.db")

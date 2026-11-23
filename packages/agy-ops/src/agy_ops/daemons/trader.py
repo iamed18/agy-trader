@@ -7,7 +7,7 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
@@ -37,9 +37,11 @@ from agy_trader.core.config import (
 from agy_trader.core.control_plane import ControlPlane
 from agy_trader.core.models import (
     AssetRiskMetadata,
+    AssetType,
     ControlDials,
     MacroPoint,
     NewsArticle,
+    OrderSide,
     UniverseSymbol,
     ensure_utc,
 )
@@ -48,7 +50,11 @@ from agy_trader.execution.alpaca_broker import AlpacaBroker
 from agy_trader.risk.engine import HardRiskEngine, PortfolioRiskState
 from agy_trader.storage.db import StateDB
 from agy_trader.storage.parquet_store import ParquetBarStore
-from agy_trader.strategy.features import FeatureEngine
+from agy_trader.strategy.features import (
+    SAFE_HAVEN_SECTORS,
+    SAFE_HAVEN_SYMBOLS,
+    FeatureEngine,
+)
 from agy_trader.strategy.portfolio import PortfolioConstructor
 
 from .common import (
@@ -248,6 +254,8 @@ class TraderDaemon(DaemonRunner):
         self._high_water_mark: float = 0.0
         self._last_snapshot_at: datetime | None = None
         self._ew50_base_prices: dict[str, float] = {}
+        self._last_noncompleted_rebalance_at: datetime | None = None
+        self._last_noncompleted_rebalance_reason: str | None = None
 
     def _get_broker(self) -> AlpacaBroker:
         if self.broker is None:
@@ -678,6 +686,14 @@ class TraderDaemon(DaemonRunner):
 
         return bars_by_symbol, all_prices, latest_age
 
+    def _has_completed_rebalance_for_month(self, target_date: date) -> bool:
+        return self.db.has_month_rebalance_completed(
+            target_date.year,
+            target_date.month,
+            daemon_name=self.daemon_name,
+            exclude_session_date=target_date.isoformat(),
+        )
+
     def _active_rebalance_checkpoint(
         self,
         *,
@@ -685,24 +701,40 @@ class TraderDaemon(DaemonRunner):
         now_et: datetime,
         next_close_utc: datetime | None,
         app_cfg: AppConfig,
+        has_open_positions: bool | None = None,
     ) -> str | None:
         """Return matching configured/half-day checkpoint string if within window, else None."""
-        if not is_nyse_trading_day(now_et.date()):
+        today = now_et.date()
+        if not is_nyse_trading_day(today):
             return None
 
         schedule = app_cfg.strategy.rebalance_schedule
         if schedule == "monthly_first":
-            probe = now_et.date() - timedelta(days=1)
-            while probe.month == now_et.date().month:
+            probe = today - timedelta(days=1)
+            is_first_trading_day = True
+            while probe.month == today.month:
                 if is_nyse_trading_day(probe):
-                    return None
+                    is_first_trading_day = False
+                    break
                 probe -= timedelta(days=1)
+            if not is_first_trading_day and (
+                has_open_positions is None or self._has_completed_rebalance_for_month(today)
+            ):
+                return None
         elif schedule == "monthly_last":
-            probe = now_et.date() + timedelta(days=1)
-            while probe.month == now_et.date().month:
+            probe = today + timedelta(days=1)
+            is_last_trading_day = True
+            while probe.month == today.month:
                 if is_nyse_trading_day(probe):
-                    return None
+                    is_last_trading_day = False
+                    break
                 probe += timedelta(days=1)
+            if not is_last_trading_day and (
+                has_open_positions is None
+                or has_open_positions
+                or self._has_completed_rebalance_for_month(today)
+            ):
+                return None
         elif app_cfg.strategy.rebalance_every_n_days > 1:
             recent = self.db.get_daemon_events(
                 daemon_name=self.daemon_name, event_type="rebalance", limit=1
@@ -830,6 +862,25 @@ class TraderDaemon(DaemonRunner):
                     if math.isfinite(fallback_px) and fallback_px > 0.0:
                         prices[sym] = float(fallback_px)
 
+        signal_universe_syms: set[str] = set(universe_sym_set)
+        if app_cfg.strategy.exclude_etfs_from_equity_slots:
+            signal_universe_syms = {
+                u.symbol for u in universe if u.asset_type != AssetType.etf
+            }
+            if app_cfg.strategy.safe_haven_rotation_fraction > 0.0:
+                signal_universe_syms |= {
+                    u.symbol for u in universe if u.symbol in SAFE_HAVEN_SYMBOLS
+                }
+        elif (
+            app_cfg.strategy.exclude_safe_havens_from_equity_slots
+            and app_cfg.strategy.safe_haven_rotation_fraction <= 0.0
+        ):
+            signal_universe_syms = {
+                u.symbol
+                for u in universe
+                if not (u.sector in SAFE_HAVEN_SECTORS or u.symbol in SAFE_HAVEN_SYMBOLS)
+            }
+
         feature_engine = FeatureEngine(app_cfg.strategy)
         signals = feature_engine.build_signals(
             as_of=now_utc,
@@ -840,6 +891,7 @@ class TraderDaemon(DaemonRunner):
             fallback_rf_apr=app_cfg.backtest.risk_free_rate_apr,
             sec_filings_by_symbol=sec_filings_by_symbol,
             restatement_blackout_days=app_cfg.risk.restatement_blackout_days,
+            universe_symbols=signal_universe_syms,
         )
 
         current_positions = {sym: float(pos["qty"]) for sym, pos in broker_positions.items()}
@@ -902,7 +954,23 @@ class TraderDaemon(DaemonRunner):
         desired_stops: dict[str, float] = {}
         for v in verdicts:
             if v.approved and v.adjusted_qty > 0.0 and v.stop_loss_price is not None:
-                desired_stops[v.order.symbol] = float(v.stop_loss_price)
+                sym = v.order.symbol
+                cand_stop = float(v.stop_loss_price)
+                cur_q = current_positions.get(sym, 0.0)
+                prev_stop = existing_db_stops.get(sym)
+                ref_px = prices.get(sym, v.order.reference_price)
+                if cur_q > 1e-9 and v.order.side == OrderSide.buy and prev_stop is not None:
+                    tightened = max(cand_stop, float(prev_stop))
+                    desired_stops[sym] = (
+                        tightened if (ref_px > 0.0 and tightened < ref_px) else cand_stop
+                    )
+                elif cur_q < -1e-9 and v.order.side == OrderSide.sell and prev_stop is not None:
+                    tightened = min(cand_stop, float(prev_stop))
+                    desired_stops[sym] = (
+                        tightened if (ref_px > 0.0 and tightened > ref_px) else cand_stop
+                    )
+                else:
+                    desired_stops[sym] = cand_stop
 
         for sym, pos in broker.get_broker_positions().items():
             if active_blackout.halted or sym in active_blackout.frozen_symbols:
@@ -932,16 +1000,48 @@ class TraderDaemon(DaemonRunner):
             run_id=run_id,
         )
 
+        approved_count = sum(1 for v in verdicts if v.approved and v.adjusted_qty > 0.0)
+        successful_exec_count = sum(
+            1
+            for r in exec_report.records
+            if r.filled_qty > 0.0
+            or (
+                r.error is None
+                and r.status not in {"rejected", "canceled", "expired", "blocked_blackout"}
+            )
+        )
+        if active_blackout.halted:
+            rebalance_status = "halted_blackout"
+        elif dials.pause_new_entries:
+            rebalance_status = "paused"
+        elif len(signals) == 0:
+            rebalance_status = "skipped_no_signals"
+        elif len(proposed) > 0 and approved_count == 0:
+            rebalance_status = "rejected_by_risk"
+        elif approved_count > 0 and successful_exec_count == 0:
+            rebalance_status = "failed_execution"
+        else:
+            rebalance_status = "completed"
+
+        if rebalance_status == "completed":
+            self._last_noncompleted_rebalance_at = None
+            self._last_noncompleted_rebalance_reason = None
+        else:
+            self._last_noncompleted_rebalance_at = now_utc
+            self._last_noncompleted_rebalance_reason = rebalance_status
+
         rebalance_details = {
             "session_date": session_date,
             "checkpoint": checkpoint,
-            "status": "completed",
+            "status": rebalance_status,
+            "paused": dials.pause_new_entries,
             "run_id": run_id,
             "signals_count": len(signals),
             "fresh_symbols_count": len(bars_with_proxy),
             "latest_bar_age_minutes": latest_bar_age_minutes,
             "proposed_count": len(proposed),
-            "approved_count": sum(1 for v in verdicts if v.approved and v.adjusted_qty > 0.0),
+            "approved_count": approved_count,
+            "successful_exec_count": successful_exec_count,
             "executed_count": len(exec_report.records),
             "submitted_stops": sorted(stop_sync.submitted_stops.keys()),
             "untouched_blackout_positions": stop_sync.untouched_blackout_positions,
@@ -1053,6 +1153,7 @@ class TraderDaemon(DaemonRunner):
                 now_et=now_et,
                 next_close_utc=next_close_utc,
                 app_cfg=app_cfg,
+                has_open_positions=bool(positions),
             )
             if market_open
             else None
@@ -1062,6 +1163,18 @@ class TraderDaemon(DaemonRunner):
             and active_ckpt is not None
             and not self.db.has_session_rebalance_completed(session_date, active_ckpt)
         )
+        if should_rebalance and self._last_noncompleted_rebalance_at is not None:
+            blocker_cleared = (
+                self._last_noncompleted_rebalance_reason == "paused" and not dials.pause_new_entries
+            ) or (
+                self._last_noncompleted_rebalance_reason == "halted_blackout"
+                and not blackout.halted
+            )
+            if (
+                not blocker_cleared
+                and (now - self._last_noncompleted_rebalance_at).total_seconds() < 300.0
+            ):
+                should_rebalance = False
 
         snap_cadence = (
             self.snapshot_interval_open_seconds

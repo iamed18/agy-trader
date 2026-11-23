@@ -16,7 +16,7 @@ from agy_ops.reporting import (
     build_morning_plan,
     build_readiness_report,
 )
-from agy_trader.core.config import load_universe
+from agy_trader.core.config import load_app_config, load_universe
 from agy_trader.core.control_plane import ControlPlane
 from agy_trader.core.models import EarningsEvent, MacroPoint, NewsArticle, SecFilingEvent
 from agy_trader.data.synthetic import generate_synthetic_dataset
@@ -331,7 +331,8 @@ def test_reporting_builders_and_agy_ops_cli(
     daily = build_daily_summary(data_dir, REPO_CONFIG_DIR, now_utc=now)
     assert daily["equity"] == 102_500.0
     assert daily["cumulative_return_pct"] == pytest.approx(2.5)
-    assert daily["drawdown_headroom_pct"] == pytest.approx(13.0)  # -1.0% vs -14.0% halt
+    expected_headroom = load_app_config(REPO_CONFIG_DIR).risk.max_drawdown_halt_pct * 100.0 - 1.0
+    assert daily["drawdown_headroom_pct"] == pytest.approx(expected_headroom)
     assert len(daily["todays_fills"]) == 2
     assert daily["mean_realized_slippage_bps"] == pytest.approx(4.48)
     assert "Daily Close Summary" in daily["markdown_summary"]

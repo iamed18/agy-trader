@@ -1528,7 +1528,6 @@ class StateDB:
                 FROM daemon_events
                 WHERE event_type = 'rebalance'
                 ORDER BY timestamp DESC, id DESC
-                LIMIT 50
                 """
             ).fetchall()
         for row in rows:
@@ -1540,6 +1539,55 @@ class StateDB:
                 status = details.get("status")
                 if status is None or str(status).lower() in {"completed", "ok", "success"}:
                     return True
+        return False
+
+    def has_month_rebalance_completed(
+        self,
+        year: int,
+        month: int,
+        *,
+        daemon_name: str = "trader",
+        exclude_session_date: str | None = None,
+    ) -> bool:
+        clean_daemon = daemon_name.strip()
+        excl = exclude_session_date.strip() if exclude_session_date else None
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute(
+                    """
+                    SELECT details_json
+                    FROM daemon_events
+                    WHERE daemon_name = ? AND event_type = 'rebalance'
+                    ORDER BY timestamp DESC, id DESC
+                    """,
+                    (clean_daemon,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return False
+            raise
+
+        for row in rows:
+            details = json.loads(str(row["details_json"]))
+            status = details.get("status")
+            if status is not None and str(status).lower() not in {"completed", "ok", "success"}:
+                continue
+            if bool(details.get("paused", False)):
+                continue
+            if (
+                int(details.get("proposed_count", 0)) > 0
+                and int(details.get("approved_count", 0)) == 0
+            ):
+                continue
+            last_session = str(details.get("session_date", "")).strip()
+            if not last_session or (excl is not None and last_session == excl):
+                continue
+            try:
+                last_dt = datetime.fromisoformat(f"{last_session}T00:00:00").date()
+            except ValueError:
+                continue
+            if last_dt.year == year and last_dt.month == month:
+                return True
         return False
 
     def prune_old_telemetry(

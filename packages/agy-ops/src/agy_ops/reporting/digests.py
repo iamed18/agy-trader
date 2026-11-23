@@ -410,6 +410,7 @@ def build_morning_plan(
         spy_vol_surge_thresh=app_cfg.strategy.spy_vol_surge_thresh,
         spy_ret10_crash_thresh=app_cfg.strategy.spy_ret10_crash_thresh,
         spy_ret10_crash_scale=app_cfg.strategy.spy_ret10_crash_scale,
+        regime_mode=app_cfg.strategy.regime_mode,
     )
 
     earnings_blackouts: list[dict[str, str]] = []

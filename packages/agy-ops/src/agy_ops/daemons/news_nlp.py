@@ -11,8 +11,9 @@ from typing import Any
 
 import httpx
 import structlog
+import yaml
 
-from agy_trader.core.config import EnvSettings, load_universe
+from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, NewsArticle, ensure_utc
 from agy_trader.data.alpaca_news import AlpacaNewsProvider
 from agy_trader.data.feeds import collect_official_rss_feeds, collect_yfinance_news
@@ -138,6 +139,10 @@ class NewsNlpDaemon(DaemonRunner):
 
     def run_once(self, now_utc: datetime | None = None) -> dict[str, Any]:
         now = ensure_utc(now_utc) if now_utc is not None else datetime.now(UTC)
+        try:
+            app_cfg = load_app_config(self.config_dir)
+        except (FileNotFoundError, OSError, ValueError, TypeError, yaml.YAMLError):
+            app_cfg = AppConfig()
         universe = load_universe(self.config_dir)
         all_symbols = [u.symbol for u in universe]
         equity_symbols = [u.symbol for u in universe if u.asset_type == AssetType.equity]
@@ -192,14 +197,24 @@ class NewsNlpDaemon(DaemonRunner):
             # 2. Finnhub company news (if key set or injected)
             try:
                 fh_prov = self._finnhub_news_provider
+                fh_symbols = equity_symbols or all_symbols
                 if fh_prov is None and self.settings.finnhub_api_key.strip():
                     fh_prov = FinnhubNewsProvider(
                         api_key=self.settings.finnhub_api_key,
                         client=http_client,
                     )
+                    if app_cfg.strategy.w_news_sentiment <= 0.0:
+                        eq_set = set(equity_symbols)
+                        held_eq = [
+                            str(p["symbol"]).strip().upper()
+                            for p in self.db.get_live_positions()
+                            if abs(float(p["qty"])) > 1e-9
+                            and str(p["symbol"]).strip().upper() in eq_set
+                        ]
+                        fh_symbols = (held_eq or equity_symbols)[:25] or all_symbols[:25]
                 if fh_prov is not None:
                     fh_arts = fh_prov.fetch_news(
-                        symbols=equity_symbols or all_symbols,
+                        symbols=fh_symbols,
                         start=finnhub_start_utc,
                         end=now,
                     )

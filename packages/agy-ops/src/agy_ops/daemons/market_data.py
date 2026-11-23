@@ -11,6 +11,7 @@ from typing import Any
 
 import httpx
 import structlog
+import yaml
 from alpaca.data.enums import DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockSnapshotRequest
@@ -303,6 +304,13 @@ class MarketDataDaemon(DaemonRunner):
         equity_syms = self._equity_symbols()
         universe = load_universe(self.config_dir)
         etf_entries = [u for u in universe if u.asset_type == AssetType.etf]
+        max_form4_per_symbol = 200
+        try:
+            app_cfg = load_app_config(self.config_dir)
+            if app_cfg.strategy.w_insider <= 0.0:
+                max_form4_per_symbol = 0
+        except (FileNotFoundError, OSError, ValueError, TypeError, yaml.YAMLError):
+            pass
 
         with httpx.Client(timeout=30.0) as http_client:
             # 1. FRED Macro (T10Y2Y, BAMLH0A0HYM2, VIXCLS, DGS3MO)
@@ -335,6 +343,7 @@ class MarketDataDaemon(DaemonRunner):
                         user_agent=self.settings.sec_edgar_user_agent,
                         cache_dir=self.data_dir / "sec_cache",
                         client=http_client,
+                        max_form4_per_symbol=max_form4_per_symbol,
                     )
                 if sec_prov is not None:
                     filings = sec_prov.fetch_filings(

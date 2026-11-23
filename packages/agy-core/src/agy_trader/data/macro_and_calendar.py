@@ -111,7 +111,7 @@ class YFinanceEarningsProvider(EarningsProvider):
 
         for sym in clean_symbols:
             try:
-                ticker = yf.Ticker(sym)
+                ticker = yf.Ticker(sym.replace(".", "-"))
                 df = ticker.get_earnings_dates(limit=self.limit)
                 if df is None or df.empty:
                     continue

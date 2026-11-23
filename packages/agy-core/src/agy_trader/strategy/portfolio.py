@@ -9,6 +9,7 @@ import numpy as np
 from agy_trader.core.config import RiskConfig, StrategyConfig
 from agy_trader.core.models import (
     AssetRiskMetadata,
+    AssetType,
     ControlDials,
     OrderSide,
     PositionSide,
@@ -160,6 +161,10 @@ class PortfolioConstructor:
                 self.strategy.exclude_safe_havens_from_equity_slots
                 and _is_safe_haven(s.symbol, universe_meta)
             )
+            and not (
+                self.strategy.exclude_etfs_from_equity_slots
+                and universe_meta[s.symbol].asset_type == AssetType.etf
+            )
             and s.stage1_finalist
             and _long_abs_ok(s)
             and s.composite_score
@@ -192,6 +197,10 @@ class PortfolioConstructor:
                 and not (
                     self.strategy.exclude_safe_havens_from_equity_slots
                     and _is_safe_haven(s.symbol, universe_meta)
+                )
+                and not (
+                    self.strategy.exclude_etfs_from_equity_slots
+                    and universe_meta[s.symbol].asset_type == AssetType.etf
                 )
                 and universe_meta[s.symbol].shortable
                 and universe_meta[s.symbol].easy_to_borrow
