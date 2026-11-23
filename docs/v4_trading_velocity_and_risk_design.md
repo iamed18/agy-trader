@@ -25,7 +25,9 @@ From `reports/v4_monthly_research/summary.json` (`119` monthly rebalances over `
 - **Calendar-day average:** **`0.79` filled orders/day** (`1,952` orders over `2,485` days; **`0.82`/day** in `2022–2026` OOS across `1,226` days).
 - **Non-rebalance trading days (~20 of 21 sessions/month):** **`0` trades on ~98.6% of days**. Intra-month trades occur only if a resting `10x ATR` protective stop triggers (`34` stop exits over 10 years, ~`3.4`/yr; `11` in 5Y OOS, ~`2.2`/yr).
 - **Monthly rebalance day (`1st` NYSE trading day @ `15:40 ET`):** **`~16.1` orders** on average (`1,918` non-stop orders / `119` months — rotations, exits, and re-weights above `1.5%`; slightly fewer minor re-weight orders may occur live due to whole-share sizing with `allow_fractional_longs: false`).
-- **Mid-month Day-1 deployment (`2026-11-23` @ `15:40 ET`):** Expect up to **`~25` opening buy orders** when deploying from `0` positions (excluding any symbols blocked by `BLACKOUT_PERIOD`, earnings blackouts, or restatement blackouts).
+- **Mid-month Day-1 deployment (`2026-11-23` @ `15:40 ET`):** Expect up to **`~25` opening buy orders** when deploying from `0` positions (excluding any symbols blocked by `BLACKOUT_PERIOD` or Item 4.02 restatement blackouts; earnings entry blackouts are disabled per Section 4).
+
+*(Note on benchmark figures: `reports/v4_monthly_research/summary.json` runs the fractional R&D spec `allow_fractional_longs: true` yielding `+20.24%` 10Y CAGR / `+16.07%` OOS / `0.862` XS-SR / `1,952` orders, whereas the live whole-share `allow_fractional_longs: false` baseline in Section 4 yields `+20.05%` 10Y / `+15.89%` OOS / `0.857` XS-SR / `1,954` orders.)*
 
 ---
 
@@ -61,7 +63,7 @@ V4 is deliberately **non-reactive day-to-day**: neither `news-nlp` nor `market-d
 | Approach (Equities-Only vs Options) | Gap Behavior | Expected Cost / Trade-Off |
 | :--- | :--- | :--- |
 | **25-stock diversification + `12%` cap (`current`)** | `~3%–5%` typical weight bounds a `-40%` single-stock gap to `~1.2%–2.0%` portfolio impact | Zero hedge drag (`$0`); absorbs single-stock shocks while wide `10x ATR` GTC stops cut multi-week meltdowns |
-| **Exit existing holds before earnings** | Eliminates earnings overnight gaps | Currently `earnings_blackout_days: 2` blocks *new entries* only; forced pre-earnings exits likely forfeit positive momentum surprises and raise turnover *(untested in V4)* |
+| **Earnings entry blackout (`earnings_blackout_days: null`, disabled live)** | Skipping new entries near earnings forfeits pre-earnings & PEAD drift (`+2.64%` to `+3.57%` 21d avg return on blocked picks) | Disabling `±2d` added `+0.76%`/yr on 10Y PIT S&P 500 Top-200 (`+19.29% -> +20.05%`) and `+1.29%`/yr on Live 200 (`+23.65% -> +24.94%`) with lower/flat MaxDD; backfill `#26+` worsened MaxDD, while `pre_2d + rescale_remaining` is the best fallback if ever desired |
 | **Delayed-open / collared exit on gap-down** | Avoids 09:30:00 opening-auction print volatility | Loses server-side GTC autonomy and exposes position to deeper intraday selloff |
 | **Protective puts *(requires options support)*** | Contractual floor across overnight gaps | Rolling single-stock puts on 25 high-momentum names typically costs `~5%–10%+/yr` in implied-vol premium; far-OTM `SPY` puts cost less (`~1%–2%`/yr) but hedge only broad-market shocks |
 
@@ -70,6 +72,6 @@ V4 is deliberately **non-reactive day-to-day**: neither `news-nlp` nor `market-d
 ## 5. Future R&D Revisit Checklist
 
 1. **Automated Monthly PIT Universe Reconstitution (Operational Priority before `2026-12-01`):** Wire a scheduled monthly refresh of [`config/universe.yaml`](../config/universe.yaml) and bar/earnings/SEC backfill for newly entering S&P 500 Top-200 names ahead of each `monthly_first` rebalance.
-2. **Pre-Earnings Exit Ablation:** Backtest closing vs holding existing positions into the `2`-day earnings window on the 10-year V4 dataset to measure exact CAGR/Sharpe/MaxDD impact.
+2. **Pre-Earnings Forced-Exit Ablation:** Backtest closing existing positions before earnings (distinct from the now-disabled entry-only block, or testing `pre_2d + rescale_remaining` if earnings risk tolerance narrows) on the 10-year V4 dataset.
 3. **News Veto / Post-Earnings Drift (`w_pead`):** Once 215-symbol FinBERT history accrues, test negative-sentiment entry vetoes (rather than noisy 48-hour cross-sectional blends) on monthly rebalances.
 4. **Portfolio Tail-Hedge Evaluation (If Options Are Added Later):** Benchmark rolling far-OTM `SPY` puts vs cash/`C3_RegimeManaged` Daniel–Moskowitz scaling during crisis regimes.

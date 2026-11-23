@@ -86,6 +86,10 @@ def test_v4_monthly_research_end_to_end_synthetic(tmp_path: Path) -> None:
 
     out_dir = tmp_path / "v4_out"
     specs = build_v4_candidate_specs()
+    t0_spec = next(s for s in specs if s.candidate_id == "T0")
+    c2_spec = next(s for s in specs if s.candidate_id == "C2_LiquidAdaptive")
+    assert t0_spec.risk_overrides["earnings_blackout_days"] == 2
+    assert c2_spec.risk_overrides["earnings_blackout_days"] is None
     report, _ = run_v4_monthly_research(
         bars,
         pool,

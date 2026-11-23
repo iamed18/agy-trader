@@ -408,6 +408,21 @@ def test_embed_formatters_morning_close_and_test() -> None:
         "Today's Earnings / Item-4.02 Blackouts",
         "Overnight News / SEC / RSS Highlights",
     ]
+    assert "Earnings Blackouts: AAPL (2026-11-23)" in ready_embed["fields"][3]["value"]
+
+    # Guard explicitly disabled (earnings_blackout_days: None) must say Disabled, NOT None
+    disabled_embed = build_morning_discord_embed(
+        {"status": "READY", "session_date_et": "2026-11-23", "checks": [{}, {}], "issues": []},
+        {**morning_plan, "earnings_blackout_days": None, "earnings_blackouts": []},
+    )
+    assert "Earnings Blackouts: Disabled" in disabled_embed["fields"][3]["value"]
+
+    # Guard active (earnings_blackout_days: 2) with zero matches must say None
+    active_empty_embed = build_morning_discord_embed(
+        {"status": "READY", "session_date_et": "2026-11-23", "checks": [{}, {}], "issues": []},
+        {**morning_plan, "earnings_blackout_days": 2, "earnings_blackouts": []},
+    )
+    assert "Earnings Blackouts: None" in active_empty_embed["fields"][3]["value"]
 
     degraded_embed = build_morning_discord_embed(
         {

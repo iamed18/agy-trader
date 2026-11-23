@@ -1,7 +1,7 @@
 # V4 Monthly-Rebalance Dynamic Index-Beater Candidate Configuration
 # R&D candidate validated over 2017-2026 survivorship-free PIT S&P 500 Top-200
 # (`C2_LiquidAdaptive`: +20.24% 10Y CAGR, 0.862 Excess Sharpe, -25.61% MaxDD, 1.0x gross).
-# NOTE: Live v0.2 paper trading continues using config/strategy.yaml untouched.
+# NOTE: Promoted to live paper trading in config/strategy.yaml (with allow_fractional_longs: false and exclude_etfs_from_equity_slots: true).
 
 strategy:
   rebalance_checkpoints_et:
@@ -24,6 +24,8 @@ strategy:
   w_pullback: 0.0
   w_news_sentiment: 0.0
   w_insider: 0.0
+  news_half_life_hours: 48.0
+  news_lookback_hours: 120.0
   top_k_long: 25
   top_k_short: 0
   min_signal_threshold: 0.0
@@ -73,7 +75,7 @@ risk:
   max_drawdown_halt_pct: 0.35
   max_drawdown_cooldown_days: 20
   delisting_haircut_pct: 0.10
-  earnings_blackout_days: 2
+  earnings_blackout_days: null
   restatement_blackout_days: 10
   stop_loss_atr_mult_long: 10.0
   stop_loss_atr_mult_short: 3.0

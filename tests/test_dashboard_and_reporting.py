@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import yaml
 from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
@@ -324,9 +325,32 @@ def test_reporting_builders_and_agy_ops_cli(
 
     morning = build_morning_plan(data_dir, REPO_CONFIG_DIR, now_utc=now)
     assert morning["macro_regime_scale"] > 0.0
-    assert any(e["symbol"] == "AAPL" for e in morning["earnings_blackouts"])
     assert any(r["symbol"] == "MSFT" for r in morning["restatement_blackouts"])
     assert "Morning Plan" in morning["markdown_summary"]
+
+    # Isolated config checks: earnings_blackout_days=None vs earnings_blackout_days=2
+    raw_strat = yaml.safe_load((REPO_CONFIG_DIR / "strategy.yaml").read_text(encoding="utf-8"))
+    univ_txt = (REPO_CONFIG_DIR / "universe.yaml").read_text(encoding="utf-8")
+
+    cfg_disabled = tmp_path / "cfg_earn_disabled"
+    cfg_disabled.mkdir()
+    raw_dis = {**raw_strat, "risk": {**raw_strat["risk"], "earnings_blackout_days": None}}
+    (cfg_disabled / "strategy.yaml").write_text(yaml.safe_dump(raw_dis), encoding="utf-8")
+    (cfg_disabled / "universe.yaml").write_text(univ_txt, encoding="utf-8")
+    morning_disabled = build_morning_plan(data_dir, cfg_disabled, now_utc=now)
+    assert morning_disabled["earnings_blackout_days"] is None
+    assert morning_disabled["earnings_blackouts"] == []
+    assert "**Earnings Blackouts Today:** Disabled" in morning_disabled["markdown_summary"]
+
+    cfg_earn = tmp_path / "cfg_earn"
+    cfg_earn.mkdir()
+    raw_en = {**raw_strat, "risk": {**raw_strat["risk"], "earnings_blackout_days": 2}}
+    (cfg_earn / "strategy.yaml").write_text(yaml.safe_dump(raw_en), encoding="utf-8")
+    (cfg_earn / "universe.yaml").write_text(univ_txt, encoding="utf-8")
+    morning_with_earn = build_morning_plan(data_dir, cfg_earn, now_utc=now)
+    assert morning_with_earn["earnings_blackout_days"] == 2
+    assert any(e["symbol"] == "AAPL" for e in morning_with_earn["earnings_blackouts"])
+    assert "**Earnings Blackouts Today:** AAPL" in morning_with_earn["markdown_summary"]
 
     daily = build_daily_summary(data_dir, REPO_CONFIG_DIR, now_utc=now)
     assert daily["equity"] == 102_500.0

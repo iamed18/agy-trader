@@ -319,9 +319,16 @@ class HardRiskEngine:
         if meta is None:
             violations.append("UNKNOWN_ASSET_METADATA")
         else:
-            if meta.asset_type == AssetType.equity and self.config.earnings_blackout_days >= 0:
+            if (
+                meta.asset_type == AssetType.equity
+                and self.config.earnings_blackout_days is not None
+                and self.config.earnings_blackout_days >= 0
+            ):
                 for earn_dt in earnings_map.get(sym, ()):
-                    if _trading_days_apart(as_of_et_date, earn_dt) <= self.config.earnings_blackout_days:
+                    if (
+                        _trading_days_apart(as_of_et_date, earn_dt)
+                        <= self.config.earnings_blackout_days
+                    ):
                         violations.append("EARNINGS_BLACKOUT")
                         break
 

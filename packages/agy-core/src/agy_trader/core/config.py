@@ -216,7 +216,7 @@ class RiskConfig(BaseModel):
     max_drawdown_halt_pct: float = Field(default=0.08, gt=0.0, lt=1.0)
     max_drawdown_cooldown_days: int | None = Field(default=None, ge=1, le=252)
     delisting_haircut_pct: float = Field(default=0.10, ge=0.0, le=1.0)
-    earnings_blackout_days: int = Field(default=2, ge=0, le=30)
+    earnings_blackout_days: int | None = Field(default=2, ge=0, le=30)
     restatement_blackout_days: int = Field(default=10, ge=0, le=60)
     stop_loss_atr_mult_long: float = Field(default=2.5, gt=0.0)
     stop_loss_atr_mult_short: float = Field(default=2.0, gt=0.0)

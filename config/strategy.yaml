@@ -81,7 +81,9 @@ risk:
   max_drawdown_halt_pct: 0.35
   max_drawdown_cooldown_days: 20
   delisting_haircut_pct: 0.10
-  earnings_blackout_days: 2
+  # 10Y ablation (+0.76%/yr PIT SP500 Top-200, +1.29%/yr Live 200; blocked picks +2.64%..+3.57% 21d avg):
+  # disabling entry-only earnings block improves return & Sharpe; Item 4.02 & BLACKOUT_PERIOD stay active.
+  earnings_blackout_days: null
   restatement_blackout_days: 10
   stop_loss_atr_mult_long: 10.0
   stop_loss_atr_mult_short: 3.0

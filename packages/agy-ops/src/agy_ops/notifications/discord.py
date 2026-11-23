@@ -434,12 +434,18 @@ def build_morning_discord_embed(
 
     earnings = list(morning_plan.get("earnings_blackouts", ()))
     restatements = list(morning_plan.get("restatement_blackouts", ()))
-    earnings_str = (
-        ", ".join(f"{e.get('symbol')} ({e.get('earnings_date')})" for e in earnings[:10])
-        or "None"
-    )
-    if len(earnings) > 10:
-        earnings_str += f" (+{len(earnings) - 10} more)"
+    earn_days = morning_plan.get("earnings_blackout_days")
+    if "earnings_blackout_days" in morning_plan and (
+        earn_days is None or (isinstance(earn_days, int) and earn_days < 0)
+    ):
+        earnings_str = "Disabled"
+    else:
+        earnings_str = (
+            ", ".join(f"{e.get('symbol')} ({e.get('earnings_date')})" for e in earnings[:10])
+            or "None"
+        )
+        if len(earnings) > 10:
+            earnings_str += f" (+{len(earnings) - 10} more)"
     restate_str = ", ".join(str(r.get("symbol")) for r in restatements[:10]) or "None"
     blackouts_value = (
         f"Earnings Blackouts: {earnings_str}\n"

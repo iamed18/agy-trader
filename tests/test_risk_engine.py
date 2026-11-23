@@ -371,6 +371,63 @@ def test_earnings_blackout_across_presidents_day_and_etf_exempt() -> None:
     assert v_thu[0].approved is True
 
 
+def test_earnings_blackout_none_disables_entry_block_while_preserving_other_guards() -> None:
+    assert RiskConfig().earnings_blackout_days == 2
+    earn_day = date(2025, 2, 19)
+    as_of = _as_of_et(earn_day)
+    meta = {"AAPL": _meta("AAPL", asset_type=AssetType.equity)}
+    order = ProposedOrder(
+        symbol="AAPL", side=OrderSide.buy, qty=10.0, reference_price=100.0, stop_loss_price=95.0
+    )
+    earnings = {"AAPL": [earn_day]}
+
+    engine_disabled = HardRiskEngine(RiskConfig(earnings_blackout_days=None))
+    state = _base_state(as_of, prices={"AAPL": 100.0})
+    sig_clean = {"AAPL": _signal("AAPL", as_of)}
+    v_ok = engine_disabled.evaluate_batch([order], state, ControlDials(), meta, sig_clean, earnings)
+    assert v_ok[0].approved is True
+    assert v_ok[0].adjusted_qty == 10.0
+    assert v_ok[0].stop_loss_price == 95.0
+
+    # With stop_loss_price=None, ATR stop synthesis still runs normally (default mult 2.5, atr_pct=0.02 -> 95.0)
+    order_no_stop = ProposedOrder(
+        symbol="AAPL", side=OrderSide.buy, qty=10.0, reference_price=100.0, stop_loss_price=None
+    )
+    v_synth = engine_disabled.evaluate_batch(
+        [order_no_stop], state, ControlDials(), meta, sig_clean, earnings
+    )
+    assert v_synth[0].approved is True
+    assert v_synth[0].stop_loss_price == pytest.approx(95.0)
+
+    # Exact-day boundary earnings_blackout_days=0 still blocks earn_day, unlike None
+    engine_zero = HardRiskEngine(RiskConfig(earnings_blackout_days=0))
+    v_zero = engine_zero.evaluate_batch([order], state, ControlDials(), meta, sig_clean, earnings)
+    assert v_zero[0].approved is False
+    assert "EARNINGS_BLACKOUT" in v_zero[0].violations
+
+    # RESTATEMENT_BLACKOUT and BLACKOUT_PERIOD still block even when earnings_blackout_days=None
+    sig_restate = {
+        "AAPL": _signal("AAPL", as_of).model_copy(update={"has_recent_restatement": True})
+    }
+    v_restate = engine_disabled.evaluate_batch(
+        [order], state, ControlDials(), meta, sig_restate, earnings
+    )
+    assert v_restate[0].approved is False
+    assert "RESTATEMENT_BLACKOUT" in v_restate[0].violations
+
+    v_frozen = engine_disabled.evaluate_batch(
+        [order], state, ControlDials(), meta, sig_clean, earnings, frozen_symbols={"AAPL"}
+    )
+    assert v_frozen[0].approved is False
+    assert "BLACKOUT_PERIOD_FROZEN" in v_frozen[0].violations
+
+    v_halted = engine_disabled.evaluate_batch(
+        [order], state, ControlDials(), meta, sig_clean, earnings, blackout_halted=True
+    )
+    assert v_halted[0].approved is False
+    assert "BLACKOUT_PERIOD_HALT" in v_halted[0].violations
+
+
 def test_cumulative_batch_caps_portfolio_price_integrity_and_ref_divergence() -> None:
     as_of = _as_of_et(date(2025, 3, 5))
     cfg = RiskConfig(

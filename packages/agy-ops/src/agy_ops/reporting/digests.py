@@ -420,12 +420,16 @@ def build_morning_plan(
     overnight_sec: list[dict[str, Any]] = []
 
     if db is not None:
-        earnings_map = db.get_all_earnings_map()
-        for sym, dates in sorted(earnings_map.items()):
-            for edate in dates:
-                if nyse_trading_days_apart(today_et, edate) <= app_cfg.risk.earnings_blackout_days:
-                    earnings_blackouts.append({"symbol": sym, "earnings_date": edate.isoformat()})
-                    break
+        earn_blackout_days = app_cfg.risk.earnings_blackout_days
+        if earn_blackout_days is not None and earn_blackout_days >= 0:
+            earnings_map = db.get_all_earnings_map()
+            for sym, dates in sorted(earnings_map.items()):
+                for edate in dates:
+                    if nyse_trading_days_apart(today_et, edate) <= earn_blackout_days:
+                        earnings_blackouts.append(
+                            {"symbol": sym, "earnings_date": edate.isoformat()}
+                        )
+                        break
 
         sec_map = db.get_sec_filings_map()
         for sym, events in sorted(sec_map.items()):
@@ -494,7 +498,11 @@ def build_morning_plan(
         f"- **PIT Macro Regime Scale:** {macro_scale:.4f}",
         f"- **Control Dials:** paused={dials.pause_new_entries}, multiplier={dials.exposure_multiplier:.2f}, allow_shorting={dials.allow_shorting}",
         f"- **BLACKOUT_PERIOD Compliance:** {blackout_summary_str}",
-        f"- **Earnings Blackouts Today:** {', '.join(e['symbol'] for e in earnings_blackouts) or 'None'}",
+        (
+            "- **Earnings Blackouts Today:** Disabled"
+            if app_cfg.risk.earnings_blackout_days is None
+            else f"- **Earnings Blackouts Today:** {', '.join(e['symbol'] for e in earnings_blackouts) or 'None'}"
+        ),
         f"- **Item 4.02 Restatement Blackouts:** {', '.join(r['symbol'] for r in restatement_blackouts) or 'None'}",
         f"- **Overnight Highlights (24h):** {len(overnight_news)} model news, {len(overnight_sec)} SEC filings, {len(overnight_fwd)} RSS/YF feeds",
     ]
@@ -516,6 +524,7 @@ def build_morning_plan(
         "macro_regime_scale": macro_scale,
         "control_dials": dials.model_dump(mode="json"),
         "blackout": blackout.to_status_dict(),
+        "earnings_blackout_days": app_cfg.risk.earnings_blackout_days,
         "earnings_blackouts": earnings_blackouts,
         "restatement_blackouts": restatement_blackouts,
         "overnight_model_news": overnight_news,
