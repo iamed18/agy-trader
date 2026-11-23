@@ -4,6 +4,8 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 
+import numpy as np
+
 from agy_trader.core.config import RiskConfig, StrategyConfig
 from agy_trader.core.models import (
     AssetRiskMetadata,
@@ -147,13 +149,14 @@ class PortfolioConstructor:
             selected.sort(key=sort_key)
             return selected
 
-        # Eligible long candidates with hysteresis & optional dual-momentum filter
+        # Eligible long candidates with hysteresis, Stage-1 finalist gate, & optional dual-momentum filter
         long_cands = [
             s
             for s in deduped
             if s.symbol not in frozen_set
             and s.symbol not in blacklist
             and s.symbol in universe_meta
+            and s.stage1_finalist
             and _long_abs_ok(s)
             and s.composite_score
             >= (exit_thresh if _is_held_long(s) else self.strategy.min_signal_threshold)
@@ -220,35 +223,13 @@ class PortfolioConstructor:
                 risk_scale=risk_scale,
                 universe_meta=universe_meta,
             )
-            self._apply_sector_gross_cap(targets, universe_meta, frozen_set=frozen_set)
-            gross_cap = self.risk.max_gross_exposure * dials.exposure_multiplier
-            frozen_gross = sum(abs(w) for sym, w in targets.items() if sym in frozen_set)
-            non_frozen_gross = sum(
-                abs(w) for sym, w in targets.items() if sym not in frozen_set
-            )
-            if frozen_gross + non_frozen_gross > gross_cap and non_frozen_gross > 1e-12:
-                gs = max(0.0, gross_cap - frozen_gross) / non_frozen_gross
-                for sym in targets:
-                    if sym not in frozen_set:
-                        targets[sym] *= gs
-            effective_max_net = min(
-                self.risk.max_net_exposure,
-                self.risk.max_net_exposure * dials.exposure_multiplier,
-            )
-            effective_min_net = max(
-                self.risk.min_net_exposure,
-                self.risk.min_net_exposure * dials.exposure_multiplier,
-            )
-            self._apply_net_exposure_bounds(
-                targets, effective_max_net, effective_min_net, frozen_set=frozen_set
-            )
         else:
             # Allocate remaining gross budget across non-frozen selected longs and shorts
             frozen_gross = sum(abs(w) for sym, w in targets.items() if sym in frozen_set)
             avail_gross_budget = max(0.0, effective_gross_budget - frozen_gross)
             raw_inv_vol: dict[str, float] = {}
             for s in selected_longs:
-                raw_inv_vol[s.symbol] = 1.0 / max(s.atr_pct, 0.005)
+                raw_inv_vol[s.symbol] = self._raw_long_base_weight(s, selected_longs)
             for s in selected_shorts:
                 cap_ratio = self.risk.max_short_position_pct / max(
                     self.risk.max_long_position_pct, 1e-6
@@ -264,18 +245,179 @@ class PortfolioConstructor:
                     w = avail_gross_budget * (raw_inv_vol[s.symbol] / total_inv_vol)
                     targets[s.symbol] = -min(w, self.risk.max_short_position_pct)
 
-            self._apply_sector_gross_cap(targets, universe_meta, frozen_set=frozen_set)
-            effective_max_net = min(
-                self.risk.max_net_exposure, self.risk.max_net_exposure * risk_scale
-            )
-            effective_min_net = max(
-                self.risk.min_net_exposure, self.risk.min_net_exposure * risk_scale
-            )
-            self._apply_net_exposure_bounds(
-                targets, effective_max_net, effective_min_net, frozen_set=frozen_set
-            )
+        return self.apply_portfolio_overlays(
+            targets,
+            signals=deduped,
+            dials=dials,
+            universe_meta=universe_meta,
+            current_weights=cur_w,
+            frozen_set=frozen_set,
+            as_of=as_of_utc,
+        )
 
-        # If ops paused new entries, clamp target magnitude so we never open or increase risk
+    def apply_portfolio_overlays(
+        self,
+        targets: dict[str, float],
+        *,
+        signals: Sequence[SignalRow],
+        dials: ControlDials,
+        universe_meta: Mapping[str, AssetRiskMetadata],
+        current_weights: Mapping[str, float] = {},
+        frozen_set: frozenset[str] = frozenset(),
+        as_of: datetime | None = None,
+    ) -> dict[str, float]:
+        """Enforce sector cap, macro/gross/net exposure ceilings, PSD vol-target, and pause_new_entries."""
+        normalized: dict[str, float] = {}
+        for raw_sym, raw_w in targets.items():
+            sym = str(raw_sym).strip().upper()
+            if not sym:
+                continue
+            val = float(raw_w)
+            if not math.isfinite(val):
+                raise ValueError(f"Non-finite target weight for {sym}: {raw_w!r}")
+            normalized[sym] = val
+        targets = normalized
+
+        cur_w: dict[str, float] = {}
+        for raw_sym, raw_val in current_weights.items():
+            sym = str(raw_sym).strip().upper()
+            if sym and math.isfinite(float(raw_val)):
+                cur_w[sym] = float(raw_val)
+
+        as_of_utc = (
+            ensure_utc(as_of)
+            if as_of is not None
+            else (
+                max((ensure_utc(s.as_of) for s in signals), default=ensure_utc(dials.updated_at))
+            )
+        )
+        blacklist = dials.active_blacklist(as_of_utc)
+        deduped_map: dict[str, SignalRow] = {}
+        for s in signals:
+            if s.as_of <= as_of_utc:
+                prev = deduped_map.get(s.symbol)
+                if prev is None or s.as_of >= prev.as_of:
+                    deduped_map[s.symbol] = s
+
+        for sym in list(targets.keys()):
+            if sym not in frozen_set and (
+                sym in blacklist or (targets[sym] < 0.0 and not dials.allow_shorting)
+            ):
+                targets[sym] = 0.0
+
+        use_multi_sleeve = (
+            self.strategy.waterfill_weights
+            or self.strategy.exempt_safe_havens_from_macro_scale
+            or self.strategy.safe_haven_rotation_fraction > 0.0
+        )
+        macro_scale = min((s.macro_regime_scale for s in deduped_map.values()), default=1.0)
+        risk_scale = max(0.0, min(1.0, macro_scale * dials.exposure_multiplier))
+
+        # 1. Sector gross exposure cap
+        self._apply_sector_gross_cap(targets, universe_meta, frozen_set=frozen_set)
+
+        # 2. Portfolio gross exposure cap & net exposure bounds
+        gross_cap = (
+            self.risk.max_gross_exposure * dials.exposure_multiplier
+            if use_multi_sleeve
+            else self.risk.max_gross_exposure * risk_scale
+        )
+        frozen_gross = sum(abs(w) for sym, w in targets.items() if sym in frozen_set)
+        non_frozen_gross = sum(abs(w) for sym, w in targets.items() if sym not in frozen_set)
+        if frozen_gross + non_frozen_gross > gross_cap and non_frozen_gross > 1e-12:
+            gs = max(0.0, gross_cap - frozen_gross) / non_frozen_gross
+            for sym in list(targets.keys()):
+                if sym not in frozen_set:
+                    targets[sym] *= gs
+
+        net_scale = dials.exposure_multiplier if use_multi_sleeve else risk_scale
+        effective_max_net = min(
+            self.risk.max_net_exposure,
+            self.risk.max_net_exposure * net_scale,
+        )
+        effective_min_net = max(
+            self.risk.min_net_exposure,
+            self.risk.min_net_exposure * net_scale,
+        )
+        self._apply_net_exposure_bounds(
+            targets, effective_max_net, effective_min_net, frozen_set=frozen_set
+        )
+
+        # 3. Portfolio-level covariance volatility targeting (with PSD eigenvalue floor)
+        if self.strategy.portfolio_vol_target_ann is not None:
+            active_syms = [
+                sym
+                for sym, w in targets.items()
+                if sym not in frozen_set and abs(w) > 1e-9
+            ]
+            if active_syms:
+                n_act = len(active_syms)
+                w_vol_vec = np.zeros(n_act, dtype=np.float64)
+                for i, sym_i in enumerate(active_syms):
+                    sig_i = deduped_map.get(sym_i)
+                    raw_vol = sig_i.ann_vol if sig_i is not None else 0.20
+                    vol_i = (
+                        max(float(raw_vol), 0.05)
+                        if math.isfinite(float(raw_vol))
+                        else 0.20
+                    )
+                    w_vol_vec[i] = targets[sym_i] * vol_i
+
+                diag_var = float(np.dot(w_vol_vec, w_vol_vec))
+                corr_mat = np.eye(n_act, dtype=np.float64)
+                for i in range(n_act):
+                    sym_i = active_syms[i]
+                    sig_i = deduped_map.get(sym_i)
+                    for j in range(i + 1, n_act):
+                        sym_j = active_syms[j]
+                        sig_j = deduped_map.get(sym_j)
+                        c_ij = (
+                            sig_i.peer_corr_60d.get(sym_j)
+                            if sig_i is not None
+                            else None
+                        )
+                        c_ji = (
+                            sig_j.peer_corr_60d.get(sym_i)
+                            if sig_j is not None
+                            else None
+                        )
+                        if c_ij is not None and math.isfinite(float(c_ij)):
+                            raw_c = float(c_ij)
+                        elif c_ji is not None and math.isfinite(float(c_ji)):
+                            raw_c = float(c_ji)
+                        else:
+                            raw_c = 0.25
+                        clamped_c = max(-0.99, min(0.99, raw_c))
+                        corr_mat[i, j] = clamped_c
+                        corr_mat[j, i] = clamped_c
+
+                try:
+                    eigvals, eigvecs = np.linalg.eigh(corr_mat)
+                    psd_corr = (
+                        eigvecs
+                        @ np.diag(np.maximum(eigvals, 0.05))
+                        @ eigvecs.T
+                    )
+                    raw_port_var = float(w_vol_vec @ psd_corr @ w_vol_vec)
+                except np.linalg.LinAlgError:
+                    raw_port_var = diag_var
+
+                min_var_floor = diag_var * 0.25 if n_act > 1 else diag_var
+                port_var = (
+                    max(raw_port_var, min_var_floor, 1e-8)
+                    if math.isfinite(raw_port_var)
+                    else max(diag_var, 1e-8)
+                )
+                port_vol = math.sqrt(port_var)
+                vol_scale = min(
+                    1.0, self.strategy.portfolio_vol_target_ann / max(port_vol, 0.05)
+                )
+                if vol_scale < 1.0:
+                    for sym in list(targets.keys()):
+                        if sym not in frozen_set:
+                            targets[sym] *= vol_scale
+
+        # 4. If ops paused new entries, clamp target magnitude so we never open or increase risk
         if dials.pause_new_entries:
             for sym, tgt in list(targets.items()):
                 if sym in frozen_set:
@@ -289,6 +431,31 @@ class PortfolioConstructor:
                     targets[sym] = min(0.0, max(cw, tgt))
 
         return targets
+
+    def _raw_long_base_weight(
+        self,
+        s: SignalRow,
+        selected_longs: Sequence[SignalRow],
+    ) -> float:
+        mode = self.strategy.vol_sizing_mode
+        if mode == "inv_atr":
+            base = 1.0 / max(s.atr_pct, 0.005)
+        elif mode == "capped_inv_vol":
+            clipped = max(
+                self.strategy.vol_sizing_floor,
+                min(self.strategy.vol_sizing_cap, max(s.ann_vol, 0.05)),
+            )
+            base = 1.0 / clipped
+        else:
+            base = 1.0
+
+        if self.strategy.score_tilt_power > 0.0:
+            base *= max(0.25, s.composite_score + 0.5) ** self.strategy.score_tilt_power
+        if self.strategy.corr_penalty_eta > 0.0 and len(selected_longs) >= 2:
+            others = [o.symbol for o in selected_longs if o.symbol != s.symbol]
+            mc = sum(max(0.0, s.peer_corr_60d.get(o, 0.0)) for o in others) / len(others)
+            base /= 1.0 + self.strategy.corr_penalty_eta * mc
+        return base
 
     def _allocate_multi_sleeve_weights(
         self,
@@ -329,16 +496,10 @@ class PortfolioConstructor:
         ]
 
         if selected_longs:
-            raw_w: dict[str, float] = {}
-            for s in selected_longs:
-                base = 1.0 / max(s.atr_pct, 0.005)
-                if self.strategy.score_tilt_power > 0.0:
-                    base *= max(0.25, s.composite_score + 0.5) ** self.strategy.score_tilt_power
-                if self.strategy.corr_penalty_eta > 0.0 and len(selected_longs) >= 2:
-                    others = [o.symbol for o in selected_longs if o.symbol != s.symbol]
-                    mc = sum(max(0.0, s.peer_corr_60d.get(o, 0.0)) for o in others) / len(others)
-                    base /= 1.0 + self.strategy.corr_penalty_eta * mc
-                raw_w[s.symbol] = base
+            raw_w: dict[str, float] = {
+                s.symbol: self._raw_long_base_weight(s, selected_longs)
+                for s in selected_longs
+            }
 
             rem = max_total_long
             unalloc = [s.symbol for s in selected_longs]
@@ -486,12 +647,15 @@ class PortfolioConstructor:
         as_of: datetime,
         universe_meta: Mapping[str, AssetRiskMetadata],
         frozen_symbols: set[str] | frozenset[str] = frozenset(),
+        *,
+        target_weights_override: Mapping[str, float] | None = None,
     ) -> list[ProposedOrder]:
         """Convert signals and current signed share positions into ProposedOrders."""
         if not math.isfinite(equity) or equity <= 0.0:
             return []
 
         as_of_utc = ensure_utc(as_of)
+        blacklist = dials.active_blacklist(as_of_utc)
         frozen_set = frozenset(s.strip().upper() for s in frozen_symbols if s.strip())
         signal_map: dict[str, SignalRow] = {}
         for s in signals:
@@ -500,20 +664,56 @@ class PortfolioConstructor:
                 if prev is None or s.as_of >= prev.as_of:
                     signal_map[s.symbol] = s
 
+        norm_positions: dict[str, float] = {}
+        for raw_sym, raw_qty in current_positions.items():
+            sym = str(raw_sym).strip().upper()
+            if sym and math.isfinite(float(raw_qty)):
+                norm_positions[sym] = float(raw_qty)
+
+        norm_prices: dict[str, float] = {}
+        for raw_sym, raw_px in prices.items():
+            sym = str(raw_sym).strip().upper()
+            if sym and math.isfinite(float(raw_px)):
+                norm_prices[sym] = float(raw_px)
+
         current_weights: dict[str, float] = {}
-        for sym, qty in current_positions.items():
-            px = prices.get(sym, 0.0)
+        for sym, qty in norm_positions.items():
+            px = norm_prices.get(sym, 0.0)
             if px > 0.0 and math.isfinite(px):
                 current_weights[sym] = (qty * px) / equity
 
-        target_weights = self.compute_target_weights(
-            signals=list(signal_map.values()),
-            dials=dials,
-            as_of=as_of_utc,
-            universe_meta=universe_meta,
-            current_weights=current_weights,
-            frozen_symbols=frozen_set,
-        )
+        if target_weights_override is not None:
+            target_weights: dict[str, float] = {}
+            for raw_k, raw_w in target_weights_override.items():
+                sym = str(raw_k).strip().upper()
+                if not sym:
+                    continue
+                w_val = float(raw_w)
+                if not math.isfinite(w_val):
+                    raise ValueError(
+                        f"target_weights_override contains non-finite weight for {sym}: {raw_w!r}"
+                    )
+                target_weights[sym] = w_val
+            if dials.pause_new_entries:
+                for sym, tgt in list(target_weights.items()):
+                    if sym in frozen_set:
+                        continue
+                    cw = current_weights.get(sym, 0.0)
+                    if sym in blacklist or cw == 0.0:
+                        target_weights[sym] = 0.0
+                    elif cw > 0.0:
+                        target_weights[sym] = max(0.0, min(cw, tgt))
+                    else:
+                        target_weights[sym] = min(0.0, max(cw, tgt))
+        else:
+            target_weights = self.compute_target_weights(
+                signals=list(signal_map.values()),
+                dials=dials,
+                as_of=as_of_utc,
+                universe_meta=universe_meta,
+                current_weights=current_weights,
+                frozen_symbols=frozen_set,
+            )
 
         macro_scale = min((s.macro_regime_scale for s in signal_map.values()), default=1.0)
         risk_scale = max(0.0, min(1.0, macro_scale * dials.exposure_multiplier))
@@ -529,17 +729,17 @@ class PortfolioConstructor:
         )
 
         orders: list[ProposedOrder] = []
-        all_symbols = sorted(set(current_positions.keys()) | set(target_weights.keys()))
+        all_symbols = sorted(set(norm_positions.keys()) | set(target_weights.keys()))
         deadband = self.strategy.rebalance_deadband_pct
 
         for sym in all_symbols:
             if sym in frozen_set:
                 continue
-            px = prices.get(sym, 0.0)
+            px = norm_prices.get(sym, 0.0)
             if not math.isfinite(px) or px <= 0.0:
                 continue
 
-            cur_qty = float(current_positions.get(sym, 0.0))
+            cur_qty = float(norm_positions.get(sym, 0.0))
             cur_w = (cur_qty * px) / equity
             tgt_w = float(target_weights.get(sym, 0.0))
 

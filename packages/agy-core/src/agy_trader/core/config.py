@@ -101,6 +101,17 @@ class StrategyConfig(BaseModel):
     spy_vol_surge_thresh: float = Field(default=1.65, gt=0.0)
     spy_ret10_crash_thresh: float = Field(default=-0.055, lt=0.0)
     spy_ret10_crash_scale: float | None = Field(default=None, ge=0.0, le=1.0)
+    use_sector_residual: bool = False
+    w_fip: float = Field(default=0.0, ge=0.0, le=1.0)
+    w_jump_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
+    vol_sizing_mode: Literal["inv_atr", "capped_inv_vol", "equal"] = "inv_atr"
+    vol_sizing_floor: float = Field(default=0.18, gt=0.0, le=1.0)
+    vol_sizing_cap: float = Field(default=0.45, gt=0.0, le=2.0)
+    portfolio_vol_target_ann: float | None = Field(default=None, gt=0.0, le=1.0)
+    rebalance_tranches: int = Field(default=1, ge=1, le=8)
+    regime_mode: Literal["legacy_stacked", "daniel_moskowitz"] = "legacy_stacked"
+    w_pead: float = Field(default=0.0, ge=0.0, le=1.0)
+    finalist_pool_size: int = Field(default=40, ge=5, le=200)
 
     @field_validator("model_news_sources")
     @classmethod
@@ -121,14 +132,29 @@ class StrategyConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_weights(self) -> StrategyConfig:
-        total = self.w_trend + self.w_pullback + self.w_news_sentiment + self.w_insider
+        total = (
+            self.w_trend
+            + self.w_pullback
+            + self.w_news_sentiment
+            + self.w_insider
+            + self.w_fip
+            + self.w_pead
+        )
         if total <= 0.0:
             raise ValueError("Strategy signal weights must sum to > 0")
+        if self.vol_sizing_cap < self.vol_sizing_floor:
+            raise ValueError("vol_sizing_cap must be >= vol_sizing_floor")
         if self.momentum_mode == "m2_residual":
             m2_total = self.m2_w_long + self.m2_w_med + self.m2_w_residual
             if m2_total <= 0.0:
                 raise ValueError(
                     "m2_residual weights (m2_w_long, m2_w_med, m2_w_residual) must sum to > 0"
+                )
+        else:
+            if self.w_fip > 0.0 or self.w_jump_penalty > 0.0 or self.use_sector_residual:
+                raise ValueError(
+                    "w_fip > 0, w_jump_penalty > 0, and use_sector_residual=True require "
+                    "momentum_mode == 'm2_residual'"
                 )
         if self.news_lookback_hours < self.news_half_life_hours:
             raise ValueError("news_lookback_hours must be >= news_half_life_hours")
@@ -151,6 +177,8 @@ class RiskConfig(BaseModel):
     max_sector_gross_pct: float = Field(default=0.25, gt=0.0, le=1.0)
     daily_loss_halt_pct: float = Field(default=0.02, gt=0.0, lt=1.0)
     max_drawdown_halt_pct: float = Field(default=0.08, gt=0.0, lt=1.0)
+    max_drawdown_cooldown_days: int | None = Field(default=None, ge=1, le=252)
+    delisting_haircut_pct: float = Field(default=0.10, ge=0.0, le=1.0)
     earnings_blackout_days: int = Field(default=2, ge=0, le=30)
     restatement_blackout_days: int = Field(default=10, ge=0, le=60)
     stop_loss_atr_mult_long: float = Field(default=2.5, gt=0.0)

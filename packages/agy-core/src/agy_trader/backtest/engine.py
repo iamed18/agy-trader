@@ -3,6 +3,7 @@ from __future__ import annotations
 import bisect
 import itertools
 import math
+from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -30,6 +31,7 @@ from agy_trader.strategy.features import (
     FeatureEngine,
     latest_pit_rf_apr,
 )
+from agy_trader.strategy.finalist_funnel import apply_stage2_finalist_overlay
 from agy_trader.strategy.portfolio import PortfolioConstructor
 
 from .metrics import (
@@ -77,6 +79,8 @@ class _SimState:
     cash: float
     positions: dict[str, _PositionLot] = field(default_factory=dict)
     carried_exits: list[_PendingExecution] = field(default_factory=list)
+    tranche_weights: list[dict[str, float]] = field(default_factory=list)
+    rebalance_count: int = 0
     bankrupt: bool = False
     trades: list[SimulatedTrade] = field(default_factory=list)
     total_traded_notional: float = 0.0
@@ -142,6 +146,9 @@ class BacktestEngine:
         close_open_positions_at_end: bool = False,
         execution_timing: Literal["same_close", "next_open"] | None = None,
         n_trials: int = 1,
+        eligible_symbols_by_date: Mapping[date, frozenset[str]] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> BacktestResult:
         res, _, _, _ = self._run_with_series(
             bars_by_symbol,
@@ -158,6 +165,9 @@ class BacktestEngine:
             close_open_positions_at_end=close_open_positions_at_end,
             execution_timing=execution_timing,
             n_trials=n_trials,
+            eligible_symbols_by_date=eligible_symbols_by_date,
+            symbol_sectors=symbol_sectors,
+            sector_etf_map=sector_etf_map,
         )
         return res
 
@@ -178,6 +188,9 @@ class BacktestEngine:
         close_open_positions_at_end: bool = False,
         execution_timing: Literal["same_close", "next_open"] | None = None,
         n_trials: int = 1,
+        eligible_symbols_by_date: Mapping[date, frozenset[str]] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> BacktestRunSeries:
         """Run backtest and return result alongside aligned RF, benchmark, and EW series."""
         res, daily_rf_rates, benchmark_closes, ew_universe_equities = self._run_with_series(
@@ -195,6 +208,9 @@ class BacktestEngine:
             close_open_positions_at_end=close_open_positions_at_end,
             execution_timing=execution_timing,
             n_trials=n_trials,
+            eligible_symbols_by_date=eligible_symbols_by_date,
+            symbol_sectors=symbol_sectors,
+            sector_etf_map=sector_etf_map,
         )
         return BacktestRunSeries(
             result=res,
@@ -220,6 +236,9 @@ class BacktestEngine:
         close_open_positions_at_end: bool = False,
         execution_timing: Literal["same_close", "next_open"] | None = None,
         n_trials: int = 1,
+        eligible_symbols_by_date: Mapping[date, frozenset[str]] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> tuple[BacktestResult, list[float], list[float], list[float]]:
         # Validate variant strategy config (guards news-only config + use_news=False -> sum=0)
         strat_payload = self.config.strategy.model_dump()
@@ -302,8 +321,30 @@ class BacktestEngine:
         last_known_close: dict[str, float] = {}
         last_bar_ts: dict[str, datetime] = {}
         pending_queue: list[_PendingExecution] = []
+        consecutive_missing_bars: dict[str, int] = defaultdict(int)
+        halt_streak_days = 0
 
-        high_water_mark = state.cash
+        norm_eligible_by_date: dict[date, frozenset[str]] | None = None
+        reconst_dates: list[date] = []
+        if eligible_symbols_by_date is not None:
+            norm_eligible_by_date = {
+                d: frozenset(s.strip().upper() for s in syms if s.strip())
+                for d, syms in eligible_symbols_by_date.items()
+            }
+            reconst_dates = sorted(norm_eligible_by_date.keys())
+
+        def _active_universe_for_date(d: date) -> frozenset[str] | None:
+            if norm_eligible_by_date is None:
+                return None
+            if not reconst_dates:
+                return frozenset()
+            idx = bisect.bisect_right(reconst_dates, d)
+            if idx > 0:
+                return norm_eligible_by_date[reconst_dates[idx - 1]]
+            return frozenset()
+
+        reporting_hwm = state.cash
+        risk_hwm = state.cash
         prev_day_equity = state.cash
         prev_ts: datetime | None = None
 
@@ -323,6 +364,8 @@ class BacktestEngine:
                 last_bar_ts[sym] = ensure_utc(df["timestamp"].iloc[pos - 1].to_pydatetime())
 
         for bar_idx, ts in enumerate(sim_timestamps):
+            active_universe_syms = _active_universe_for_date(ts.date())
+
             # 1. Overnight borrow accrual + positive-cash T-bill yield accrual
             period_rf = 0.0
             if prev_ts is not None and not state.bankrupt:
@@ -335,6 +378,41 @@ class BacktestEngine:
                     bt_cfg=bt_cfg,
                 )
             daily_rf_rates.append(period_rf)
+
+            # 1b. Strictly causal delisting / prolonged-halt forced exit (>= 5 consecutive missing bars)
+            if not state.bankrupt and state.positions:
+                for sym in list(state.positions.keys()):
+                    lot = state.positions[sym]
+                    if abs(lot.qty) <= 1e-9:
+                        continue
+                    if bar_lookup.get(sym, {}).get(ts) is None:
+                        consecutive_missing_bars[sym] += 1
+                    else:
+                        consecutive_missing_bars[sym] = 0
+                    if consecutive_missing_bars[sym] >= 5:
+                        base_px = last_known_close.get(sym, lot.avg_entry_price)
+                        self._force_close_delisted(
+                            state=state,
+                            sym=sym,
+                            lot=lot,
+                            base_px=base_px,
+                            ts=ts,
+                            haircut_pct=risk_cfg.delisting_haircut_pct,
+                            bt_cfg=bt_cfg,
+                        )
+                        consecutive_missing_bars.pop(sym, None)
+                        if state.carried_exits:
+                            state.carried_exits = [
+                                item
+                                for item in state.carried_exits
+                                if item.verdict.order.symbol != sym
+                            ]
+                        if pending_queue:
+                            pending_queue = [
+                                item
+                                for item in pending_queue
+                                if item.verdict.order.symbol != sym
+                            ]
 
             # 2. Open-gap stop-losses on existing positions at bar t open
             stopped_at_open: set[str] = set()
@@ -423,9 +501,9 @@ class BacktestEngine:
 
                 if not state.bankrupt and pre_equity > 0.0:
                     pre_drawdown = (
-                        (pre_equity - max(high_water_mark, pre_equity))
-                        / max(high_water_mark, pre_equity)
-                        if max(high_water_mark, pre_equity) > 1e-9
+                        (pre_equity - max(risk_hwm, pre_equity))
+                        / max(risk_hwm, pre_equity)
+                        if max(risk_hwm, pre_equity) > 1e-9
                         else 0.0
                     )
                     pre_daily_pnl = (
@@ -463,6 +541,9 @@ class BacktestEngine:
                             exposure_multiplier=exposure_multiplier,
                             label=label,
                             carried_symbols=carried_symbols,
+                            active_universe_syms=active_universe_syms,
+                            symbol_sectors=symbol_sectors,
+                            sector_etf_map=sector_etf_map,
                         )
                         batch_to_exec.extend(new_items)
 
@@ -512,9 +593,13 @@ class BacktestEngine:
                 gross_notional = 0.0
                 net_notional = 0.0
 
-            high_water_mark = max(high_water_mark, equity)
-            drawdown_pct = (
-                (equity - high_water_mark) / high_water_mark if high_water_mark > 1e-9 else 0.0
+            reporting_hwm = max(reporting_hwm, equity)
+            reporting_drawdown_pct = (
+                (equity - reporting_hwm) / reporting_hwm if reporting_hwm > 1e-9 else 0.0
+            )
+            risk_hwm = max(risk_hwm, equity)
+            risk_drawdown_pct = (
+                (equity - risk_hwm) / risk_hwm if risk_hwm > 1e-9 else 0.0
             )
             daily_pnl_pct = (
                 (equity - prev_day_equity) / prev_day_equity if prev_day_equity > 1e-9 else 0.0
@@ -530,16 +615,30 @@ class BacktestEngine:
                     gross_exposure=round(gross_exp, 4),
                     net_exposure=round(net_exp, 4),
                     daily_pnl_pct=round(daily_pnl_pct, 6),
-                    drawdown_pct=round(min(0.0, drawdown_pct), 6),
+                    drawdown_pct=round(min(0.0, reporting_drawdown_pct), 6),
                 )
             )
+            if risk_drawdown_pct <= -risk_cfg.max_drawdown_halt_pct:
+                halt_streak_days += 1
+            else:
+                halt_streak_days = 0
+            if (
+                risk_cfg.max_drawdown_cooldown_days is not None
+                and not state.bankrupt
+                and equity > 0.0
+                and halt_streak_days >= risk_cfg.max_drawdown_cooldown_days
+            ):
+                risk_hwm = equity
+                halt_streak_days = 0
+                risk_drawdown_pct = 0.0
+
             # Only append genuine live benchmark bars (never carry forward stale SPY closes!)
             if bt_cfg.benchmark_symbol in live_close_prices:
                 benchmark_closes.append(live_close_prices[bt_cfg.benchmark_symbol])
 
             # Track equal-weight universe index using MTM prices so missing bars
             # hold 0% return on day t and realize exact multi-day return on day t+1
-            ew_mtm_prices = {
+            all_valid_mtm = {
                 sym: px
                 for sym, px in mtm_prices.items()
                 if (not self.universe_meta or sym in self.universe_meta)
@@ -551,13 +650,20 @@ class BacktestEngine:
             else:
                 sym_rets = [
                     close_px / prev_ew_closes[sym] - 1.0
-                    for sym, close_px in ew_mtm_prices.items()
+                    for sym, close_px in all_valid_mtm.items()
                     if sym in prev_ew_closes and prev_ew_closes[sym] > 0.0
                 ]
                 if sym_rets:
                     ew_equity = max(0.0, ew_equity * (1.0 + float(np.mean(sym_rets))))
                 ew_universe_equities.append(ew_equity)
-            prev_ew_closes = ew_mtm_prices
+            if active_universe_syms is not None:
+                prev_ew_closes = {
+                    sym: px
+                    for sym, px in all_valid_mtm.items()
+                    if sym in active_universe_syms
+                }
+            else:
+                prev_ew_closes = all_valid_mtm
 
             if eff_timing == "next_open":
                 # 6. Compute strictly point-in-time signals & queue approved orders for bar t+1 open
@@ -585,12 +691,15 @@ class BacktestEngine:
                         mtm_prices=mtm_prices,
                         equity=equity,
                         daily_pnl_pct=daily_pnl_pct,
-                        drawdown_pct=drawdown_pct,
+                        drawdown_pct=risk_drawdown_pct,
                         allow_shorting=allow_shorting,
                         use_news=use_news,
                         exposure_multiplier=exposure_multiplier,
                         label=label,
                         carried_symbols=carried_symbols,
+                        active_universe_syms=active_universe_syms,
+                        symbol_sectors=symbol_sectors,
+                        sector_etf_map=sector_etf_map,
                     )
                     pending_queue.extend(new_items)
 
@@ -757,6 +866,60 @@ class BacktestEngine:
                     state.total_cash_yield_usd += cash_yield
 
         return pit_rf_apr * day_frac
+
+    def _force_close_delisted(
+        self,
+        *,
+        state: _SimState,
+        sym: str,
+        lot: _PositionLot,
+        base_px: float,
+        ts: datetime,
+        haircut_pct: float,
+        bt_cfg: BacktestConfig,
+    ) -> None:
+        haircut = max(0.0, min(1.0, float(haircut_pct)))
+        if lot.qty > 1e-9:
+            fill_px = round(base_px * (1.0 - haircut), 6)
+            qty = lot.qty
+            slip_usd = qty * max(0.0, base_px - fill_px)
+            sec_fee = qty * fill_px * (bt_cfg.sec_sell_fee_bps / 10_000.0)
+            state.cash += qty * fill_px - sec_fee
+            gross_pnl = (fill_px - lot.avg_entry_price) * qty
+            net_pnl = gross_pnl - sec_fee - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
+            side = "long"
+        else:
+            fill_px = round(base_px * (1.0 + haircut), 6)
+            qty = abs(lot.qty)
+            slip_usd = qty * max(0.0, fill_px - base_px)
+            sec_fee = 0.0
+            state.cash -= qty * fill_px
+            gross_pnl = (lot.avg_entry_price - fill_px) * qty
+            net_pnl = gross_pnl - lot.accrued_sec_fee_usd - lot.accrued_borrow_usd
+            side = "short"
+
+        state.total_traded_notional += qty * fill_px
+        state.total_orders_filled += 1
+        state.total_slippage_usd += slip_usd
+        state.total_sec_fees_usd += sec_fee
+        state.trades.append(
+            SimulatedTrade(
+                symbol=sym,
+                side=side,
+                entry_time=lot.entry_time,
+                exit_time=ts,
+                qty=qty,
+                entry_price=round(lot.avg_entry_price, 6),
+                exit_price=round(fill_px, 6),
+                gross_pnl=round(gross_pnl, 4),
+                net_pnl=round(net_pnl, 4),
+                holding_days=max(0.0, (ts - lot.entry_time).total_seconds() / 86400.0),
+                exit_reason="delisted_forced_exit",
+            )
+        )
+        del state.positions[sym]
+        for tw in state.tranche_weights:
+            tw.pop(sym, None)
 
     def _close_lot_full(
         self,
@@ -1157,13 +1320,31 @@ class BacktestEngine:
         exposure_multiplier: float,
         label: str,
         carried_symbols: set[str],
+        active_universe_syms: frozenset[str] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> list[_PendingExecution]:
         ts_ns = int(pd.Timestamp(ts).as_unit("ns").value)
         pit_bars: dict[str, pd.DataFrame] = {}
         fresh_bar_ages: list[float] = []
 
+        needed_bar_syms: set[str] | None = None
+        if active_universe_syms is not None:
+            needed_bar_syms = (
+                set(active_universe_syms)
+                | {bt_cfg.benchmark_symbol.strip().upper()}
+                | {
+                    s.strip().upper()
+                    for s in (sector_etf_map.values() if sector_etf_map else ())
+                    if s.strip()
+                }
+                | set(state.positions.keys())
+            )
+
         feature_lb = max(_FEATURE_LOOKBACK_BARS, strat_cfg.m2_long_lookback + 48)
         for sym, df in sorted_bars.items():
+            if needed_bar_syms is not None and sym not in needed_bar_syms:
+                continue
             sym_last_ts = last_bar_ts.get(sym)
             if sym_last_ts is None:
                 continue
@@ -1210,6 +1391,20 @@ class BacktestEngine:
                 if hi_i > lo_i:
                     pit_sec[sym] = evs[lo_i:hi_i]
 
+        eff_universe_syms: frozenset[str] | None
+        if active_universe_syms is not None:
+            eff_universe_syms = active_universe_syms
+        elif self.universe_meta:
+            eff_universe_syms = frozenset(self.universe_meta.keys())
+        else:
+            eff_universe_syms = None
+
+        eff_sectors: Mapping[str, str] | None = (
+            symbol_sectors
+            if symbol_sectors is not None
+            else ({s: m.sector for s, m in self.universe_meta.items()} if self.universe_meta else None)
+        )
+
         signals = feature_engine.build_signals(
             as_of=ts,
             bars_by_symbol=pit_bars,
@@ -1219,8 +1414,26 @@ class BacktestEngine:
             fallback_rf_apr=bt_cfg.risk_free_rate_apr,
             sec_filings_by_symbol=pit_sec if pit_sec else None,
             restatement_blackout_days=risk_cfg.restatement_blackout_days,
-            universe_symbols=frozenset(self.universe_meta.keys()) if self.universe_meta else None,
+            universe_symbols=eff_universe_syms,
+            symbol_sectors=eff_sectors,
+            sector_etf_map=sector_etf_map,
         )
+
+        if strat_cfg.w_pead > 0.0 and signals:
+            signals = apply_stage2_finalist_overlay(
+                signals=signals,
+                bars_by_symbol=pit_bars,
+                held_symbols=set(state.positions.keys()),
+                as_of=ts,
+                finalist_pool_size=strat_cfg.finalist_pool_size,
+                w_pead=strat_cfg.w_pead,
+                w_trend=strat_cfg.w_trend,
+                w_pullback=strat_cfg.w_pullback,
+                w_news_sentiment=strat_cfg.w_news_sentiment if use_news else 0.0,
+                w_insider=strat_cfg.w_insider,
+                w_fip=strat_cfg.w_fip,
+                earnings_by_symbol=earnings_by_symbol,
+            )
 
         dials = ControlDials(
             pause_new_entries=False,
@@ -1231,15 +1444,142 @@ class BacktestEngine:
             updated_at=ts,
         )
         signed_pos = {sym: lot.qty for sym, lot in state.positions.items()}
-        proposed = portfolio_ctor.build_proposed_orders(
-            signals=signals,
-            current_positions=signed_pos,
-            prices=mtm_prices,
-            equity=equity,
-            dials=dials,
-            as_of=ts,
-            universe_meta=self.universe_meta,
-        )
+
+        if strat_cfg.rebalance_tranches > 1:
+            n_tranches = strat_cfg.rebalance_tranches
+            cur_weights: dict[str, float] = {}
+            for sym, qty in signed_pos.items():
+                px = mtm_prices.get(sym, 0.0)
+                if px > 0.0 and math.isfinite(px) and equity > 0.0:
+                    cur_weights[sym] = (qty * px) / equity
+
+            if active_universe_syms is not None:
+                for tw in state.tranche_weights:
+                    for sym in list(tw.keys()):
+                        if sym not in active_universe_syms:
+                            tw.pop(sym, None)
+
+            if not signals:
+                # Do not initialize empty tranches or advance rebalance_count when signals are empty
+                blended_weights = portfolio_ctor.compute_target_weights(
+                    signals=(),
+                    dials=dials,
+                    as_of=ts,
+                    universe_meta=self.universe_meta,
+                    current_weights=cur_weights,
+                )
+                if active_universe_syms is not None:
+                    for sym in list(signed_pos.keys()):
+                        if sym not in active_universe_syms:
+                            blended_weights[sym] = 0.0
+            else:
+                in_halt = (
+                    not math.isfinite(daily_pnl_pct)
+                    or daily_pnl_pct <= -risk_cfg.daily_loss_halt_pct
+                    or not math.isfinite(drawdown_pct)
+                    or drawdown_pct <= -risk_cfg.max_drawdown_halt_pct
+                )
+                if in_halt:
+                    # During kill-switch halt: do NOT insert phantom Pass-2 entries or advance tranche pointer;
+                    # only purge existing held symbols whose fresh target exited to 0.0 so Pass-1 exits run.
+                    fresh_weights = portfolio_ctor.compute_target_weights(
+                        signals=signals,
+                        dials=dials,
+                        as_of=ts,
+                        universe_meta=self.universe_meta,
+                        current_weights=cur_weights,
+                    )
+                    for tw in state.tranche_weights:
+                        for sym in list(tw.keys()):
+                            if abs(fresh_weights.get(sym, 0.0)) <= 1e-9:
+                                tw.pop(sym, None)
+                    if state.tranche_weights:
+                        all_tranche_syms: set[str] = set()
+                        for tw in state.tranche_weights:
+                            all_tranche_syms.update(tw.keys())
+                        blended_weights = {}
+                        for sym in all_tranche_syms:
+                            avg_w = sum(tw.get(sym, 0.0) for tw in state.tranche_weights) / float(
+                                len(state.tranche_weights)
+                            )
+                            blended_weights[sym] = 0.0 if abs(avg_w) < 1e-6 else avg_w
+                    else:
+                        blended_weights = {
+                            sym: (w if abs(fresh_weights.get(sym, 0.0)) > 1e-9 else 0.0)
+                            for sym, w in cur_weights.items()
+                        }
+                else:
+                    if state.rebalance_count == 0 or len(state.tranche_weights) != n_tranches:
+                        fresh_weights = portfolio_ctor.compute_target_weights(
+                            signals=signals,
+                            dials=dials,
+                            as_of=ts,
+                            universe_meta=self.universe_meta,
+                            current_weights=cur_weights,
+                        )
+                        nz_fresh = {
+                            k: v for k, v in fresh_weights.items() if abs(v) > 1e-9
+                        }
+                        state.tranche_weights = [dict(nz_fresh) for _ in range(n_tranches)]
+                    else:
+                        tranche_idx = state.rebalance_count % n_tranches
+                        prev_tranche_w = state.tranche_weights[tranche_idx]
+                        fresh_weights = portfolio_ctor.compute_target_weights(
+                            signals=signals,
+                            dials=dials,
+                            as_of=ts,
+                            universe_meta=self.universe_meta,
+                            current_weights=prev_tranche_w,
+                        )
+                        state.tranche_weights[tranche_idx] = {
+                            k: v for k, v in fresh_weights.items() if abs(v) > 1e-9
+                        }
+                    state.rebalance_count += 1
+
+                    all_tranche_syms = set()
+                    for tw in state.tranche_weights:
+                        all_tranche_syms.update(tw.keys())
+                    blended_weights = {}
+                    for sym in all_tranche_syms:
+                        avg_w = sum(tw.get(sym, 0.0) for tw in state.tranche_weights) / float(
+                            n_tranches
+                        )
+                        blended_weights[sym] = 0.0 if abs(avg_w) < 1e-6 else avg_w
+
+                if active_universe_syms is not None:
+                    for sym in list(signed_pos.keys()):
+                        if sym not in active_universe_syms:
+                            blended_weights[sym] = 0.0
+
+                blended_weights = portfolio_ctor.apply_portfolio_overlays(
+                    blended_weights,
+                    signals=signals,
+                    dials=dials,
+                    universe_meta=self.universe_meta,
+                    current_weights=cur_weights,
+                    as_of=ts,
+                )
+
+            proposed = portfolio_ctor.build_proposed_orders(
+                signals=signals,
+                current_positions=signed_pos,
+                prices=mtm_prices,
+                equity=equity,
+                dials=dials,
+                as_of=ts,
+                universe_meta=self.universe_meta,
+                target_weights_override=blended_weights,
+            )
+        else:
+            proposed = portfolio_ctor.build_proposed_orders(
+                signals=signals,
+                current_positions=signed_pos,
+                prices=mtm_prices,
+                equity=equity,
+                dials=dials,
+                as_of=ts,
+                universe_meta=self.universe_meta,
+            )
         proposed = [o for o in proposed if o.symbol not in carried_symbols]
 
         risk_state = PortfolioRiskState(
@@ -1283,6 +1623,9 @@ class BacktestEngine:
         end_date: date | None = None,
         execution_timing: Literal["same_close", "next_open"] | None = None,
         n_trials: int = 1,
+        eligible_symbols_by_date: Mapping[date, frozenset[str]] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> list[BacktestResult]:
         """Run the 4-way A/B ablation matrix on identical market data."""
         variants = [
@@ -1305,6 +1648,9 @@ class BacktestEngine:
                 use_news=use_news,
                 execution_timing=execution_timing,
                 n_trials=n_trials,
+                eligible_symbols_by_date=eligible_symbols_by_date,
+                symbol_sectors=symbol_sectors,
+                sector_etf_map=sector_etf_map,
             )
             for label, allow_short, use_news in variants
         ]
@@ -1334,6 +1680,9 @@ class BacktestEngine:
         allow_shorting: bool = True,
         use_news: bool = True,
         execution_timing: Literal["same_close", "next_open"] | None = None,
+        eligible_symbols_by_date: Mapping[date, frozenset[str]] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> list[BacktestMetrics]:
         """Evaluate fixed-parameter strategy across chronological out-of-sample calendar folds."""
         all_dates = self._extract_sorted_dates(bars_by_symbol)
@@ -1358,6 +1707,9 @@ class BacktestEngine:
                 allow_shorting=allow_shorting,
                 use_news=use_news,
                 execution_timing=execution_timing,
+                eligible_symbols_by_date=eligible_symbols_by_date,
+                symbol_sectors=symbol_sectors,
+                sector_etf_map=sector_etf_map,
             )
             fold_metrics.append(res.metrics)
         return fold_metrics
@@ -1377,6 +1729,9 @@ class BacktestEngine:
         allow_shorting: bool = True,
         use_news: bool = True,
         execution_timing: Literal["same_close", "next_open"] | None = None,
+        eligible_symbols_by_date: Mapping[date, frozenset[str]] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> CPCVSummary:
         """Combinatorial Purged Cross-Validation (CPCV) across C(n_groups, k_test_groups) paths.
 
@@ -1458,6 +1813,9 @@ class BacktestEngine:
                         allow_shorting=allow_shorting,
                         use_news=use_news,
                         execution_timing=eff_timing,
+                        eligible_symbols_by_date=eligible_symbols_by_date,
+                        symbol_sectors=symbol_sectors,
+                        sector_etf_map=sector_etf_map,
                     )
                 span_runs.append(span_cache[cache_key])
 

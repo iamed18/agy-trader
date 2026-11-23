@@ -34,6 +34,15 @@ from agy_trader.backtest.sp500_cohorts import (
     select_point_in_time_candidates,
     validate_research_dir,
 )
+from agy_trader.backtest.v3_benchmark import (
+    run_v3_benchmark,
+)
+from agy_trader.backtest.v3_universe import (
+    V3_CORE_ETFS,
+    fetch_and_cache_fred_macro,
+    fetch_and_cache_v3_sip_bars,
+    load_or_fetch_v3_equity_pool,
+)
 from agy_trader.core.blackout import (
     NON_EQUITY_ETF_SECTORS,
     load_universe_for_blackout,
@@ -970,6 +979,149 @@ def sp500_cohorts_cmd(
     console.print(
         f"Outputs saved to [green]{output_dir}[/green] "
         f"(summary.json, summary.md, cohorts_manifest.json, {len(plot_paths)} plots)"
+    )
+
+
+@app.command("v3-research")
+def v3_research_cmd(
+    ctx: typer.Context,
+    research_dir: Annotated[
+        Path,
+        typer.Option("--research-dir", help="Isolated research Parquet and metadata cache directory"),
+    ] = Path("data/parquet_v3_research"),
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Output directory for reports, summary JSON/MD, and plots"),
+    ] = Path("reports/v3_research"),
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override data directory for safety checks"),
+    ] = None,
+    config_dir: Annotated[
+        Path | None,
+        typer.Option("--config-dir", help="Override config directory"),
+    ] = None,
+    top_n: Annotated[
+        int,
+        typer.Option("--top-n", min=10, help="Monthly point-in-time universe size"),
+    ] = 200,
+    hysteresis: Annotated[
+        int,
+        typer.Option("--hysteresis", min=0, help="Turnover buffer for monthly universe ranking"),
+    ] = 50,
+    refresh_data: Annotated[
+        bool,
+        typer.Option("--refresh-data", help="Re-fetch constituents, macro, and bars from providers"),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON output"),
+    ] = False,
+) -> None:
+    """Run V3 research 11-year data acquisition, progressive 6-track benchmarks, stress checks, and plots."""
+    settings, resolved_data, resolved_config = _resolve_paths(ctx, data_dir, config_dir)
+
+    try:
+        app_cfg: AppConfig = load_app_config(resolved_config)
+        validate_research_dir(research_dir, data_dir=resolved_data)
+    except (FileNotFoundError, OSError, TypeError, ValueError, ValidationError, yaml.YAMLError) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    try:
+        pool = load_or_fetch_v3_equity_pool(research_dir, refresh=refresh_data)
+        macro_points = fetch_and_cache_fred_macro(
+            research_dir, fred_api_key=settings.fred_api_key, refresh=refresh_data
+        )
+
+        pool_symbols = [c.symbol for c in pool]
+        all_symbols = list(dict.fromkeys(pool_symbols + list(V3_CORE_ETFS) + ["SPY"]))
+
+        bars_by_symbol = fetch_and_cache_v3_sip_bars(
+            all_symbols,
+            research_dir,
+            api_key=settings.alpaca_api_key,
+            secret_key=settings.alpaca_secret_key,
+            refresh=refresh_data,
+        )
+
+        report, _ = run_v3_benchmark(
+            bars_by_symbol,
+            pool,
+            app_config=app_cfg,
+            macro_points=macro_points,
+            top_n=top_n,
+            hysteresis=hysteresis,
+            output_dir=output_dir,
+        )
+        summary_json_path = output_dir / "summary.json"
+        summary_md_path = output_dir / "summary.md"
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        ValidationError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    if json_output:
+        _emit_json(
+            {
+                "summary_json": str(summary_json_path),
+                "summary_md": str(summary_md_path),
+                "plot_paths": report.plot_paths,
+                "is_selected_track_id": report.is_selected_track_id,
+                "is_selected_reason": report.is_selected_reason,
+                "pool_total": report.pool_total,
+                "delisted_count": report.delisted_count,
+                "bars_loaded": report.bars_loaded,
+                "tracks_count": len(report.tracks),
+            }
+        )
+        return
+
+    table = Table(
+        title=f"V3 Benchmark Progressive Ladder: IS ({report.is_window[0]}..{report.is_window[1]}) vs OOS ({report.oos_window[0]}..{report.oos_window[1]})"
+    )
+    table.add_column("Track", style="cyan")
+    table.add_column("Name", style="white")
+    table.add_column("IS CAGR", justify="right")
+    table.add_column("IS XS-SR", justify="right")
+    table.add_column("IS MaxDD", justify="right")
+    table.add_column("OOS CAGR", justify="right")
+    table.add_column("OOS XS-SR", justify="right")
+    table.add_column("OOS MaxDD", justify="right")
+    table.add_column("Full CAGR", justify="right")
+    table.add_column("Full XS-SR", justify="right")
+
+    for t in report.tracks:
+        star = " ★" if t.track_id == report.is_selected_track_id else ""
+        table.add_row(
+            f"{t.track_id}{star}",
+            t.name,
+            f"{t.is_metrics.cagr_pct:+.1f}%",
+            f"{t.is_metrics.excess_sharpe_ratio:.2f}",
+            f"{t.is_metrics.max_drawdown_pct:.1f}%",
+            f"{t.oos_metrics.cagr_pct:+.1f}%",
+            f"{t.oos_metrics.excess_sharpe_ratio:.2f}",
+            f"{t.oos_metrics.max_drawdown_pct:.1f}%",
+            f"{t.full_metrics.cagr_pct:+.1f}%",
+            f"{t.full_metrics.excess_sharpe_ratio:.2f}",
+        )
+    console.print(table)
+    console.print(
+        f"Anti-peeking IS Winner: [bold green]{report.is_selected_track_id}[/bold green] "
+        f"({report.is_selected_reason})"
+    )
+    console.print(
+        f"Outputs saved to [green]{output_dir}[/green] "
+        f"(summary.json, summary.md, {len(report.plot_paths)} plots)"
     )
 
 

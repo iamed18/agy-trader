@@ -5,6 +5,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -227,6 +228,7 @@ def compute_macro_regime_scale(
     spy_vol_surge_thresh: float = 1.65,
     spy_ret10_crash_thresh: float = -0.055,
     spy_ret10_crash_scale: float | None = None,
+    regime_mode: Literal["legacy_stacked", "daniel_moskowitz"] = "legacy_stacked",
 ) -> float:
     """Compute strictly point-in-time macro risk scaling in [floor, 1.0].
 
@@ -236,6 +238,76 @@ def compute_macro_regime_scale(
     crash brakes computed strictly on bars with `timestamp <= as_of_utc`.
     """
     as_of_utc = ensure_utc(as_of)
+
+    if regime_mode == "daniel_moskowitz":
+        spy_ann_vol_20d = 0.15
+        bear_state = False
+        last_c = 0.0
+        ema_50 = 0.0
+        if spy_bars is not None and not spy_bars.empty:
+            spy_hist_dm = spy_bars.loc[spy_bars["timestamp"] <= as_of_utc].sort_values("timestamp")
+            if len(spy_hist_dm) >= 51:
+                closes_dm = spy_hist_dm["close"].astype(float)
+                if _is_valid_price_series(closes_dm.tail(51)):
+                    log_rets_dm = np.log(closes_dm / closes_dm.shift(1)).dropna()
+                    cand_vol = float(log_rets_dm.tail(20).std(ddof=1) * math.sqrt(252.0))
+                    if math.isfinite(cand_vol) and cand_vol > 0.0:
+                        spy_ann_vol_20d = cand_vol
+                    ema_50 = float(closes_dm.ewm(span=50, adjust=False).mean().iloc[-1])
+                    last_c = float(closes_dm.iloc[-1])
+                    if len(spy_hist_dm) >= 200:
+                        closes_200 = closes_dm.tail(200)
+                        if _is_valid_price_series(closes_200):
+                            sma_200 = float(closes_200.mean())
+                            if math.isfinite(sma_200) and last_c < sma_200:
+                                bear_state = True
+                    if len(spy_hist_dm) >= 253:
+                        closes_253 = closes_dm.tail(253)
+                        if _is_valid_price_series(closes_253):
+                            c_252 = float(closes_253.iloc[0])
+                            if math.isfinite(c_252) and last_c < c_252:
+                                bear_state = True
+
+        vix_dm: MacroPoint | None = None
+        hy_dm: MacroPoint | None = None
+        if macro_points:
+            latest_dm: dict[str, MacroPoint] = {}
+            for pt in macro_points:
+                if not math.isfinite(pt.value):
+                    continue
+                if macro_point_available_at_utc(pt) > as_of_utc:
+                    continue
+                prev = latest_dm.get(pt.series_id)
+                if prev is None or pt.as_of_date > prev.as_of_date:
+                    latest_dm[pt.series_id] = pt
+            vix_dm = latest_dm.get("VIXCLS")
+            hy_dm = latest_dm.get("BAMLH0A0HYM2")
+
+        if vix_dm is not None and vix_dm.value >= 28.0:
+            bear_state = True
+
+        if bear_state and (
+            spy_ann_vol_20d >= 0.22 or (vix_dm is not None and vix_dm.value >= 25.0)
+        ):
+            dm_scale = min(1.0, 0.20 / max(spy_ann_vol_20d, 0.10))
+            if hy_dm is not None and hy_dm.value >= 6.0:
+                dm_scale = min(dm_scale, 0.55)
+            if vix_dm is not None and vix_dm.value >= 35.0:
+                dm_scale = min(dm_scale, 0.45)
+            dm_scale = max(0.40, dm_scale)
+        else:
+            if (
+                spy_ann_vol_20d >= 0.30
+                and last_c > 0.0
+                and math.isfinite(ema_50)
+                and last_c < ema_50
+            ):
+                dm_scale = 0.85
+            else:
+                dm_scale = 1.0
+
+        return round(max(0.40, min(1.0, dm_scale)), 4)
+
     scale = 1.0
 
     # 1. SPY market volatility & trend proxy (strictly <= as_of_utc)
@@ -457,6 +529,8 @@ class FeatureEngine:
         restatement_blackout_days: int = 10,
         *,
         universe_symbols: set[str] | frozenset[str] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> list[SignalRow]:
         """Compute cross-sectional SignalRows strictly using data <= as_of (UTC)."""
         as_of_utc = ensure_utc(as_of)
@@ -476,6 +550,8 @@ class FeatureEngine:
                 sec_filings_by_symbol=sec_filings_by_symbol,
                 restatement_blackout_days=restatement_blackout_days,
                 universe_symbols=norm_universe,
+                symbol_sectors=symbol_sectors,
+                sector_etf_map=sector_etf_map,
             )
 
         news_map = news_by_symbol or {}
@@ -508,11 +584,12 @@ class FeatureEngine:
             spy_vol_surge_thresh=self.config.spy_vol_surge_thresh,
             spy_ret10_crash_thresh=self.config.spy_ret10_crash_thresh,
             spy_ret10_crash_scale=self.config.spy_ret10_crash_scale,
+            regime_mode=self.config.regime_mode,
         )
 
         raw_rows: list[_RawSymbolFeatures] = []
         for symbol in sorted(bars_by_symbol.keys()):
-            if norm_universe is not None and symbol not in norm_universe:
+            if norm_universe is not None and symbol.strip().upper() not in norm_universe:
                 continue
             df = bars_by_symbol[symbol]
             if df.empty:
@@ -669,9 +746,16 @@ class FeatureEngine:
         sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
         restatement_blackout_days: int = 10,
         universe_symbols: set[str] | frozenset[str] | None = None,
+        symbol_sectors: Mapping[str, str] | None = None,
+        sector_etf_map: Mapping[str, str] | None = None,
     ) -> list[SignalRow]:
         """Compute multi-horizon OPUS-M2 + CAPM residual Sharpe + 60d peer correlations."""
         as_of_ns = np.int64(pd.Timestamp(as_of_utc).value)
+        norm_universe: frozenset[str] | None = (
+            frozenset(s.strip().upper() for s in universe_symbols if s.strip())
+            if universe_symbols is not None
+            else None
+        )
         news_map = news_by_symbol or {}
         sec_map = sec_filings_by_symbol or {}
         allowed_sources: frozenset[str] | None = (
@@ -701,6 +785,33 @@ class FeatureEngine:
                     spy_lr = raw_spy_lr
                     spy_lr_ts = raw_spy_ts
 
+        # Precompute sector ETF (ts_vals, lr_vals) arrays once per rebalance call
+        sector_etf_lr_by_sym: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        if self.config.use_sector_residual and sector_etf_map:
+            for raw_etf_sym in set(sector_etf_map.values()):
+                etf_sym = raw_etf_sym.strip().upper()
+                if not etf_sym or etf_sym in sector_etf_lr_by_sym:
+                    continue
+                etf_df = bars_by_symbol.get(etf_sym)
+                if etf_df is None:
+                    etf_df = bars_by_symbol.get(raw_etf_sym)
+                if etf_df is None or etf_df.empty:
+                    continue
+                etf_arrs = _sorted_bars_arrays(etf_df, as_of_ns)
+                if etf_arrs is None:
+                    continue
+                ets, ec, _, _ = etf_arrs
+                if len(ec) >= MIN_HISTORY_BARS and np.all(
+                    np.isfinite(ec[-MIN_HISTORY_BARS:]) & (ec[-MIN_HISTORY_BARS:] > 0.0)
+                ):
+                    raw_etf_lr = np.log(ec[1:] / ec[:-1])
+                    raw_etf_ts = ets[1:]
+                    valid_etf = np.isfinite(raw_etf_lr)
+                    if not np.all(valid_etf):
+                        raw_etf_lr = raw_etf_lr[valid_etf]
+                        raw_etf_ts = raw_etf_ts[valid_etf]
+                    sector_etf_lr_by_sym[etf_sym] = (raw_etf_ts, raw_etf_lr)
+
         macro_scale = compute_macro_regime_scale(
             as_of=as_of_utc,
             spy_bars=spy_df,
@@ -711,6 +822,7 @@ class FeatureEngine:
             spy_vol_surge_thresh=self.config.spy_vol_surge_thresh,
             spy_ret10_crash_thresh=self.config.spy_ret10_crash_thresh,
             spy_ret10_crash_scale=self.config.spy_ret10_crash_scale,
+            regime_mode=self.config.regime_mode,
         )
 
         raw_items: list[dict[str, float | int | bool | str]] = []
@@ -721,7 +833,8 @@ class FeatureEngine:
         med_skip = self.config.m2_med_skip
 
         for symbol in sorted(bars_by_symbol.keys()):
-            if universe_symbols is not None and symbol not in universe_symbols:
+            norm_sym = symbol.strip().upper()
+            if norm_universe is not None and norm_sym not in norm_universe:
                 continue
             arrs = _sorted_bars_arrays(bars_by_symbol[symbol], as_of_ns)
             if arrs is None:
@@ -767,6 +880,12 @@ class FeatureEngine:
             shp_252_s21 = _seg_sharpe(lr_vals, long_lb, long_skip, shp_120)
             shp_126_s10 = _seg_sharpe(lr_vals, med_lb, med_skip, shp_120)
 
+            eff_sk_long = long_skip if n_lr >= (60 + long_skip) else 0
+            seg_long = lr_vals[max(0, n_lr - long_lb) : n_lr - eff_sk_long]
+            fip_seg = seg_long if len(seg_long) >= 25 else lr120
+            fip_raw = float(np.mean(fip_seg > 0.0) - np.mean(fip_seg < 0.0))
+            max_jump_raw = float(np.max(np.abs(fip_seg)))
+
             rshp_252_s21 = shp_252_s21
             if spy_lr is not None and spy_lr_ts is not None:
                 idx_s = np.searchsorted(spy_lr_ts, lr_ts)
@@ -780,6 +899,7 @@ class FeatureEngine:
                     if len(pos_a) >= 45:
                         ja = lr_vals[pos_a]
                         jm = spy_lr[pos_s]
+                        j_ts = lr_ts[pos_a]
                         nj = len(ja)
                         sk21 = long_skip if nj >= 80 else 0
                         lo_j = max(0, nj - long_lb)
@@ -795,6 +915,60 @@ class FeatureEngine:
                                 al = float(np.mean(a_seg)) - b * float(np.mean(m_seg))
                                 rs = max(float(np.std(a_seg - (al + b * m_seg), ddof=1)), 0.004)
                                 rshp_252_s21 = (al / rs) * math.sqrt(252.0)
+
+                            if self.config.use_sector_residual and sector_etf_lr_by_sym:
+                                sec_name = (
+                                    (symbol_sectors or {}).get(symbol, "")
+                                    or (symbol_sectors or {}).get(norm_sym, "")
+                                )
+                                raw_sec_etf = (sector_etf_map or {}).get(sec_name, "")
+                                sec_etf = raw_sec_etf.strip().upper()
+                                if (
+                                    sec_etf
+                                    and sec_etf != norm_sym
+                                    and sec_etf != benchmark_symbol.strip().upper()
+                                    and sec_etf in sector_etf_lr_by_sym
+                                ):
+                                    sec_ts_arr, sec_lr_arr = sector_etf_lr_by_sym[sec_etf]
+                                    seg_ts = j_ts[lo_j:hi_j]
+                                    idx_sec = np.searchsorted(sec_ts_arr, seg_ts)
+                                    valid_sec = idx_sec < len(sec_ts_arr)
+                                    if np.any(valid_sec):
+                                        pos_seg = np.flatnonzero(valid_sec)
+                                        pos_sec = idx_sec[pos_seg]
+                                        eq_sec = seg_ts[pos_seg] == sec_ts_arr[pos_sec]
+                                        pos_seg = pos_seg[eq_sec]
+                                        pos_sec = pos_sec[eq_sec]
+                                        if len(pos_seg) >= 45:
+                                            stock_seg = a_seg[pos_seg]
+                                            spy_seg = m_seg[pos_seg]
+                                            sec_seg = sec_lr_arr[pos_sec]
+                                            n_obs = len(stock_seg)
+                                            x_mat = np.column_stack(
+                                                [
+                                                    np.ones(n_obs, dtype=np.float64),
+                                                    spy_seg,
+                                                    sec_seg,
+                                                ]
+                                            )
+                                            try:
+                                                cond = float(np.linalg.cond(x_mat))
+                                            except np.linalg.LinAlgError:
+                                                cond = float("inf")
+                                            if math.isfinite(cond) and cond < 1e6:
+                                                coeffs, _, _, _ = np.linalg.lstsq(
+                                                    x_mat, stock_seg, rcond=None
+                                                )
+                                                if len(coeffs) == 3 and bool(
+                                                    np.all(np.isfinite(coeffs))
+                                                ):
+                                                    alpha_2f = float(coeffs[0])
+                                                    resid_2f = stock_seg - (x_mat @ coeffs)
+                                                    rs_2f = float(np.std(resid_2f, ddof=1))
+                                                    if math.isfinite(rs_2f) and rs_2f > 1e-10:
+                                                        rshp_252_s21 = (
+                                                            alpha_2f / max(rs_2f, 0.004)
+                                                        ) * math.sqrt(252.0)
 
             sh_ok = False
             sh_strength = 0.0
@@ -834,6 +1008,8 @@ class FeatureEngine:
                     shp_252_s21,
                     rshp_252_s21,
                     pullback_5,
+                    fip_raw,
+                    max_jump_raw,
                     agg_sent.news_score,
                     agg_sent.velocity_z,
                     insider_score,
@@ -855,6 +1031,8 @@ class FeatureEngine:
                     "shp_252_s21": shp_252_s21,
                     "rshp_252_s21": rshp_252_s21,
                     "pullback_5": pullback_5,
+                    "fip_raw": fip_raw,
+                    "max_jump_raw": max_jump_raw,
                     "news_raw": agg_sent.news_score,
                     "news_velocity_z": agg_sent.velocity_z,
                     "news_count": agg_sent.article_count_window,
@@ -904,7 +1082,14 @@ class FeatureEngine:
 
         zs = {
             k: _zscore_cross_section([float(r[k]) for r in raw_items])
-            for k in ("shp_126_s10", "shp_252_s21", "rshp_252_s21", "pullback_5")
+            for k in (
+                "shp_126_s10",
+                "shp_252_s21",
+                "rshp_252_s21",
+                "pullback_5",
+                "fip_raw",
+                "max_jump_raw",
+            )
         }
         news_zs = [max(-3.0, min(3.0, float(r["news_raw"]) * 1.8)) for r in raw_items]
 
@@ -917,6 +1102,8 @@ class FeatureEngine:
         w_p = self.config.w_pullback
         w_n = self.config.w_news_sentiment
         w_i = self.config.w_insider
+        w_fip = self.config.w_fip
+        w_jump = self.config.w_jump_penalty
 
         signals: list[SignalRow] = []
         for idx, r in enumerate(raw_items):
@@ -927,16 +1114,30 @@ class FeatureEngine:
                 + w_r * zs["rshp_252_s21"][idx]
             )
             p_score = zs["pullback_5"][idx]
+            fip_z = zs["fip_raw"][idx]
+            jump_z = zs["max_jump_raw"][idx]
             n_score = news_zs[idx]
             i_score = float(r["insider_score"])
             eff_wn = w_n if int(r["news_count"]) > 0 else 0.0
             eff_wi = w_i if (w_i > 0.0 and bool(r["has_insider_activity"])) else 0.0
-            denom = w_t + w_p + eff_wn + eff_wi
-            composite = (
-                (w_t * t_score + w_p * p_score + eff_wn * n_score + eff_wi * i_score) / denom
-                if denom > 0.0
-                else 0.0
-            )
+            if w_fip > 0.0 or w_jump > 0.0:
+                denom = w_t + w_p + eff_wn + eff_wi + w_fip
+                num = (
+                    w_t * t_score
+                    + w_p * p_score
+                    + eff_wn * n_score
+                    + eff_wi * i_score
+                    + w_fip * fip_z
+                    - w_jump * max(0.0, jump_z)
+                )
+                composite = num / denom if denom > 0.0 else 0.0
+            else:
+                denom = w_t + w_p + eff_wn + eff_wi
+                composite = (
+                    (w_t * t_score + w_p * p_score + eff_wn * n_score + eff_wi * i_score) / denom
+                    if denom > 0.0
+                    else 0.0
+                )
             signals.append(
                 SignalRow(
                     as_of=as_of_utc,
@@ -956,6 +1157,7 @@ class FeatureEngine:
                     safe_haven_strength=float(r["sh_strength"]),
                     insider_score=round(i_score, 6),
                     has_recent_restatement=bool(r["has_recent_restatement"]),
+                    fip_score=round(fip_z, 6),
                 )
             )
         return signals

@@ -284,6 +284,9 @@ class SignalRow(_StrictModel):
     safe_haven_strength: float = 0.0
     insider_score: float = 0.0
     has_recent_restatement: bool = False
+    fip_score: float = 0.0
+    pead_score: float = 0.0
+    stage1_finalist: bool = True
 
     @field_validator("symbol")
     @classmethod
