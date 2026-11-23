@@ -286,6 +286,7 @@ class SignalRow(_StrictModel):
     has_recent_restatement: bool = False
     fip_score: float = 0.0
     pead_score: float = 0.0
+    mddv_60d: float = Field(default=0.0, ge=0.0)
     stage1_finalist: bool = True
 
     @field_validator("symbol")

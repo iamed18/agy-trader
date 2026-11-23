@@ -68,6 +68,12 @@ class StrategyConfig(BaseModel):
     m2_w_long: float = Field(default=0.50, ge=0.0, le=1.0)
     m2_w_med: float = Field(default=0.25, ge=0.0, le=1.0)
     m2_w_residual: float = Field(default=0.25, ge=0.0, le=1.0)
+    m2_w_raw_long: float = Field(default=0.0, ge=0.0, le=1.0)
+    m2_w_intermed: float = Field(default=0.0, ge=0.0, le=1.0)
+    m2_w_52w_high: float = Field(default=0.0, ge=0.0, le=1.0)
+    m2_w_reg_slope: float = Field(default=0.0, ge=0.0, le=1.0)
+    m2_w_liquidity: float = Field(default=0.0, ge=0.0, le=1.0)
+    reg_slope_lookback: int = Field(default=126, ge=40, le=252)
     w_trend: float = Field(default=0.45, ge=0.0, le=1.0)
     w_pullback: float = Field(default=0.25, ge=0.0, le=1.0)
     w_news_sentiment: float = Field(default=0.30, ge=0.0, le=1.0)
@@ -84,6 +90,7 @@ class StrategyConfig(BaseModel):
     rebalance_deadband_pct: float = Field(default=0.015, ge=0.0, le=0.5)
     allow_fractional_longs: bool = True
     rebalance_every_n_days: int = Field(default=1, ge=1, le=21)
+    rebalance_schedule: Literal["every_n_days", "monthly_first", "monthly_last"] = "every_n_days"
     hold_rank_buffer: int = Field(default=0, ge=0, le=50)
     exit_signal_threshold: float | None = Field(default=None, ge=-1.0, le=1.0)
     abs_momentum_filter: bool = False
@@ -95,6 +102,7 @@ class StrategyConfig(BaseModel):
     waterfill_weights: bool = False
     exempt_safe_havens_from_macro_scale: bool = False
     safe_haven_rotation_fraction: float = Field(default=0.0, ge=0.0, le=1.0)
+    exclude_safe_havens_from_equity_slots: bool = False
     spy_sma200_defensive_scale: float | None = Field(default=None, ge=0.0, le=1.0)
     spy_ema50_dual_scale: float | None = Field(default=None, ge=0.0, le=1.0)
     spy_vol_surge_scale: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -104,12 +112,16 @@ class StrategyConfig(BaseModel):
     use_sector_residual: bool = False
     w_fip: float = Field(default=0.0, ge=0.0, le=1.0)
     w_jump_penalty: float = Field(default=0.0, ge=0.0, le=1.0)
-    vol_sizing_mode: Literal["inv_atr", "capped_inv_vol", "equal"] = "inv_atr"
+    fip_gate_quantile: float | None = Field(default=None, ge=0.05, le=0.95)
+    max_stock_ann_vol: float | None = Field(default=None, gt=0.0, le=5.0)
+    trend_above_sma200_filter: bool = False
+    vol_sizing_mode: Literal["inv_atr", "capped_inv_vol", "equal", "liquidity_pow"] = "inv_atr"
+    liquidity_weight_power: float = Field(default=0.5, ge=0.0, le=1.0)
     vol_sizing_floor: float = Field(default=0.18, gt=0.0, le=1.0)
     vol_sizing_cap: float = Field(default=0.45, gt=0.0, le=2.0)
     portfolio_vol_target_ann: float | None = Field(default=None, gt=0.0, le=1.0)
     rebalance_tranches: int = Field(default=1, ge=1, le=8)
-    regime_mode: Literal["legacy_stacked", "daniel_moskowitz"] = "legacy_stacked"
+    regime_mode: Literal["legacy_stacked", "daniel_moskowitz", "none", "sma200_only"] = "legacy_stacked"
     w_pead: float = Field(default=0.0, ge=0.0, le=1.0)
     finalist_pool_size: int = Field(default=40, ge=5, le=200)
 
@@ -145,16 +157,40 @@ class StrategyConfig(BaseModel):
         if self.vol_sizing_cap < self.vol_sizing_floor:
             raise ValueError("vol_sizing_cap must be >= vol_sizing_floor")
         if self.momentum_mode == "m2_residual":
-            m2_total = self.m2_w_long + self.m2_w_med + self.m2_w_residual
+            m2_total = (
+                self.m2_w_long
+                + self.m2_w_med
+                + self.m2_w_residual
+                + self.m2_w_raw_long
+                + self.m2_w_intermed
+                + self.m2_w_52w_high
+                + self.m2_w_reg_slope
+                + self.m2_w_liquidity
+            )
             if m2_total <= 0.0:
                 raise ValueError(
-                    "m2_residual weights (m2_w_long, m2_w_med, m2_w_residual) must sum to > 0"
+                    "m2_residual weights (m2_w_long, m2_w_med, m2_w_residual, "
+                    "m2_w_raw_long, m2_w_intermed, m2_w_52w_high, m2_w_reg_slope, "
+                    "m2_w_liquidity) must sum to > 0"
                 )
         else:
-            if self.w_fip > 0.0 or self.w_jump_penalty > 0.0 or self.use_sector_residual:
+            if (
+                self.w_fip > 0.0
+                or self.w_jump_penalty > 0.0
+                or self.use_sector_residual
+                or self.m2_w_raw_long > 0.0
+                or self.m2_w_intermed > 0.0
+                or self.m2_w_52w_high > 0.0
+                or self.m2_w_reg_slope > 0.0
+                or self.m2_w_liquidity > 0.0
+                or self.fip_gate_quantile is not None
+                or self.max_stock_ann_vol is not None
+                or self.trend_above_sma200_filter
+                or self.vol_sizing_mode == "liquidity_pow"
+            ):
                 raise ValueError(
-                    "w_fip > 0, w_jump_penalty > 0, and use_sector_residual=True require "
-                    "momentum_mode == 'm2_residual'"
+                    "V3/V4 residual, FIP, raw/intermed/52w/slope/liquidity momentum, "
+                    "liquidity_pow sizing, and stage-1 gate fields require momentum_mode == 'm2_residual'"
                 )
         if self.news_lookback_hours < self.news_half_life_hours:
             raise ValueError("news_lookback_hours must be >= news_half_life_hours")

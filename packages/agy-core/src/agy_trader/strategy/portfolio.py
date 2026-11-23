@@ -156,6 +156,10 @@ class PortfolioConstructor:
             if s.symbol not in frozen_set
             and s.symbol not in blacklist
             and s.symbol in universe_meta
+            and not (
+                self.strategy.exclude_safe_havens_from_equity_slots
+                and _is_safe_haven(s.symbol, universe_meta)
+            )
             and s.stage1_finalist
             and _long_abs_ok(s)
             and s.composite_score
@@ -185,6 +189,10 @@ class PortfolioConstructor:
                 and s.symbol not in blacklist
                 and s.symbol not in selected_long_syms
                 and s.symbol in universe_meta
+                and not (
+                    self.strategy.exclude_safe_havens_from_equity_slots
+                    and _is_safe_haven(s.symbol, universe_meta)
+                )
                 and universe_meta[s.symbol].shortable
                 and universe_meta[s.symbol].easy_to_borrow
                 and s.ret_5d < self.risk.short_squeeze_5d_return_cap
@@ -446,6 +454,8 @@ class PortfolioConstructor:
                 min(self.strategy.vol_sizing_cap, max(s.ann_vol, 0.05)),
             )
             base = 1.0 / clipped
+        elif mode == "liquidity_pow":
+            base = max(s.mddv_60d / 1e6, 1e-3) ** self.strategy.liquidity_weight_power
         else:
             base = 1.0
 

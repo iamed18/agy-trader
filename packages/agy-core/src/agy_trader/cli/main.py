@@ -43,6 +43,9 @@ from agy_trader.backtest.v3_universe import (
     fetch_and_cache_v3_sip_bars,
     load_or_fetch_v3_equity_pool,
 )
+from agy_trader.backtest.v4_monthly_research import (
+    run_v4_monthly_research,
+)
 from agy_trader.core.blackout import (
     NON_EQUITY_ETF_SECTORS,
     load_universe_for_blackout,
@@ -1118,6 +1121,167 @@ def v3_research_cmd(
     console.print(
         f"Anti-peeking IS Winner: [bold green]{report.is_selected_track_id}[/bold green] "
         f"({report.is_selected_reason})"
+    )
+    console.print(
+        f"Outputs saved to [green]{output_dir}[/green] "
+        f"(summary.json, summary.md, {len(report.plot_paths)} plots)"
+    )
+
+
+@app.command("v4-research")
+def v4_research_cmd(
+    ctx: typer.Context,
+    research_dir: Annotated[
+        Path,
+        typer.Option("--research-dir", help="Isolated research Parquet and metadata cache directory"),
+    ] = Path("data/parquet_v3_research"),
+    output_dir: Annotated[
+        Path,
+        typer.Option("--output-dir", help="Output directory for V4 monthly summary JSON/MD and plots"),
+    ] = Path("reports/v4_monthly_research"),
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", help="Override data directory for safety checks"),
+    ] = None,
+    config_dir: Annotated[
+        Path | None,
+        typer.Option("--config-dir", help="Override config directory"),
+    ] = None,
+    top_n: Annotated[
+        int,
+        typer.Option("--top-n", min=10, help="Monthly PIT universe size"),
+    ] = 200,
+    hysteresis: Annotated[
+        int,
+        typer.Option("--hysteresis", min=0, help="Turnover buffer for monthly universe ranking"),
+    ] = 50,
+    skip_cpcv: Annotated[
+        bool,
+        typer.Option("--skip-cpcv", help="Skip 15-path CPCV validation for faster execution"),
+    ] = False,
+    skip_plateau: Annotated[
+        bool,
+        typer.Option("--skip-plateau", help="Skip 2D top_k x buffer plateau grid for faster execution"),
+    ] = False,
+    skip_stress: Annotated[
+        bool,
+        typer.Option("--skip-stress", help="Skip execution/slippage/delisting/universe stress checks"),
+    ] = False,
+    refresh_data: Annotated[
+        bool,
+        typer.Option("--refresh-data", help="Re-fetch constituents, macro, and bars from providers"),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON output"),
+    ] = False,
+) -> None:
+    """Run V4 monthly-rebalance index-beating research, stress checks, CPCV, plateau, and plots."""
+    settings, resolved_data, _ = _resolve_paths(ctx, data_dir, config_dir)
+
+    try:
+        validate_research_dir(research_dir, data_dir=resolved_data)
+    except (OSError, TypeError, ValueError) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    try:
+        pool = load_or_fetch_v3_equity_pool(research_dir, refresh=refresh_data)
+        macro_points = fetch_and_cache_fred_macro(
+            research_dir, fred_api_key=settings.fred_api_key, refresh=refresh_data
+        )
+        pool_symbols = [c.symbol for c in pool]
+        all_symbols = list(dict.fromkeys(pool_symbols + list(V3_CORE_ETFS) + ["SPY"]))
+        bars_by_symbol = fetch_and_cache_v3_sip_bars(
+            all_symbols,
+            research_dir,
+            api_key=settings.alpaca_api_key,
+            secret_key=settings.alpaca_secret_key,
+            refresh=refresh_data,
+        )
+        report, _ = run_v4_monthly_research(
+            bars_by_symbol,
+            pool,
+            macro_points=macro_points,
+            top_n=top_n,
+            hysteresis=hysteresis,
+            run_stress=not skip_stress,
+            run_cpcv=not skip_cpcv,
+            run_plateau=not skip_plateau,
+            output_dir=output_dir,
+        )
+        summary_json_path = output_dir / "summary.json"
+        summary_md_path = output_dir / "summary.md"
+    except (
+        FileNotFoundError,
+        OSError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        ValidationError,
+        httpx.HTTPError,
+        json.JSONDecodeError,
+        sqlite3.Error,
+    ) as exc:
+        _fail(str(exc), json_output=json_output)
+        return
+
+    if json_output:
+        _emit_json(
+            {
+                "summary_json": str(summary_json_path),
+                "summary_md": str(summary_md_path),
+                "plot_paths": report.plot_paths,
+                "champion_id": report.champion_id,
+                "selection_reason": report.selection_reason,
+                "pool_total": report.pool_total,
+                "delisted_count": report.delisted_count,
+                "bars_loaded": report.bars_loaded,
+                "candidates_count": len(report.candidates),
+                "stress_count": len(report.stress_rows),
+                "plateau_count": len(report.plateau_cells),
+            }
+        )
+        return
+
+    table = Table(
+        title=f"V4 Monthly Research: IS ({report.is_window[0]}..{report.is_window[1]}) vs OOS ({report.oos_window[0]}..{report.oos_window[1]})"
+    )
+    table.add_column("Candidate", style="cyan")
+    table.add_column("IS CAGR", justify="right")
+    table.add_column("IS XS-SR", justify="right")
+    table.add_column("OOS CAGR", justify="right")
+    table.add_column("OOS XS-SR", justify="right")
+    table.add_column("10Y CAGR", justify="right")
+    table.add_column("10Y XS-SR", justify="right")
+    table.add_column("10Y MaxDD", justify="right")
+
+    for c in report.candidates:
+        star = " ★" if c.candidate_id == report.champion_id else ""
+        table.add_row(
+            f"{c.candidate_id}{star}",
+            f"{c.is_metrics.cagr_pct:+.1f}%",
+            f"{c.is_metrics.excess_sharpe_ratio:.2f}",
+            f"{c.oos_metrics.cagr_pct:+.1f}%",
+            f"{c.oos_metrics.excess_sharpe_ratio:.2f}",
+            f"{c.full_metrics.cagr_pct:+.1f}%",
+            f"{c.full_metrics.excess_sharpe_ratio:.2f}",
+            f"{c.full_metrics.max_drawdown_pct:.1f}%",
+        )
+    for b in report.benchmarks:
+        table.add_row(
+            f"[dim]{b.name}[/dim]",
+            f"{b.is_cagr_pct:+.1f}%",
+            f"{b.is_excess_sharpe:.2f}",
+            f"{b.oos_cagr_pct:+.1f}%",
+            f"{b.oos_excess_sharpe:.2f}",
+            f"{b.full_cagr_pct:+.1f}%",
+            f"{b.full_excess_sharpe:.2f}",
+            f"{b.full_max_drawdown_pct:.1f}%",
+        )
+    console.print(table)
+    console.print(
+        f"IS-Selected Champion: [bold green]{report.champion_id}[/bold green] ({report.selection_reason})"
     )
     console.print(
         f"Outputs saved to [green]{output_dir}[/green] "

@@ -759,6 +759,8 @@ def run_v3_benchmark(
                 symbol_sectors=symbol_sectors,
                 sector_etf_map=SECTOR_TO_ETF,
                 macro_points=macro_points,
+                start_date=is_start,
+                end_date=oos_end,
                 n_groups=6,
                 k_test_groups=2,
                 purge_days=21,

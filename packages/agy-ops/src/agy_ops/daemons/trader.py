@@ -690,7 +690,20 @@ class TraderDaemon(DaemonRunner):
         if not is_nyse_trading_day(now_et.date()):
             return None
 
-        if app_cfg.strategy.rebalance_every_n_days > 1:
+        schedule = app_cfg.strategy.rebalance_schedule
+        if schedule == "monthly_first":
+            probe = now_et.date() - timedelta(days=1)
+            while probe.month == now_et.date().month:
+                if is_nyse_trading_day(probe):
+                    return None
+                probe -= timedelta(days=1)
+        elif schedule == "monthly_last":
+            probe = now_et.date() + timedelta(days=1)
+            while probe.month == now_et.date().month:
+                if is_nyse_trading_day(probe):
+                    return None
+                probe += timedelta(days=1)
+        elif app_cfg.strategy.rebalance_every_n_days > 1:
             recent = self.db.get_daemon_events(
                 daemon_name=self.daemon_name, event_type="rebalance", limit=1
             )

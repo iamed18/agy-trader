@@ -8,9 +8,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
+
+_NY_TZ = ZoneInfo("America/New_York")
 
 from agy_trader.core.config import AppConfig, BacktestConfig, RiskConfig, StrategyConfig
 from agy_trader.core.models import (
@@ -28,6 +31,7 @@ from agy_trader.core.models import (
 from agy_trader.risk.engine import HardRiskEngine, PortfolioRiskState
 from agy_trader.strategy.features import (
     MIN_HISTORY_BARS,
+    SAFE_HAVEN_SYMBOLS,
     FeatureEngine,
     latest_pit_rf_apr,
 )
@@ -485,7 +489,25 @@ class BacktestEngine:
                 elif sym in last_known_close:
                     mtm_prices[sym] = last_known_close[sym]
 
-            is_rebalance_day = (bar_idx % strat_cfg.rebalance_every_n_days) == 0
+            if strat_cfg.rebalance_schedule == "monthly_first":
+                ts_et = ts.astimezone(_NY_TZ)
+                prev_et = sim_timestamps[bar_idx - 1].astimezone(_NY_TZ) if bar_idx > 0 else ts_et
+                is_rebalance_day = (
+                    bar_idx == 0
+                    or (ts_et.year, ts_et.month) != (prev_et.year, prev_et.month)
+                )
+            elif strat_cfg.rebalance_schedule == "monthly_last":
+                ts_et = ts.astimezone(_NY_TZ)
+                is_rebalance_day = bar_idx == 0 or (
+                    bar_idx + 1 < len(sim_timestamps)
+                    and (
+                        sim_timestamps[bar_idx + 1].astimezone(_NY_TZ).year,
+                        sim_timestamps[bar_idx + 1].astimezone(_NY_TZ).month,
+                    )
+                    != (ts_et.year, ts_et.month)
+                )
+            else:
+                is_rebalance_day = (bar_idx % strat_cfg.rebalance_every_n_days) == 0
             is_last_bar = ts == sim_timestamps[-1]
 
             if eff_timing == "same_close":
@@ -1328,6 +1350,11 @@ class BacktestEngine:
         pit_bars: dict[str, pd.DataFrame] = {}
         fresh_bar_ages: list[float] = []
 
+        safe_havens_in_meta: set[str] = (
+            {s for s in SAFE_HAVEN_SYMBOLS if s in self.universe_meta}
+            if strat_cfg.safe_haven_rotation_fraction > 0.0
+            else set()
+        )
         needed_bar_syms: set[str] | None = None
         if active_universe_syms is not None:
             needed_bar_syms = (
@@ -1339,6 +1366,7 @@ class BacktestEngine:
                     if s.strip()
                 }
                 | set(state.positions.keys())
+                | safe_havens_in_meta
             )
 
         feature_lb = max(_FEATURE_LOOKBACK_BARS, strat_cfg.m2_long_lookback + 48)
@@ -1393,7 +1421,11 @@ class BacktestEngine:
 
         eff_universe_syms: frozenset[str] | None
         if active_universe_syms is not None:
-            eff_universe_syms = active_universe_syms
+            eff_universe_syms = (
+                active_universe_syms | frozenset(safe_havens_in_meta)
+                if safe_havens_in_meta
+                else active_universe_syms
+            )
         elif self.universe_meta:
             eff_universe_syms = frozenset(self.universe_meta.keys())
         else:
@@ -1454,9 +1486,10 @@ class BacktestEngine:
                     cur_weights[sym] = (qty * px) / equity
 
             if active_universe_syms is not None:
+                allowed_tranche_syms = active_universe_syms | frozenset(safe_havens_in_meta)
                 for tw in state.tranche_weights:
                     for sym in list(tw.keys()):
-                        if sym not in active_universe_syms:
+                        if sym not in allowed_tranche_syms:
                             tw.pop(sym, None)
 
             if not signals:
@@ -1469,8 +1502,9 @@ class BacktestEngine:
                     current_weights=cur_weights,
                 )
                 if active_universe_syms is not None:
+                    allowed_tranche_syms = active_universe_syms | frozenset(safe_havens_in_meta)
                     for sym in list(signed_pos.keys()):
-                        if sym not in active_universe_syms:
+                        if sym not in allowed_tranche_syms:
                             blended_weights[sym] = 0.0
             else:
                 in_halt = (
@@ -1547,8 +1581,9 @@ class BacktestEngine:
                         blended_weights[sym] = 0.0 if abs(avg_w) < 1e-6 else avg_w
 
                 if active_universe_syms is not None:
+                    allowed_tranche_syms = active_universe_syms | frozenset(safe_havens_in_meta)
                     for sym in list(signed_pos.keys()):
-                        if sym not in active_universe_syms:
+                        if sym not in allowed_tranche_syms:
                             blended_weights[sym] = 0.0
 
                 blended_weights = portfolio_ctor.apply_portfolio_overlays(
@@ -1722,6 +1757,8 @@ class BacktestEngine:
         macro_points: Sequence[MacroPoint] | None = None,
         earnings_by_symbol: Mapping[str, Sequence[date]] | None = None,
         sec_filings_by_symbol: Mapping[str, Sequence[SecFilingEvent]] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
         n_groups: int = 6,
         k_test_groups: int = 2,
         purge_days: int = 21,
@@ -1749,6 +1786,18 @@ class BacktestEngine:
 
         all_dates = self._extract_sorted_dates(bars_by_symbol)
         eval_dates = all_dates[MIN_HISTORY_BARS:] if len(all_dates) > MIN_HISTORY_BARS else []
+        eff_start = start_date
+        if eligible_symbols_by_date:
+            earliest_sched = min(eligible_symbols_by_date.keys())
+            eff_start = (
+                max(eff_start, earliest_sched) if eff_start is not None else earliest_sched
+            )
+        if eff_start is not None or end_date is not None:
+            eval_dates = [
+                d
+                for d in eval_dates
+                if (eff_start is None or d >= eff_start) and (end_date is None or d <= end_date)
+            ]
         if len(eval_dates) < n_groups * 2:
             return CPCVSummary(
                 n_groups=n_groups,
@@ -1887,11 +1936,19 @@ class BacktestEngine:
         stitched_bm: list[float] = []
         stitched_ew: list[float] = []
 
-        cur_eq = float(initial_capital)
-        cur_bm = 100.0
-        cur_ew = float(initial_capital)
-
         first_res = span_runs[0][0]
+        cur_eq = (
+            float(first_res.equity_curve[0].equity)
+            if first_res.equity_curve
+            else float(initial_capital)
+        )
+        cur_bm = 100.0
+        cur_ew = (
+            float(span_runs[0][3][0])
+            if span_runs[0][3]
+            else float(initial_capital)
+        )
+
         if first_res.equity_curve:
             p0 = first_res.equity_curve[0]
             stitched_curve.append(
@@ -1910,7 +1967,7 @@ class BacktestEngine:
         total_sec_fees_usd = 0.0
         total_cash_yield_usd = 0.0
 
-        for res, rf_rates, bm_closes, ew_equities in span_runs:
+        for span_idx, (res, rf_rates, bm_closes, ew_equities) in enumerate(span_runs):
             all_trades.extend(res.trades)
             m = res.metrics
             total_orders_filled += m.total_orders_filled
@@ -1924,6 +1981,14 @@ class BacktestEngine:
                 avg_eq = float(np.mean([pt.equity for pt in res.equity_curve]))
                 years = max(m.trading_days / 252.0, 1.0 / 252.0)
                 total_traded_notional += m.annual_turnover * 2.0 * avg_eq * years
+
+            if span_idx > 0 and initial_capital > 0.0:
+                if res.equity_curve:
+                    ret0 = (res.equity_curve[0].equity / initial_capital) - 1.0
+                    cur_eq = max(0.0, cur_eq * (1.0 + ret0))
+                if ew_equities:
+                    ew_ret0 = (ew_equities[0] / initial_capital) - 1.0
+                    cur_ew = max(0.0, cur_ew * (1.0 + ew_ret0))
 
             for k in range(1, len(res.equity_curve)):
                 prev_e = res.equity_curve[k - 1].equity

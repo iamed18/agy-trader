@@ -228,7 +228,9 @@ def compute_macro_regime_scale(
     spy_vol_surge_thresh: float = 1.65,
     spy_ret10_crash_thresh: float = -0.055,
     spy_ret10_crash_scale: float | None = None,
-    regime_mode: Literal["legacy_stacked", "daniel_moskowitz"] = "legacy_stacked",
+    regime_mode: Literal[
+        "legacy_stacked", "daniel_moskowitz", "none", "sma200_only"
+    ] = "legacy_stacked",
 ) -> float:
     """Compute strictly point-in-time macro risk scaling in [floor, 1.0].
 
@@ -238,6 +240,28 @@ def compute_macro_regime_scale(
     crash brakes computed strictly on bars with `timestamp <= as_of_utc`.
     """
     as_of_utc = ensure_utc(as_of)
+
+    if regime_mode == "none":
+        return 1.0
+
+    if regime_mode == "sma200_only":
+        def_scale = (
+            spy_sma200_defensive_scale
+            if spy_sma200_defensive_scale is not None
+            else 0.50
+        )
+        if spy_bars is not None and not spy_bars.empty:
+            spy_hist_200 = spy_bars.loc[spy_bars["timestamp"] <= as_of_utc].sort_values(
+                "timestamp"
+            )
+            if len(spy_hist_200) >= 200:
+                closes_200 = spy_hist_200["close"].astype(float).tail(200)
+                if _is_valid_price_series(closes_200):
+                    sma_200 = float(closes_200.mean())
+                    last_c_200 = float(closes_200.iloc[-1])
+                    if math.isfinite(sma_200) and last_c_200 < sma_200:
+                        return round(max(0.0, min(1.0, float(def_scale))), 4)
+        return 1.0
 
     if regime_mode == "daniel_moskowitz":
         spy_ann_vol_20d = 0.15
@@ -476,7 +500,7 @@ def _seg_sharpe(lr_vals: np.ndarray, tot: int, sk: int, fallback: float) -> floa
 def _sorted_bars_arrays(
     df: pd.DataFrame,
     as_of_ns: np.int64,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     if df.empty:
         return None
     parsed = pd.to_datetime(df["timestamp"], utc=True)
@@ -489,22 +513,39 @@ def _sorted_bars_arrays(
     ts_all = parsed.dt.as_unit("ns").astype("int64").to_numpy()
     if ts_all.size == 0:
         return None
+    has_vol = "volume" in df.columns
     if not bool(np.all(ts_all[:-1] <= ts_all[1:])):
         order = np.argsort(ts_all, kind="mergesort")
         ts_all = ts_all[order]
         closes_all = df["close"].to_numpy(dtype=np.float64)[order]
         highs_all = df["high"].to_numpy(dtype=np.float64)[order]
         lows_all = df["low"].to_numpy(dtype=np.float64)[order]
+        volumes_all = (
+            df["volume"].to_numpy(dtype=np.float64)[order]
+            if has_vol
+            else np.zeros_like(closes_all)
+        )
     else:
         closes_all = df["close"].to_numpy(dtype=np.float64)
         highs_all = df["high"].to_numpy(dtype=np.float64)
         lows_all = df["low"].to_numpy(dtype=np.float64)
+        volumes_all = (
+            df["volume"].to_numpy(dtype=np.float64)
+            if has_vol
+            else np.zeros_like(closes_all)
+        )
     if ts_all[-1] <= as_of_ns:
-        return ts_all, closes_all, highs_all, lows_all
+        return ts_all, closes_all, highs_all, lows_all, volumes_all
     mask = ts_all <= as_of_ns
     if not np.any(mask):
         return None
-    return ts_all[mask], closes_all[mask], highs_all[mask], lows_all[mask]
+    return (
+        ts_all[mask],
+        closes_all[mask],
+        highs_all[mask],
+        lows_all[mask],
+        volumes_all[mask],
+    )
 
 
 class FeatureEngine:
@@ -772,7 +813,7 @@ class FeatureEngine:
         if spy_df is not None and not spy_df.empty:
             spy_arrs = _sorted_bars_arrays(spy_df, as_of_ns)
             if spy_arrs is not None:
-                sts, sc, _, _ = spy_arrs
+                sts, sc, _, _, _ = spy_arrs
                 if len(sc) >= MIN_HISTORY_BARS and np.all(
                     np.isfinite(sc[-MIN_HISTORY_BARS:]) & (sc[-MIN_HISTORY_BARS:] > 0.0)
                 ):
@@ -800,7 +841,7 @@ class FeatureEngine:
                 etf_arrs = _sorted_bars_arrays(etf_df, as_of_ns)
                 if etf_arrs is None:
                     continue
-                ets, ec, _, _ = etf_arrs
+                ets, ec, _, _, _ = etf_arrs
                 if len(ec) >= MIN_HISTORY_BARS and np.all(
                     np.isfinite(ec[-MIN_HISTORY_BARS:]) & (ec[-MIN_HISTORY_BARS:] > 0.0)
                 ):
@@ -839,7 +880,7 @@ class FeatureEngine:
             arrs = _sorted_bars_arrays(bars_by_symbol[symbol], as_of_ns)
             if arrs is None:
                 continue
-            ts_vals, closes, highs, lows = arrs
+            ts_vals, closes, highs, lows, volumes = arrs
             if len(closes) < MIN_HISTORY_BARS:
                 continue
             if not (
@@ -848,6 +889,11 @@ class FeatureEngine:
                 and np.all(np.isfinite(lows[-MIN_HISTORY_BARS:]) & (lows[-MIN_HISTORY_BARS:] > 0.0))
             ):
                 continue
+
+            bad_close_idx = np.flatnonzero(~(np.isfinite(closes) & (closes > 0.0)))
+            clean_closes = (
+                closes[int(bad_close_idx[-1]) + 1 :] if bad_close_idx.size > 0 else closes
+            )
 
             last_close = float(closes[-1])
             ret_5d = float(last_close / float(closes[-6]) - 1.0)
@@ -885,6 +931,44 @@ class FeatureEngine:
             fip_seg = seg_long if len(seg_long) >= 25 else lr120
             fip_raw = float(np.mean(fip_seg > 0.0) - np.mean(fip_seg < 0.0))
             max_jump_raw = float(np.max(np.abs(fip_seg)))
+
+            raw_ret_long = (
+                float(np.sum(seg_long)) if len(seg_long) >= 20 else float(np.sum(lr120))
+            )
+            raw_ret_252_s126 = (
+                float(np.sum(lr_vals[max(0, n_lr - 252) : n_lr - 126]))
+                if n_lr >= 180
+                else raw_ret_long
+            )
+            h_win = highs[-min(252, len(highs)) :]
+            valid_h = h_win[np.isfinite(h_win) & (h_win > 0.0)]
+            max_h = float(np.max(valid_h)) if valid_h.size > 0 else last_close
+            prox_52w_high = float(last_close / max_h) if max_h > 0.0 else 0.0
+
+            reg_lb = min(int(self.config.reg_slope_lookback), len(closes))
+            closes_reg = closes[-reg_lb:]
+            if reg_lb >= 20 and bool(np.all(np.isfinite(closes_reg) & (closes_reg > 0.0))):
+                y_reg = np.log(closes_reg)
+                x_reg = np.arange(reg_lb, dtype=np.float64)
+                dx = x_reg - float(np.mean(x_reg))
+                dy = y_reg - float(np.mean(y_reg))
+                ss_xx = float(np.dot(dx, dx))
+                ss_yy = float(np.dot(dy, dy))
+                ss_xy = float(np.dot(dx, dy))
+                if ss_xx <= 1e-12 or ss_yy <= 1e-12:
+                    reg_slope_r2 = 0.0
+                else:
+                    slope_reg = ss_xy / ss_xx
+                    r2_reg = min(1.0, max(0.0, (ss_xy * ss_xy) / (ss_xx * ss_yy)))
+                    reg_slope_r2 = float(np.clip(slope_reg * 252.0, -5.0, 5.0) * r2_reg)
+            else:
+                reg_slope_r2 = 0.0
+
+            above_sma200 = False
+            if len(closes) >= 200:
+                c200 = closes[-200:]
+                if bool(np.all(np.isfinite(c200) & (c200 > 0.0))):
+                    above_sma200 = bool(last_close >= float(np.mean(c200)))
 
             rshp_252_s21 = shp_252_s21
             if spy_lr is not None and spy_lr_ts is not None:
@@ -973,8 +1057,8 @@ class FeatureEngine:
             sh_ok = False
             sh_strength = 0.0
             if symbol in SAFE_HAVEN_SYMBOLS:
-                ema20 = _fast_ema_last(closes, 20)
-                sma50 = float(np.mean(closes[-50:]))
+                ema20 = _fast_ema_last(clean_closes, 20)
+                sma50 = float(np.mean(clean_closes[-50:]))
                 lr60 = lr_vals[-min(60, n_lr) :]
                 shp_60 = (
                     float(np.mean(lr60)) / max(float(np.std(lr60, ddof=1)), 0.004)
@@ -987,7 +1071,7 @@ class FeatureEngine:
                     + (0.3 if last_close > sma50 else 0.0),
                 )
 
-            rsi5 = _fast_rsi_last(closes, 5)
+            rsi5 = _fast_rsi_last(clean_closes, 5)
             pullback_5 = (50.0 - rsi5) / 25.0
 
             sym_news = _filter_news_by_sources(news_map.get(symbol, ()), allowed_sources)
@@ -999,6 +1083,21 @@ class FeatureEngine:
                 restatement_blackout_days=restatement_blackout_days,
             )
 
+            c_win_60 = closes[-min(60, len(closes)) :]
+            v_win_60 = volumes[-min(60, len(volumes)) :]
+            valid_dv = (
+                np.isfinite(c_win_60)
+                & (c_win_60 > 0.0)
+                & np.isfinite(v_win_60)
+                & (v_win_60 >= 0.0)
+            )
+            mddv_60d = (
+                float(np.median(c_win_60[valid_dv] * v_win_60[valid_dv]))
+                if bool(np.any(valid_dv))
+                else 0.0
+            )
+            log_mddv = math.log(max(mddv_60d, 1.0))
+
             if not all(
                 math.isfinite(x)
                 for x in (
@@ -1007,6 +1106,12 @@ class FeatureEngine:
                     shp_126_s10,
                     shp_252_s21,
                     rshp_252_s21,
+                    raw_ret_long,
+                    raw_ret_252_s126,
+                    prox_52w_high,
+                    reg_slope_r2,
+                    mddv_60d,
+                    log_mddv,
                     pullback_5,
                     fip_raw,
                     max_jump_raw,
@@ -1030,6 +1135,13 @@ class FeatureEngine:
                     "shp_126_s10": shp_126_s10,
                     "shp_252_s21": shp_252_s21,
                     "rshp_252_s21": rshp_252_s21,
+                    "raw_ret_long": raw_ret_long,
+                    "raw_ret_252_s126": raw_ret_252_s126,
+                    "prox_52w_high": prox_52w_high,
+                    "reg_slope_r2": reg_slope_r2,
+                    "mddv_60d": mddv_60d,
+                    "log_mddv": log_mddv,
+                    "above_sma200": above_sma200,
                     "pullback_5": pullback_5,
                     "fip_raw": fip_raw,
                     "max_jump_raw": max_jump_raw,
@@ -1086,6 +1198,11 @@ class FeatureEngine:
                 "shp_126_s10",
                 "shp_252_s21",
                 "rshp_252_s21",
+                "raw_ret_long",
+                "raw_ret_252_s126",
+                "prox_52w_high",
+                "reg_slope_r2",
+                "log_mddv",
                 "pullback_5",
                 "fip_raw",
                 "max_jump_raw",
@@ -1093,10 +1210,24 @@ class FeatureEngine:
         }
         news_zs = [max(-3.0, min(3.0, float(r["news_raw"]) * 1.8)) for r in raw_items]
 
-        m2_sum = self.config.m2_w_long + self.config.m2_w_med + self.config.m2_w_residual
+        m2_sum = (
+            self.config.m2_w_long
+            + self.config.m2_w_med
+            + self.config.m2_w_residual
+            + self.config.m2_w_raw_long
+            + self.config.m2_w_intermed
+            + self.config.m2_w_52w_high
+            + self.config.m2_w_reg_slope
+            + self.config.m2_w_liquidity
+        )
         w_l = self.config.m2_w_long / m2_sum
         w_m = self.config.m2_w_med / m2_sum
         w_r = self.config.m2_w_residual / m2_sum
+        w_raw = self.config.m2_w_raw_long / m2_sum
+        w_intermed = self.config.m2_w_intermed / m2_sum
+        w_52w = self.config.m2_w_52w_high / m2_sum
+        w_reg = self.config.m2_w_reg_slope / m2_sum
+        w_liq = self.config.m2_w_liquidity / m2_sum
 
         w_t = self.config.w_trend
         w_p = self.config.w_pullback
@@ -1105,14 +1236,48 @@ class FeatureEngine:
         w_fip = self.config.w_fip
         w_jump = self.config.w_jump_penalty
 
-        signals: list[SignalRow] = []
+        t_scores: list[float] = []
+        eligible_flags: list[bool] = []
         for idx, r in enumerate(raw_items):
-            sym = str(r["symbol"])
-            t_score = (
+            t_val = (
                 w_l * zs["shp_252_s21"][idx]
                 + w_m * zs["shp_126_s10"][idx]
                 + w_r * zs["rshp_252_s21"][idx]
+                + w_raw * zs["raw_ret_long"][idx]
+                + w_intermed * zs["raw_ret_252_s126"][idx]
+                + w_52w * zs["prox_52w_high"][idx]
+                + w_reg * zs["reg_slope_r2"][idx]
+                + w_liq * zs["log_mddv"][idx]
             )
+            t_scores.append(t_val)
+            is_elig = True
+            if (
+                self.config.max_stock_ann_vol is not None
+                and float(r["ann_vol"]) > self.config.max_stock_ann_vol
+            ):
+                is_elig = False
+            if self.config.trend_above_sma200_filter and not bool(r["above_sma200"]):
+                is_elig = False
+            eligible_flags.append(is_elig)
+
+        if self.config.fip_gate_quantile is not None:
+            elig_indices = [idx for idx, flag in enumerate(eligible_flags) if flag]
+            if elig_indices:
+                elig_indices.sort(
+                    key=lambda idx: (-float(raw_items[idx]["fip_raw"]), str(raw_items[idx]["symbol"]))
+                )
+                k_keep = max(
+                    1, math.ceil(len(elig_indices) * self.config.fip_gate_quantile)
+                )
+                keep_set = set(elig_indices[:k_keep])
+                for idx in elig_indices:
+                    if idx not in keep_set:
+                        eligible_flags[idx] = False
+
+        signals: list[SignalRow] = []
+        for idx, r in enumerate(raw_items):
+            sym = str(r["symbol"])
+            t_score = t_scores[idx]
             p_score = zs["pullback_5"][idx]
             fip_z = zs["fip_raw"][idx]
             jump_z = zs["max_jump_raw"][idx]
@@ -1158,6 +1323,8 @@ class FeatureEngine:
                     insider_score=round(i_score, 6),
                     has_recent_restatement=bool(r["has_recent_restatement"]),
                     fip_score=round(fip_z, 6),
+                    mddv_60d=round(float(r["mddv_60d"]), 2),
+                    stage1_finalist=bool(eligible_flags[idx]),
                 )
             )
         return signals

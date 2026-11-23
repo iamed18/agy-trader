@@ -1,0 +1,99 @@
+# V4 Monthly-Rebalance Dynamic Index-Beater Candidate Configuration
+# R&D candidate validated over 2017-2026 survivorship-free PIT S&P 500 Top-200
+# (`C2_LiquidAdaptive`: +20.24% 10Y CAGR, 0.862 Excess Sharpe, -25.61% MaxDD, 1.0x gross).
+# NOTE: Live v0.2 paper trading continues using config/strategy.yaml untouched.
+
+strategy:
+  rebalance_checkpoints_et:
+    - "15:40"
+  momentum_mode: "m2_residual"
+  m2_long_lookback: 126
+  m2_long_skip: 0
+  m2_med_lookback: 63
+  m2_med_skip: 0
+  m2_w_long: 0.25
+  m2_w_med: 0.45
+  m2_w_residual: 0.0
+  m2_w_raw_long: 0.0
+  m2_w_intermed: 0.0
+  m2_w_52w_high: 0.0
+  m2_w_reg_slope: 0.0
+  m2_w_liquidity: 0.30
+  reg_slope_lookback: 126
+  w_trend: 0.80
+  w_pullback: 0.0
+  w_news_sentiment: 0.0
+  w_insider: 0.0
+  top_k_long: 25
+  top_k_short: 0
+  min_signal_threshold: 0.0
+  exit_signal_threshold: -0.5
+  rebalance_deadband_pct: 0.015
+  allow_fractional_longs: true
+  rebalance_every_n_days: 1
+  rebalance_schedule: "monthly_first"
+  hold_rank_buffer: 8
+  abs_momentum_filter: false
+  use_rf_hurdle_for_abs_momentum: true
+  short_only_in_bear_regime: true
+  max_pair_corr_60d: null
+  corr_penalty_eta: 0.0
+  score_tilt_power: 0.0
+  waterfill_weights: true
+  exempt_safe_havens_from_macro_scale: false
+  safe_haven_rotation_fraction: 0.0
+  exclude_safe_havens_from_equity_slots: true
+  spy_sma200_defensive_scale: null
+  spy_ema50_dual_scale: null
+  spy_vol_surge_scale: null
+  spy_ret10_crash_scale: null
+  use_sector_residual: false
+  w_fip: 0.20
+  w_jump_penalty: 0.0
+  fip_gate_quantile: null
+  max_stock_ann_vol: null
+  trend_above_sma200_filter: false
+  vol_sizing_mode: "liquidity_pow"
+  liquidity_weight_power: 0.5
+  vol_sizing_floor: 0.22
+  vol_sizing_cap: 0.50
+  portfolio_vol_target_ann: null
+  rebalance_tranches: 1
+  regime_mode: "none"
+  w_pead: 0.0
+
+risk:
+  max_long_position_pct: 0.12
+  max_short_position_pct: 0.0
+  max_gross_exposure: 1.00
+  min_net_exposure: 0.0
+  max_net_exposure: 1.00
+  max_sector_gross_pct: 0.45
+  daily_loss_halt_pct: 0.08
+  max_drawdown_halt_pct: 0.35
+  max_drawdown_cooldown_days: 20
+  delisting_haircut_pct: 0.10
+  earnings_blackout_days: 2
+  restatement_blackout_days: 10
+  stop_loss_atr_mult_long: 10.0
+  stop_loss_atr_mult_short: 3.0
+  max_data_staleness_minutes: 15
+
+backtest:
+  initial_capital: 100000.0
+  etf_slippage_bps: 5.0
+  equity_slippage_bps: 10.0
+  short_borrow_apr: 0.015
+  sec_sell_fee_bps: 0.28
+  risk_free_rate_apr: 0.045
+  cash_yield_apr: 0.045
+  use_fred_tbill_yield: true
+  execution_timing: "same_close"
+  benchmark_symbol: "SPY"
+
+llm_quota:
+  daily_usd_cap: 1.50
+  monthly_usd_cap: 25.00
+  tier1_model: "flash"
+  tier2_model: "pro"
+  max_input_tokens_per_call: 8000
