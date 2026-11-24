@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+import math
+from collections.abc import Mapping, Sequence
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -10,7 +12,11 @@ from agy_trader.core.blackout import (
     load_universe_for_blackout,
     resolve_live_blackout,
 )
-from agy_trader.core.calendar import nyse_trading_days_apart
+from agy_trader.core.calendar import (
+    is_nyse_rth_timestamp,
+    is_nyse_trading_day,
+    nyse_trading_days_apart,
+)
 from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ControlDials, MacroPoint, ensure_utc
 from agy_trader.data.macro_and_calendar import FRED_SERIES_IDS
@@ -534,6 +540,68 @@ def build_morning_plan(
     }
 
 
+def _pct_change(cur_val: Any, base_val: Any) -> float | None:
+    if cur_val is None or base_val is None:
+        return None
+    cur = float(cur_val)
+    base = float(base_val)
+    if not (math.isfinite(cur) and math.isfinite(base)) or base <= 0.0:
+        return None
+    return round(((cur / base) - 1.0) * 100.0, 4)
+
+
+def _pick_latest_session_snap(
+    rows: Sequence[tuple[Mapping[str, Any], datetime, date]],
+) -> tuple[Mapping[str, Any], datetime, date]:
+    rth_rows = [row for row in rows if is_nyse_rth_timestamp(row[1])]
+    if rth_rows:
+        return rth_rows[-1]
+    trading_rows = [row for row in rows if is_nyse_trading_day(row[2])]
+    return trading_rows[-1] if trading_rows else rows[-1]
+
+
+def select_benchmark_session_snapshots(
+    snaps: Sequence[Mapping[str, Any]],
+    as_of_date_et: date,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+    """Select current and prior trading-session benchmark mark snapshots.
+
+    Prefers NYSE regular-trading-hour marks (09:30 ET through close + 10m grace)
+    to avoid extended-hours/weekend/holiday wide stub quotes, while falling back
+    cleanly for synthetic tests with arbitrary timestamps.
+    """
+    parsed: list[tuple[Mapping[str, Any], datetime, date]] = []
+    for snap in snaps:
+        if snap.get("spy_close") is None and snap.get("ew50_index") is None:
+            continue
+        raw_ts = snap.get("timestamp")
+        if raw_ts is None:
+            continue
+        try:
+            ts_utc = (
+                ensure_utc(raw_ts)
+                if isinstance(raw_ts, datetime)
+                else ensure_utc(datetime.fromisoformat(str(raw_ts)))
+            )
+        except (TypeError, ValueError):
+            continue
+        ts_et = ts_utc.astimezone(NY_TZ)
+        parsed.append((snap, ts_et, ts_et.date()))
+
+    if not parsed:
+        return (None, None)
+
+    eligible = [row for row in parsed if row[2] <= as_of_date_et] or parsed
+    cur_bench_snap, _, cur_date = _pick_latest_session_snap(eligible)
+
+    prior = [row for row in eligible if row[2] < cur_date]
+    if not prior:
+        return (cur_bench_snap, None)
+
+    prev_bench_snap, _, _ = _pick_latest_session_snap(prior)
+    return (cur_bench_snap, prev_bench_snap)
+
+
 def build_daily_summary(
     data_dir: Path,
     config_dir: Path,
@@ -554,7 +622,9 @@ def build_daily_summary(
     blackout = _resolve_ops_blackout(resolved_config, db, now)
 
     first_snap = db.get_first_portfolio_snapshot() if db is not None else None
+    first_invested_snap = db.get_first_invested_portfolio_snapshot() if db is not None else None
     latest_snap = db.get_latest_portfolio_snapshot() if db is not None else None
+    recent_snaps = db.get_portfolio_snapshots(limit=2000) if db is not None else []
 
     equity = float(latest_snap["equity"]) if latest_snap else app_cfg.backtest.initial_capital
     daily_return_pct = float(latest_snap["daily_pnl_pct"]) * 100.0 if latest_snap else 0.0
@@ -568,20 +638,27 @@ def build_daily_summary(
         else 0.0
     )
 
-    first_spy = first_snap.get("spy_close") if first_snap else None
-    latest_spy = latest_snap.get("spy_close") if latest_snap else None
-    spy_cum_pct = (
-        round(((float(latest_spy) / float(first_spy)) - 1.0) * 100.0, 4)
-        if first_spy is not None and latest_spy is not None and float(first_spy) > 0.0
+    cur_bench_snap, prev_bench_snap = select_benchmark_session_snapshots(recent_snaps, today_et)
+    if cur_bench_snap is None:
+        cur_bench_snap = latest_snap
+
+    spy_daily_pct = (
+        _pct_change(cur_bench_snap.get("spy_close"), prev_bench_snap.get("spy_close"))
+        if cur_bench_snap is not None and prev_bench_snap is not None
         else None
     )
-    first_ew = first_snap.get("ew50_index") if first_snap else None
-    latest_ew = latest_snap.get("ew50_index") if latest_snap else None
-    ew_cum_pct = (
-        round(((float(latest_ew) / float(first_ew)) - 1.0) * 100.0, 4)
-        if first_ew is not None and latest_ew is not None and float(first_ew) > 0.0
+    ew_daily_pct = (
+        _pct_change(cur_bench_snap.get("ew50_index"), prev_bench_snap.get("ew50_index"))
+        if cur_bench_snap is not None and prev_bench_snap is not None
         else None
     )
+
+    if first_invested_snap is not None and cur_bench_snap is not None:
+        spy_cum_pct = _pct_change(cur_bench_snap.get("spy_close"), first_invested_snap.get("spy_close"))
+        ew_cum_pct = _pct_change(cur_bench_snap.get("ew50_index"), first_invested_snap.get("ew50_index"))
+    else:
+        spy_cum_pct = None
+        ew_cum_pct = None
 
     # Today's fills & slippage vs backtest budget
     todays_fills: list[dict[str, Any]] = []
@@ -656,8 +733,10 @@ def build_daily_summary(
         if mean_slip_bps is not None and mean_budget_bps is not None
         else "No fills today"
     )
-    spy_str = f"{spy_cum_pct:+.2f}%" if spy_cum_pct is not None else "N/A"
-    ew_str = f"{ew_cum_pct:+.2f}%" if ew_cum_pct is not None else "N/A"
+    spy_daily_str = f"{spy_daily_pct:+.2f}%" if spy_daily_pct is not None else "N/A"
+    ew_daily_str = f"{ew_daily_pct:+.2f}%" if ew_daily_pct is not None else "N/A"
+    spy_cum_str = f"{spy_cum_pct:+.2f}%" if spy_cum_pct is not None else "N/A"
+    ew_cum_str = f"{ew_cum_pct:+.2f}%" if ew_cum_pct is not None else "N/A"
     if blackout.halted:
         blackout_summary_str = f"HALTED ({blackout.halt_reason})"
     elif blackout.frozen_symbols:
@@ -669,7 +748,8 @@ def build_daily_summary(
         f"# agy-trader Daily Close Summary ({today_str})",
         "",
         f"- **Equity:** ${equity:,.2f}",
-        f"- **Daily Return:** {daily_return_pct:+.2f}% | **Cumulative:** {cum_return_pct:+.2f}% (SPY: {spy_str}, EW-50: {ew_str})",
+        f"- **Daily Return:** {daily_return_pct:+.2f}% (SPY: {spy_daily_str}, EW-50: {ew_daily_str})",
+        f"- **Cumulative Return:** {cum_return_pct:+.2f}% (since first trade — SPY: {spy_cum_str}, EW-50: {ew_cum_str})",
         f"- **Drawdown:** {drawdown_pct:.2f}% (Headroom to {halt_pct:.1f}% halt: {drawdown_headroom_pct:.2f}%)",
         f"- **15:40 ET Fills:** {len(todays_fills)} order(s) | Mean Slippage: {slip_text}",
         f"- **Open Positions:** {len(enriched_positions)}",
@@ -681,9 +761,12 @@ def build_daily_summary(
         "session_date_et": today_str,
         "equity": equity,
         "daily_return_pct": round(daily_return_pct, 4),
+        "spy_daily_return_pct": spy_daily_pct,
+        "ew50_daily_return_pct": ew_daily_pct,
         "cumulative_return_pct": round(cum_return_pct, 4),
         "spy_cumulative_return_pct": spy_cum_pct,
         "ew50_cumulative_return_pct": ew_cum_pct,
+        "benchmark_anchor_timestamp": first_invested_snap["timestamp"] if first_invested_snap is not None else None,
         "drawdown_pct": round(drawdown_pct, 4),
         "max_drawdown_halt_pct": halt_pct,
         "drawdown_headroom_pct": drawdown_headroom_pct,

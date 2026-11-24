@@ -9,6 +9,8 @@ from fastapi import FastAPI, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from agy_ops.daemons.common import NY_TZ
+from agy_ops.reporting.digests import _pct_change, select_benchmark_session_snapshots
 from agy_trader.core.blackout import load_universe_for_blackout, resolve_live_blackout
 from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ControlDials, ensure_utc
@@ -134,6 +136,8 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                 "net_exposure": 0.0,
                 "spy_return_pct": None,
                 "ew50_return_pct": None,
+                "spy_daily_return_pct": None,
+                "ew50_daily_return_pct": None,
                 "control_dials": dials.model_dump(mode="json"),
                 "blackout": blackout,
             }
@@ -156,6 +160,8 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                 "net_exposure": 0.0,
                 "spy_return_pct": None,
                 "ew50_return_pct": None,
+                "spy_daily_return_pct": None,
+                "ew50_daily_return_pct": None,
                 "control_dials": dials.model_dump(mode="json"),
                 "blackout": blackout,
             }
@@ -164,19 +170,31 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
         cur_eq = float(latest["equity"])
         total_ret_pct = ((cur_eq / base_eq) - 1.0) * 100.0 if base_eq > 0.0 else 0.0
 
-        first_spy = first["spy_close"]
-        latest_spy = latest["spy_close"]
+        invested_first = db.get_first_invested_portfolio_snapshot()
+        recent_snaps = db.get_portfolio_snapshots(limit=2000)
+        latest_et_date = ensure_utc(datetime.fromisoformat(str(latest["timestamp"]))).astimezone(NY_TZ).date()
+        cur_bench, prev_bench = select_benchmark_session_snapshots(recent_snaps, latest_et_date)
+        if cur_bench is None:
+            cur_bench = latest
+
         spy_ret_pct = (
-            ((float(latest_spy) / float(first_spy)) - 1.0) * 100.0
-            if first_spy is not None and latest_spy is not None and float(first_spy) > 0.0
+            _pct_change(cur_bench.get("spy_close"), invested_first.get("spy_close"))
+            if invested_first is not None
             else None
         )
-
-        first_ew = first["ew50_index"]
-        latest_ew = latest["ew50_index"]
         ew_ret_pct = (
-            ((float(latest_ew) / float(first_ew)) - 1.0) * 100.0
-            if first_ew is not None and latest_ew is not None and float(first_ew) > 0.0
+            _pct_change(cur_bench.get("ew50_index"), invested_first.get("ew50_index"))
+            if invested_first is not None
+            else None
+        )
+        spy_daily_pct = (
+            _pct_change(cur_bench.get("spy_close"), prev_bench.get("spy_close"))
+            if prev_bench is not None
+            else None
+        )
+        ew_daily_pct = (
+            _pct_change(cur_bench.get("ew50_index"), prev_bench.get("ew50_index"))
+            if prev_bench is not None
             else None
         )
 
@@ -192,8 +210,10 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
             "high_water_mark": float(latest["high_water_mark"]),
             "gross_exposure": float(latest["gross_exposure"]),
             "net_exposure": float(latest["net_exposure"]),
-            "spy_return_pct": round(spy_ret_pct, 4) if spy_ret_pct is not None else None,
-            "ew50_return_pct": round(ew_ret_pct, 4) if ew_ret_pct is not None else None,
+            "spy_return_pct": spy_ret_pct,
+            "ew50_return_pct": ew_ret_pct,
+            "spy_daily_return_pct": spy_daily_pct,
+            "ew50_daily_return_pct": ew_daily_pct,
             "control_dials": dials.model_dump(mode="json"),
             "blackout": blackout,
         }
@@ -211,13 +231,35 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
 
         base_eq = next((float(s["equity"]) for s in snaps if float(s["equity"]) > 0.0), None)
         base_spy = next(
-            (float(s["spy_close"]) for s in snaps if s["spy_close"] is not None and float(s["spy_close"]) > 0.0),
+            (
+                float(s["spy_close"])
+                for s in snaps
+                if float(s["gross_exposure"]) > 0.0
+                and s["spy_close"] is not None
+                and float(s["spy_close"]) > 0.0
+            ),
             None,
         )
+        if base_spy is None:
+            base_spy = next(
+                (float(s["spy_close"]) for s in snaps if s["spy_close"] is not None and float(s["spy_close"]) > 0.0),
+                None,
+            )
         base_ew50 = next(
-            (float(s["ew50_index"]) for s in snaps if s["ew50_index"] is not None and float(s["ew50_index"]) > 0.0),
+            (
+                float(s["ew50_index"])
+                for s in snaps
+                if float(s["gross_exposure"]) > 0.0
+                and s["ew50_index"] is not None
+                and float(s["ew50_index"]) > 0.0
+            ),
             None,
         )
+        if base_ew50 is None:
+            base_ew50 = next(
+                (float(s["ew50_index"]) for s in snaps if s["ew50_index"] is not None and float(s["ew50_index"]) > 0.0),
+                None,
+            )
 
         series: list[dict[str, Any]] = []
         for s in snaps:

@@ -1433,6 +1433,27 @@ class StateDB:
             return None
         return self._row_to_snapshot(row)
 
+    def get_first_invested_portfolio_snapshot(self) -> dict[str, Any] | None:
+        """Return the earliest portfolio snapshot with non-zero gross exposure."""
+        try:
+            with closing(self._connect()) as conn:
+                row = conn.execute(
+                    """
+                    SELECT *
+                    FROM portfolio_snapshots
+                    WHERE gross_exposure > 0.0
+                    ORDER BY timestamp ASC, id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if self._is_missing_table(exc):
+                return None
+            raise
+        if row is None:
+            return None
+        return self._row_to_snapshot(row)
+
     def get_latest_portfolio_snapshot(self) -> dict[str, Any] | None:
         try:
             with closing(self._connect()) as conn:
@@ -1616,6 +1637,16 @@ class StateDB:
                     DELETE FROM portfolio_snapshots
                     WHERE timestamp < ?
                       AND id != (SELECT MIN(id) FROM portfolio_snapshots)
+                      AND id != COALESCE(
+                          (
+                              SELECT id
+                              FROM portfolio_snapshots
+                              WHERE gross_exposure > 0.0
+                              ORDER BY timestamp ASC, id ASC
+                              LIMIT 1
+                          ),
+                          -1
+                      )
                     """,
                     (cutoff_iso,),
                 )

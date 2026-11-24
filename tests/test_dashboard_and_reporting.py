@@ -452,9 +452,10 @@ def test_m4_inception_snapshot_preserved_and_security_headers(tmp_path: Path) ->
     now = datetime(2025, 12, 31, 20, 45, tzinfo=UTC)
     db = StateDB(data_dir / "state.db")
 
-    # Insert inception snapshot (>90d ago) FIRST, then mid snapshot (>90d ago), then current state
+    # Insert inception snapshot (>90d ago) FIRST, then two invested snapshots (>90d ago), then current state
     inception_ts = now - timedelta(days=200)
     mid_ts = now - timedelta(days=120)
+    mid2_ts = now - timedelta(days=100)
     db.insert_portfolio_snapshot(
         timestamp=inception_ts,
         equity=95_000.0,
@@ -481,13 +482,29 @@ def test_m4_inception_snapshot_preserved_and_security_headers(tmp_path: Path) ->
         spy_close=470.0,
         ew50_index=94.0,
     )
+    db.insert_portfolio_snapshot(
+        timestamp=mid2_ts,
+        equity=98_500.0,
+        cash=49_000.0,
+        buying_power=98_500.0,
+        gross_exposure=0.5,
+        net_exposure=0.5,
+        daily_pnl_pct=0.015,
+        drawdown_pct=0.0,
+        high_water_mark=98_500.0,
+        spy_close=480.0,
+        ew50_index=96.0,
+    )
     _seed_operational_state(data_dir, now_utc=now)
 
     pruned = db.prune_old_telemetry(keep_days=90, now_utc=now)
-    assert pruned["portfolio_snapshots"] == 1  # mid_ts deleted, inception_ts preserved!
+    assert pruned["portfolio_snapshots"] == 1  # mid2_ts deleted; inception_ts & mid_ts preserved!
     first = db.get_first_portfolio_snapshot()
     assert first is not None
     assert first["equity"] == 95_000.0
+    first_invested = db.get_first_invested_portfolio_snapshot()
+    assert first_invested is not None
+    assert first_invested["spy_close"] == 470.0
 
     # Verify security headers, disabled OpenAPI schema, peak_rss_mb, and preserved inception return
     app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
@@ -498,11 +515,225 @@ def test_m4_inception_snapshot_preserved_and_security_headers(tmp_path: Path) ->
     assert ov.status_code == 200
     assert ov.headers.get("x-content-type-options") == "nosniff"
     assert "default-src 'self'" in ov.headers.get("content-security-policy", "")
-    # 102,500 vs 95,000 inception
+    # 102,500 vs 95,000 inception; benchmarks anchored to first invested snapshot (470 / 94)
     assert ov.json()["total_return_pct"] == pytest.approx(((102_500.0 / 95_000.0) - 1.0) * 100.0, rel=1e-4)
+    assert ov.json()["spy_return_pct"] == pytest.approx(((505.0 / 470.0) - 1.0) * 100.0, rel=1e-4)
+    assert ov.json()["ew50_return_pct"] == pytest.approx(((101.5 / 94.0) - 1.0) * 100.0, rel=1e-4)
+    assert ov.json()["spy_daily_return_pct"] == pytest.approx(1.0)
+    assert ov.json()["ew50_daily_return_pct"] == pytest.approx(1.5)
 
     health = client.get("/api/health").json()
     assert health["daemons"]["trader"]["peak_rss_mb"] == 42.5
 
     daily = build_daily_summary(data_dir, REPO_CONFIG_DIR, now_utc=now)
     assert daily["cumulative_return_pct"] == pytest.approx(((102_500.0 / 95_000.0) - 1.0) * 100.0, rel=1e-4)
+    assert daily["spy_cumulative_return_pct"] == pytest.approx(((505.0 / 470.0) - 1.0) * 100.0, rel=1e-4)
+    assert daily["ew50_cumulative_return_pct"] == pytest.approx(((101.5 / 94.0) - 1.0) * 100.0, rel=1e-4)
+    assert daily["spy_daily_return_pct"] == pytest.approx(1.0)
+    assert daily["ew50_daily_return_pct"] == pytest.approx(1.5)
+
+
+def test_daily_summary_benchmark_anchoring_rth_and_holidays(tmp_path: Path) -> None:
+    from zoneinfo import ZoneInfo
+
+    ny_tz = ZoneInfo("America/New_York")
+
+    # Case 1-3: Cash-idle rally ignored, extended-hours stub quotes ignored,
+    # Thanksgiving holiday (2026-11-26) skipped, Black Friday (2026-11-27) 13:00 ET early close respected.
+    data_dir = tmp_path / "data_rth"
+    data_dir.mkdir(parents=True)
+    db = StateDB(data_dir / "state.db")
+
+    # Pre-entry cash-idle snapshots on Nov 23 (SPY rallies +4% while account is 100% cash)
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 23, 10, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=100_000.0,
+        cash=100_000.0,
+        buying_power=100_000.0,
+        gross_exposure=0.0,
+        net_exposure=0.0,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=100_000.0,
+        spy_close=480.7692,
+        ew50_index=95.0,
+    )
+    # First invested snapshot on Nov 23 @ 15:40 ET (SPY = 500.0, EW-50 = 100.0)
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 23, 15, 40, tzinfo=ny_tz).astimezone(UTC),
+        equity=100_000.0,
+        cash=40_000.0,
+        buying_power=140_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=100_000.0,
+        spy_close=500.0,
+        ew50_index=100.0,
+    )
+    # Nov 25 (Wed before Thanksgiving): RTH close @ 15:58 ET vs distorted post-close stub @ 17:00 ET
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 25, 15, 58, tzinfo=ny_tz).astimezone(UTC),
+        equity=101_000.0,
+        cash=40_000.0,
+        buying_power=141_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.01,
+        drawdown_pct=0.0,
+        high_water_mark=101_000.0,
+        spy_close=505.0,
+        ew50_index=101.0,
+    )
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 25, 17, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=101_000.0,
+        cash=40_000.0,
+        buying_power=141_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.01,
+        drawdown_pct=0.0,
+        high_water_mark=101_000.0,
+        spy_close=520.0,
+        ew50_index=115.0,
+    )
+    # Nov 26 (Thanksgiving Day - NYSE holiday): stale/stub quote must be skipped
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 26, 12, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=101_000.0,
+        cash=40_000.0,
+        buying_power=141_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=101_000.0,
+        spy_close=490.0,
+        ew50_index=90.0,
+    )
+    # Nov 27 (Black Friday - 13:00 ET early close): 12:58 ET RTH mark vs 14:00 ET post-close stub
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 27, 12, 58, tzinfo=ny_tz).astimezone(UTC),
+        equity=102_000.0,
+        cash=40_000.0,
+        buying_power=142_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0099,
+        drawdown_pct=0.0,
+        high_water_mark=102_000.0,
+        spy_close=510.05,
+        ew50_index=103.02,
+    )
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 27, 14, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=102_000.0,
+        cash=40_000.0,
+        buying_power=142_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0099,
+        drawdown_pct=0.0,
+        high_water_mark=102_000.0,
+        spy_close=530.0,
+        ew50_index=120.0,
+    )
+
+    # Nov 28 (Saturday) & Nov 30 08:00 ET (Monday pre-market): closed-market hourly stub quotes must be ignored!
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 28, 10, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=102_000.0,
+        cash=40_000.0,
+        buying_power=142_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0099,
+        drawdown_pct=0.0,
+        high_water_mark=102_000.0,
+        spy_close=475.0,
+        ew50_index=85.0,
+    )
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 30, 8, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=102_000.0,
+        cash=40_000.0,
+        buying_power=142_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=102_000.0,
+        spy_close=470.0,
+        ew50_index=82.0,
+    )
+
+    # Evaluate on Saturday Nov 28 AND Monday Nov 30 pre-open: both must select Fri Nov 27 12:58 ET vs Wed Nov 25 15:58 ET
+    for eval_now in (
+        datetime(2026, 11, 28, 16, 0, tzinfo=ny_tz).astimezone(UTC),
+        datetime(2026, 11, 30, 8, 30, tzinfo=ny_tz).astimezone(UTC),
+    ):
+        summary = build_daily_summary(data_dir, REPO_CONFIG_DIR, now_utc=eval_now)
+        assert summary["spy_daily_return_pct"] == pytest.approx(((510.05 / 505.0) - 1.0) * 100.0, rel=1e-4)
+        assert summary["ew50_daily_return_pct"] == pytest.approx(((103.02 / 101.0) - 1.0) * 100.0, rel=1e-4)
+        # Cumulative benchmark anchored to first invested snapshot (500.0 / 100.0), NOT cash-idle 480.7692
+        assert summary["spy_cumulative_return_pct"] == pytest.approx(((510.05 / 500.0) - 1.0) * 100.0, rel=1e-4)
+        assert summary["ew50_cumulative_return_pct"] == pytest.approx(((103.02 / 100.0) - 1.0) * 100.0, rel=1e-4)
+        assert summary["benchmark_anchor_timestamp"] is not None
+
+    # Also verify /api/equity-curve anchors SPY/EW-50 to first invested snapshot (500.0 / 100.0)
+    app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
+    client = TestClient(app)
+    ov = client.get("/api/overview").json()
+    assert ov["spy_daily_return_pct"] == pytest.approx(summary["spy_daily_return_pct"])
+    assert ov["ew50_daily_return_pct"] == pytest.approx(summary["ew50_daily_return_pct"])
+    assert ov["spy_return_pct"] == pytest.approx(summary["spy_cumulative_return_pct"])
+    assert ov["ew50_return_pct"] == pytest.approx(summary["ew50_cumulative_return_pct"])
+
+    curve_series = client.get("/api/equity-curve").json()["series"]
+    # Index 1 is first invested snapshot (500.0 / 100.0) -> 100.0 baseline
+    assert curve_series[1]["spy_index"] == pytest.approx(100.0)
+    assert curve_series[1]["ew50_index"] == pytest.approx(100.0)
+
+    # Case 4: Uninvested account (gross_exposure == 0.0 on all rows)
+    cash_dir = tmp_path / "data_cash_only"
+    cash_dir.mkdir(parents=True)
+    cash_db = StateDB(cash_dir / "state.db")
+    cash_db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 24, 15, 55, tzinfo=ny_tz).astimezone(UTC),
+        equity=100_000.0,
+        cash=100_000.0,
+        buying_power=100_000.0,
+        gross_exposure=0.0,
+        net_exposure=0.0,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=100_000.0,
+        spy_close=500.0,
+        ew50_index=100.0,
+    )
+    cash_db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 25, 15, 55, tzinfo=ny_tz).astimezone(UTC),
+        equity=100_000.0,
+        cash=100_000.0,
+        buying_power=100_000.0,
+        gross_exposure=0.0,
+        net_exposure=0.0,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=100_000.0,
+        spy_close=505.0,
+        ew50_index=102.0,
+    )
+    cash_summary = build_daily_summary(
+        cash_dir,
+        REPO_CONFIG_DIR,
+        now_utc=datetime(2026, 11, 25, 16, 5, tzinfo=ny_tz).astimezone(UTC),
+    )
+    assert cash_summary["spy_cumulative_return_pct"] is None
+    assert cash_summary["ew50_cumulative_return_pct"] is None
+    assert cash_summary["benchmark_anchor_timestamp"] is None
+    assert cash_summary["spy_daily_return_pct"] == pytest.approx(1.0)
+    assert cash_summary["ew50_daily_return_pct"] == pytest.approx(2.0)
+    assert "since first trade — SPY: N/A, EW-50: N/A" in cash_summary["markdown_summary"]

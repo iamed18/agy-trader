@@ -529,21 +529,31 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
     equity = float(summary.get("equity", 0.0))
     daily_ret = float(summary.get("daily_return_pct", 0.0))
     cum_ret = float(summary.get("cumulative_return_pct", 0.0))
+    spy_daily = summary.get("spy_daily_return_pct")
+    ew_daily = summary.get("ew50_daily_return_pct")
     spy_cum = summary.get("spy_cumulative_return_pct")
     ew_cum = summary.get("ew50_cumulative_return_pct")
 
     color = COLOR_GREEN if daily_ret >= 0.0 else COLOR_RED
     title = f"AGY Daily Close Summary ({session_date})"
-    description = (
-        f"Equity: **${equity:,.2f}** | Daily P&L: **{daily_ret:+.2f}%** | "
-        f"Cumulative: **{cum_ret:+.2f}%**"
-    )
+    if spy_daily is not None:
+        description = (
+            f"Equity: **${equity:,.2f}** | Daily P&L: **{daily_ret:+.2f}%** "
+            f"(SPY `{float(spy_daily):+.2f}%`) | Cumulative: **{cum_ret:+.2f}%**"
+        )
+    else:
+        description = (
+            f"Equity: **${equity:,.2f}** | Daily P&L: **{daily_ret:+.2f}%** | "
+            f"Cumulative: **{cum_ret:+.2f}%**"
+        )
 
-    spy_str = f"{float(spy_cum):+.2f}%" if spy_cum is not None else "N/A"
-    ew_str = f"{float(ew_cum):+.2f}%" if ew_cum is not None else "N/A"
+    spy_daily_str = f"{float(spy_daily):+.2f}%" if spy_daily is not None else "N/A"
+    ew_daily_str = f"{float(ew_daily):+.2f}%" if ew_daily is not None else "N/A"
+    spy_cum_str = f"{float(spy_cum):+.2f}%" if spy_cum is not None else "N/A"
+    ew_cum_str = f"{float(ew_cum):+.2f}%" if ew_cum is not None else "N/A"
     pnl_value = (
-        f"Daily: `{daily_ret:+.2f}%` | Cumulative: `{cum_ret:+.2f}%`\n"
-        f"Benchmarks — `SPY`: `{spy_str}` | `EW-50`: `{ew_str}`"
+        f"**Daily:** `{daily_ret:+.2f}%` (`SPY`: `{spy_daily_str}` | `EW-50`: `{ew_daily_str}`)\n"
+        f"**Cumulative:** `{cum_ret:+.2f}%` (`SPY`: `{spy_cum_str}` | `EW-50`: `{ew_cum_str}` since 1st trade)"
     )
 
     fills = list(summary.get("todays_fills", ()))

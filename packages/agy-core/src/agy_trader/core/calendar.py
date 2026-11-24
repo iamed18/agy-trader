@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from functools import lru_cache
 from typing import Any, ClassVar
+from zoneinfo import ZoneInfo
 
 from pandas.tseries.holiday import (
     AbstractHolidayCalendar,
@@ -45,6 +46,31 @@ def nyse_holidays_for_year(year: int) -> frozenset[date]:
 def is_nyse_trading_day(d: date) -> bool:
     """Return True if d is a weekday and not an NYSE holiday."""
     return d.weekday() < 5 and d not in nyse_holidays_for_year(d.year)
+
+
+_NY_TZ = ZoneInfo("America/New_York")
+
+
+def nyse_rth_close_cutoff_et(d: date) -> time:
+    """Return NYSE regular-session close cutoff time in ET (with 10-minute grace window)."""
+    if not is_nyse_trading_day(d):
+        return time(16, 10)
+    is_day_after_thanksgiving = d.month == 11 and (d - timedelta(days=1)) in nyse_holidays_for_year(d.year)
+    is_christmas_eve = d.month == 12 and d.day == 24
+    is_july_3 = d.month == 7 and d.day == 3
+    if is_day_after_thanksgiving or is_christmas_eve or is_july_3:
+        return time(13, 10)
+    return time(16, 10)
+
+
+def is_nyse_rth_timestamp(ts_utc: datetime) -> bool:
+    """Return True iff ts_utc falls inside NYSE regular trading hours (with close grace window)."""
+    ts = ts_utc if ts_utc.tzinfo is not None else ts_utc.replace(tzinfo=UTC)
+    ts_et = ts.astimezone(_NY_TZ)
+    d_et = ts_et.date()
+    if not is_nyse_trading_day(d_et):
+        return False
+    return time(9, 30) <= ts_et.time() <= nyse_rth_close_cutoff_et(d_et)
 
 
 def nyse_trading_days_apart(d1: date, d2: date) -> int:

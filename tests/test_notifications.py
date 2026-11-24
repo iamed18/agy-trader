@@ -451,6 +451,8 @@ def test_embed_formatters_morning_close_and_test() -> None:
             "session_date_et": "2026-11-23",
             "equity": 101_500.0,
             "daily_return_pct": 1.25,
+            "spy_daily_return_pct": -0.47,
+            "ew50_daily_return_pct": -0.79,
             "cumulative_return_pct": 1.5,
             "spy_cumulative_return_pct": 0.8,
             "ew50_cumulative_return_pct": 1.1,
@@ -484,6 +486,7 @@ def test_embed_formatters_morning_close_and_test() -> None:
     )
     assert pos_close["color"] == 0x22C55E
     assert pos_close["title"] == "AGY Daily Close Summary (2026-11-23)"
+    assert "(SPY `-0.47%`)" in pos_close["description"]
     assert [f["name"] for f in pos_close["fields"]] == [
         "Daily & Cumulative P&L vs SPY & EW-50",
         "15:40 ET Fills & Realized Slippage vs Budget",
@@ -491,6 +494,9 @@ def test_embed_formatters_morning_close_and_test() -> None:
         "Drawdown Headroom",
         "Notable News / SEC / RSS Events",
     ]
+    pnl_val = pos_close["fields"][0]["value"]
+    assert "**Daily:** `+1.25%` (`SPY`: `-0.47%` | `EW-50`: `-0.79%`)" in pnl_val
+    assert "**Cumulative:** `+1.50%` (`SPY`: `+0.80%` | `EW-50`: `+1.10%` since 1st trade)" in pnl_val
 
     neg_close = build_daily_summary_discord_embed(
         {
@@ -501,6 +507,10 @@ def test_embed_formatters_morning_close_and_test() -> None:
         }
     )
     assert neg_close["color"] == 0xEF4444
+    assert "(SPY" not in neg_close["description"]
+    neg_pnl_val = neg_close["fields"][0]["value"]
+    assert "**Daily:** `-1.00%` (`SPY`: `N/A` | `EW-50`: `N/A`)" in neg_pnl_val
+    assert "**Cumulative:** `-1.00%` (`SPY`: `N/A` | `EW-50`: `N/A` since 1st trade)" in neg_pnl_val
 
     test_embed = build_test_discord_embed()
     assert test_embed["footer"] == "agy-trader"
