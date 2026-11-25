@@ -4,6 +4,7 @@ import math
 import sqlite3
 from contextlib import closing
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -1476,6 +1477,84 @@ def test_state_db_read_only_mode_wal_integrity_and_live_tables(tmp_path) -> None
     open_cids = {o["client_order_id"] for o in db.get_open_live_orders()}
     assert "agy:20261120:1540:SPY:B:m0" in open_cids
     assert "agy:20261120:1540:SPY:B:m1" in open_cids
+
+
+def test_portfolio_snapshots_spmo_qmom_schema_migration_and_backfill(tmp_path: Path) -> None:
+    db_path = tmp_path / "legacy_state.db"
+    # Create legacy 12-column portfolio_snapshots table without spmo_close / qmom_close
+    with sqlite3.connect(str(db_path)) as conn:
+        conn.execute(
+            """
+            CREATE TABLE portfolio_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                equity REAL NOT NULL,
+                cash REAL NOT NULL,
+                buying_power REAL NOT NULL,
+                gross_exposure REAL NOT NULL,
+                net_exposure REAL NOT NULL,
+                daily_pnl_pct REAL NOT NULL,
+                drawdown_pct REAL NOT NULL,
+                high_water_mark REAL NOT NULL,
+                spy_close REAL,
+                ew50_index REAL
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO portfolio_snapshots (
+                timestamp, equity, cash, buying_power, gross_exposure, net_exposure,
+                daily_pnl_pct, drawdown_pct, high_water_mark, spy_close, ew50_index
+            ) VALUES
+                ('2026-11-20T20:40:00.000000Z', 100000.0, 40000.0, 140000.0, 0.6, 0.6, 0.0, 0.0, 100000.0, 500.0, 100.0),
+                ('2026-11-23T20:40:00.000000Z', 101000.0, 40000.0, 141000.0, 0.6, 0.6, 0.01, 0.0, 101000.0, 505.0, 101.0)
+            """
+        )
+
+    # Opening pre-migration DB in read_only mode must succeed without IndexError
+    ro_db = StateDB(db_path, read_only=True)
+    ro_snaps = ro_db.get_portfolio_snapshots(limit=10)
+    assert len(ro_snaps) == 2
+    assert ro_snaps[0]["spmo_close"] is None
+    assert ro_snaps[0]["qmom_close"] is None
+
+    # Opening writable StateDB idempotently adds spmo_close and qmom_close
+    rw_db = StateDB(db_path)
+    with closing(rw_db._connect()) as conn:
+        cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(portfolio_snapshots)").fetchall()}
+    assert {"spmo_close", "qmom_close"}.issubset(cols)
+
+    id3 = rw_db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 24, 20, 40, tzinfo=UTC),
+        equity=102_000.0,
+        cash=40_000.0,
+        buying_power=142_000.0,
+        gross_exposure=0.6,
+        net_exposure=0.6,
+        daily_pnl_pct=0.01,
+        drawdown_pct=0.0,
+        high_water_mark=102_000.0,
+        spy_close=510.0,
+        ew50_index=102.0,
+        spmo_close=110.0,
+        qmom_close=60.0,
+    )
+    updated = rw_db.backfill_portfolio_snapshot_benchmarks(
+        [
+            (1, 100.0, 50.0),
+            (2, 105.0, None),
+            (id3, 999.0, 999.0),  # must NOT overwrite existing non-null values
+        ]
+    )
+    assert updated == 3
+    snaps = rw_db.get_portfolio_snapshots(limit=10)
+    assert snaps[0]["spmo_close"] == pytest.approx(100.0)
+    assert snaps[0]["qmom_close"] == pytest.approx(50.0)
+    assert snaps[1]["spmo_close"] == pytest.approx(105.0)
+    assert snaps[1]["qmom_close"] is None
+    assert snaps[2]["spmo_close"] == pytest.approx(110.0)
+    assert snaps[2]["qmom_close"] == pytest.approx(60.0)
 
 
 

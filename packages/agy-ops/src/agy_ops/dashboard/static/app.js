@@ -126,7 +126,7 @@
     const totEl = document.getElementById("kpi-total-ret");
     totEl.textContent = fmtPct(data.total_return_pct);
     totEl.className = `kpi-value ${clsSign(data.total_return_pct)}`;
-    document.getElementById("kpi-baselines").textContent = `SPY: ${fmtPct(data.spy_return_pct)} · EW-50: ${fmtPct(data.ew50_return_pct)}`;
+    document.getElementById("kpi-baselines").textContent = `SPY: ${fmtPct(data.spy_return_pct)} · EW-50: ${fmtPct(data.ew50_return_pct)} · SPMO: ${fmtPct(data.spmo_return_pct)} · QMOM: ${fmtPct(data.qmom_return_pct)}`;
 
     const dayEl = document.getElementById("kpi-daily-pnl");
     dayEl.textContent = fmtPct(data.daily_pnl_pct);
@@ -349,6 +349,8 @@
           { key: "portfolio_index", color: "#4ea1ff" },
           { key: "spy_index", color: "#fbbf24" },
           { key: "ew50_index", color: "#a78bfa" },
+          { key: "spmo_index", color: "#34d399" },
+          { key: "qmom_index", color: "#fb7185" },
         ]
       );
       renderLineChart(

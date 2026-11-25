@@ -531,8 +531,12 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
     cum_ret = float(summary.get("cumulative_return_pct", 0.0))
     spy_daily = summary.get("spy_daily_return_pct")
     ew_daily = summary.get("ew50_daily_return_pct")
+    spmo_daily = summary.get("spmo_daily_return_pct")
+    qmom_daily = summary.get("qmom_daily_return_pct")
     spy_cum = summary.get("spy_cumulative_return_pct")
     ew_cum = summary.get("ew50_cumulative_return_pct")
+    spmo_cum = summary.get("spmo_cumulative_return_pct")
+    qmom_cum = summary.get("qmom_cumulative_return_pct")
 
     color = COLOR_GREEN if daily_ret >= 0.0 else COLOR_RED
     title = f"AGY Daily Close Summary ({session_date})"
@@ -549,11 +553,15 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
 
     spy_daily_str = f"{float(spy_daily):+.2f}%" if spy_daily is not None else "N/A"
     ew_daily_str = f"{float(ew_daily):+.2f}%" if ew_daily is not None else "N/A"
+    spmo_daily_str = f"{float(spmo_daily):+.2f}%" if spmo_daily is not None else "N/A"
+    qmom_daily_str = f"{float(qmom_daily):+.2f}%" if qmom_daily is not None else "N/A"
     spy_cum_str = f"{float(spy_cum):+.2f}%" if spy_cum is not None else "N/A"
     ew_cum_str = f"{float(ew_cum):+.2f}%" if ew_cum is not None else "N/A"
+    spmo_cum_str = f"{float(spmo_cum):+.2f}%" if spmo_cum is not None else "N/A"
+    qmom_cum_str = f"{float(qmom_cum):+.2f}%" if qmom_cum is not None else "N/A"
     pnl_value = (
-        f"**Daily:** `{daily_ret:+.2f}%` (`SPY`: `{spy_daily_str}` | `EW-50`: `{ew_daily_str}`)\n"
-        f"**Cumulative:** `{cum_ret:+.2f}%` (`SPY`: `{spy_cum_str}` | `EW-50`: `{ew_cum_str}` since 1st trade)"
+        f"**Daily:** `{daily_ret:+.2f}%` (`SPY`: `{spy_daily_str}` | `EW-50`: `{ew_daily_str}` | `SPMO`: `{spmo_daily_str}` | `QMOM`: `{qmom_daily_str}`)\n"
+        f"**Cumulative:** `{cum_ret:+.2f}%` (`SPY`: `{spy_cum_str}` | `EW-50`: `{ew_cum_str}` | `SPMO`: `{spmo_cum_str}` | `QMOM`: `{qmom_cum_str}` since 1st trade)"
     )
 
     fills = list(summary.get("todays_fills", ()))
@@ -613,7 +621,11 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
         )
 
     raw_fields = [
-        {"name": "Daily & Cumulative P&L vs SPY & EW-50", "value": pnl_value, "inline": False},
+        {
+            "name": "Daily & Cumulative P&L vs SPY, EW-50, SPMO & QMOM",
+            "value": pnl_value,
+            "inline": False,
+        },
         {
             "name": "15:40 ET Fills & Realized Slippage vs Budget",
             "value": "\n".join(fill_lines),

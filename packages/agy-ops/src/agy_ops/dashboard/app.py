@@ -10,11 +10,16 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from agy_ops.daemons.common import NY_TZ
-from agy_ops.reporting.digests import _pct_change, select_benchmark_session_snapshots
+from agy_ops.reporting.digests import (
+    _pct_change,
+    resolve_snapshot_benchmark_mark,
+    select_benchmark_session_snapshots,
+)
 from agy_trader.core.blackout import load_universe_for_blackout, resolve_live_blackout
 from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ControlDials, ensure_utc
 from agy_trader.storage.db import StateDB
+from agy_trader.storage.parquet_store import ParquetBarStore
 
 ALLOWED_DASHBOARD_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
 DAEMON_NAMES: tuple[str, ...] = ("market-data", "news-nlp", "trader", "dashboard")
@@ -136,8 +141,12 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                 "net_exposure": 0.0,
                 "spy_return_pct": None,
                 "ew50_return_pct": None,
+                "spmo_return_pct": None,
+                "qmom_return_pct": None,
                 "spy_daily_return_pct": None,
                 "ew50_daily_return_pct": None,
+                "spmo_daily_return_pct": None,
+                "qmom_daily_return_pct": None,
                 "control_dials": dials.model_dump(mode="json"),
                 "blackout": blackout,
             }
@@ -160,8 +169,12 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                 "net_exposure": 0.0,
                 "spy_return_pct": None,
                 "ew50_return_pct": None,
+                "spmo_return_pct": None,
+                "qmom_return_pct": None,
                 "spy_daily_return_pct": None,
                 "ew50_daily_return_pct": None,
+                "spmo_daily_return_pct": None,
+                "qmom_daily_return_pct": None,
                 "control_dials": dials.model_dump(mode="json"),
                 "blackout": blackout,
             }
@@ -177,26 +190,56 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
         if cur_bench is None:
             cur_bench = latest
 
-        spy_ret_pct = (
-            _pct_change(cur_bench.get("spy_close"), invested_first.get("spy_close"))
-            if invested_first is not None
-            else None
+        bars_1d_dir = resolved_data / "parquet" / "bars_1d"
+        bar_store = ParquetBarStore(resolved_data / "parquet") if bars_1d_dir.exists() else None
+        bar_cache: dict[str, Any] = {}
+
+        cur_spy = resolve_snapshot_benchmark_mark(
+            cur_bench, "spy_close", "SPY", bar_store, bar_cache=bar_cache
         )
-        ew_ret_pct = (
-            _pct_change(cur_bench.get("ew50_index"), invested_first.get("ew50_index"))
-            if invested_first is not None
-            else None
+        prev_spy = resolve_snapshot_benchmark_mark(
+            prev_bench, "spy_close", "SPY", bar_store, bar_cache=bar_cache
         )
-        spy_daily_pct = (
-            _pct_change(cur_bench.get("spy_close"), prev_bench.get("spy_close"))
-            if prev_bench is not None
-            else None
+        cur_ew = resolve_snapshot_benchmark_mark(cur_bench, "ew50_index")
+        prev_ew = resolve_snapshot_benchmark_mark(prev_bench, "ew50_index")
+        cur_spmo = resolve_snapshot_benchmark_mark(
+            cur_bench, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
         )
-        ew_daily_pct = (
-            _pct_change(cur_bench.get("ew50_index"), prev_bench.get("ew50_index"))
-            if prev_bench is not None
-            else None
+        prev_spmo = resolve_snapshot_benchmark_mark(
+            prev_bench, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
         )
+        cur_qmom = resolve_snapshot_benchmark_mark(
+            cur_bench, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
+        )
+        prev_qmom = resolve_snapshot_benchmark_mark(
+            prev_bench, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
+        )
+
+        if invested_first is not None:
+            first_spy = resolve_snapshot_benchmark_mark(
+                invested_first, "spy_close", "SPY", bar_store, bar_cache=bar_cache
+            )
+            first_ew = resolve_snapshot_benchmark_mark(invested_first, "ew50_index")
+            first_spmo = resolve_snapshot_benchmark_mark(
+                invested_first, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
+            )
+            first_qmom = resolve_snapshot_benchmark_mark(
+                invested_first, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
+            )
+            spy_ret_pct = _pct_change(cur_spy, first_spy)
+            ew_ret_pct = _pct_change(cur_ew, first_ew)
+            spmo_ret_pct = _pct_change(cur_spmo, first_spmo)
+            qmom_ret_pct = _pct_change(cur_qmom, first_qmom)
+        else:
+            spy_ret_pct = None
+            ew_ret_pct = None
+            spmo_ret_pct = None
+            qmom_ret_pct = None
+
+        spy_daily_pct = _pct_change(cur_spy, prev_spy)
+        ew_daily_pct = _pct_change(cur_ew, prev_ew)
+        spmo_daily_pct = _pct_change(cur_spmo, prev_spmo)
+        qmom_daily_pct = _pct_change(cur_qmom, prev_qmom)
 
         return {
             "has_data": True,
@@ -212,8 +255,12 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
             "net_exposure": float(latest["net_exposure"]),
             "spy_return_pct": spy_ret_pct,
             "ew50_return_pct": ew_ret_pct,
+            "spmo_return_pct": spmo_ret_pct,
+            "qmom_return_pct": qmom_ret_pct,
             "spy_daily_return_pct": spy_daily_pct,
             "ew50_daily_return_pct": ew_daily_pct,
+            "spmo_daily_return_pct": spmo_daily_pct,
+            "qmom_daily_return_pct": qmom_daily_pct,
             "control_dials": dials.model_dump(mode="json"),
             "blackout": blackout,
         }
@@ -229,43 +276,43 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
         if not snaps:
             return {"count": 0, "series": []}
 
-        base_eq = next((float(s["equity"]) for s in snaps if float(s["equity"]) > 0.0), None)
-        base_spy = next(
-            (
-                float(s["spy_close"])
-                for s in snaps
-                if float(s["gross_exposure"]) > 0.0
-                and s["spy_close"] is not None
-                and float(s["spy_close"]) > 0.0
-            ),
-            None,
-        )
-        if base_spy is None:
-            base_spy = next(
-                (float(s["spy_close"]) for s in snaps if s["spy_close"] is not None and float(s["spy_close"]) > 0.0),
-                None,
-            )
-        base_ew50 = next(
-            (
-                float(s["ew50_index"])
-                for s in snaps
-                if float(s["gross_exposure"]) > 0.0
-                and s["ew50_index"] is not None
-                and float(s["ew50_index"]) > 0.0
-            ),
-            None,
-        )
-        if base_ew50 is None:
-            base_ew50 = next(
-                (float(s["ew50_index"]) for s in snaps if s["ew50_index"] is not None and float(s["ew50_index"]) > 0.0),
-                None,
-            )
+        bars_1d_dir = resolved_data / "parquet" / "bars_1d"
+        bar_store = ParquetBarStore(resolved_data / "parquet") if bars_1d_dir.exists() else None
+        bar_cache: dict[str, Any] = {}
 
-        series: list[dict[str, Any]] = []
+        resolved_rows: list[tuple[dict[str, Any], float | None, float | None, float | None, float | None]] = []
         for s in snaps:
-            eq = float(s["equity"])
             spy = float(s["spy_close"]) if s["spy_close"] is not None else None
             ew = float(s["ew50_index"]) if s["ew50_index"] is not None else None
+            spmo = resolve_snapshot_benchmark_mark(
+                s, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
+            )
+            qmom = resolve_snapshot_benchmark_mark(
+                s, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
+            )
+            resolved_rows.append((s, spy, ew, spmo, qmom))
+
+        base_eq = next((float(s["equity"]) for s in snaps if float(s["equity"]) > 0.0), None)
+        base_spy = next(
+            (spy for s, spy, _, _, _ in resolved_rows if float(s["gross_exposure"]) > 0.0 and spy is not None and spy > 0.0),
+            None,
+        ) or next((spy for _, spy, _, _, _ in resolved_rows if spy is not None and spy > 0.0), None)
+        base_ew50 = next(
+            (ew for s, _, ew, _, _ in resolved_rows if float(s["gross_exposure"]) > 0.0 and ew is not None and ew > 0.0),
+            None,
+        ) or next((ew for _, _, ew, _, _ in resolved_rows if ew is not None and ew > 0.0), None)
+        base_spmo = next(
+            (spmo for s, _, _, spmo, _ in resolved_rows if float(s["gross_exposure"]) > 0.0 and spmo is not None and spmo > 0.0),
+            None,
+        ) or next((spmo for _, _, _, spmo, _ in resolved_rows if spmo is not None and spmo > 0.0), None)
+        base_qmom = next(
+            (qmom for s, _, _, _, qmom in resolved_rows if float(s["gross_exposure"]) > 0.0 and qmom is not None and qmom > 0.0),
+            None,
+        ) or next((qmom for _, _, _, _, qmom in resolved_rows if qmom is not None and qmom > 0.0), None)
+
+        series: list[dict[str, Any]] = []
+        for s, spy, ew, spmo, qmom in resolved_rows:
+            eq = float(s["equity"])
             series.append(
                 {
                     "timestamp": s["timestamp"],
@@ -279,6 +326,16 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
                     "ew50_index": (
                         round((ew / base_ew50) * 100.0, 4)
                         if (ew is not None and base_ew50)
+                        else None
+                    ),
+                    "spmo_index": (
+                        round((spmo / base_spmo) * 100.0, 4)
+                        if (spmo is not None and base_spmo)
+                        else None
+                    ),
+                    "qmom_index": (
+                        round((qmom / base_qmom) * 100.0, 4)
+                        if (qmom is not None and base_qmom)
                         else None
                     ),
                     "drawdown_pct": round(float(s["drawdown_pct"]) * 100.0, 4),

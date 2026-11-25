@@ -25,6 +25,7 @@ from agy_trader.data.macro_and_calendar import (
     FREDMacroProvider,
     YFinanceEarningsProvider,
     YFinanceEtfHoldingsProvider,
+    fetch_yfinance_consolidated_bars,
 )
 from agy_trader.data.providers import (
     EarningsProvider,
@@ -114,6 +115,7 @@ class MarketDataDaemon(DaemonRunner):
         self.min_bars_required = int(min_bars_required)
         self.max_network_wait_seconds = float(max_network_wait_seconds)
 
+        self._injected_market_provider = market_provider is not None
         self._market_provider = market_provider
         self._macro_provider = macro_provider
         self._earnings_provider = earnings_provider
@@ -139,6 +141,16 @@ class MarketDataDaemon(DaemonRunner):
         return list(
             dict.fromkeys([u.symbol for u in universe] + [app_cfg.backtest.benchmark_symbol])
         )
+
+    def _comparison_benchmark_symbols(self) -> list[str]:
+        app_cfg = load_app_config(self.config_dir)
+        universe_set = set(self._universe_symbols())
+        out: list[str] = []
+        for raw in app_cfg.backtest.comparison_benchmarks:
+            sym = raw.strip().upper()
+            if sym and sym not in universe_set and sym not in out:
+                out.append(sym)
+        return out
 
     def _equity_symbols(self) -> list[str]:
         universe = load_universe(self.config_dir)
@@ -228,18 +240,47 @@ class MarketDataDaemon(DaemonRunner):
                 )
         return saved_rows, alerts
 
+    def _use_consolidated_yf_for_comparison_benchmarks(self) -> bool:
+        return not self._injected_market_provider and self.settings.alpaca_data_feed == "iex"
+
+    def _sync_consolidated_comparison_benchmarks(
+        self,
+        now_utc: datetime,
+        *,
+        period: str = "2y",
+    ) -> int:
+        if not self._use_consolidated_yf_for_comparison_benchmarks():
+            return 0
+        max_date_et = self._canonical_daily_end(now_utc).astimezone(NY_TZ).date()
+        saved_total = 0
+        for sym in self._comparison_benchmark_symbols():
+            df = fetch_yfinance_consolidated_bars(
+                sym, period=period, interval="1d", max_date_et=max_date_et
+            )
+            if not df.empty:
+                saved_total += self.bar_store.save_bars(
+                    sym, df, timeframe="1d", allow_overwrite=True
+                )
+        return saved_total
+
     def _sync_bars_gap_fill(self, symbols: list[str], now_utc: datetime) -> dict[str, Any]:
         provider = self._get_market_provider()
         if provider is None:
             return {"bars_saved": 0, "below_min_bars": [], "alerts": []}
 
         end_utc = self._canonical_daily_end(now_utc)
+        use_yf_comp = self._use_consolidated_yf_for_comparison_benchmarks()
+        sync_symbols = (
+            list(symbols)
+            if use_yf_comp
+            else list(dict.fromkeys(symbols + self._comparison_benchmark_symbols()))
+        )
         full_backfill_syms: list[str] = []
         recent_gap_syms: list[str] = []
         earliest_gap_latest_ts: datetime | None = None
         below_min: list[str] = []
 
-        for sym in symbols:
+        for sym in sync_symbols:
             existing = self.bar_store.load_bars(sym, timeframe="1d")
             count = len(existing)
             if count < self.min_bars_required:
@@ -277,6 +318,9 @@ class MarketDataDaemon(DaemonRunner):
                 saved, sym_alerts = self._save_daily_bars_safe(fetched, now_utc=now_utc)
                 bars_saved += saved
                 alerts.extend(sym_alerts)
+
+        if use_yf_comp:
+            bars_saved += self._sync_consolidated_comparison_benchmarks(now_utc, period="2y")
 
         for sym in symbols:
             if len(self.bar_store.load_bars(sym, timeframe="1d")) < self.min_bars_required:
@@ -509,9 +553,10 @@ class MarketDataDaemon(DaemonRunner):
                     timestamp=now,
                 )
 
+        all_mark_symbols = list(dict.fromkeys(symbols + self._comparison_benchmark_symbols()))
         snapshots_count = 0
         if market_open:
-            snapshots_count = self._poll_intraday_snapshots(symbols, now)
+            snapshots_count = self._poll_intraday_snapshots(all_mark_symbols, now)
 
         eod_ran = False
         eod_bars_saved = 0
@@ -540,8 +585,13 @@ class MarketDataDaemon(DaemonRunner):
             eod_sync_ok = True
             if provider is not None:
                 try:
+                    eod_fetch_syms = (
+                        list(symbols)
+                        if self._use_consolidated_yf_for_comparison_benchmarks()
+                        else all_mark_symbols
+                    )
                     fetched = provider.fetch_bars(
-                        symbols,
+                        eod_fetch_syms,
                         start=now - timedelta(days=7),
                         end=now,
                         timeframe="1d",
@@ -549,6 +599,10 @@ class MarketDataDaemon(DaemonRunner):
                     eod_bars_saved, eod_alerts = self._save_daily_bars_safe(
                         fetched, now_utc=now
                     )
+                    if self._use_consolidated_yf_for_comparison_benchmarks():
+                        eod_bars_saved += self._sync_consolidated_comparison_benchmarks(
+                            now, period="1mo"
+                        )
                 except Exception as exc:  # noqa: BLE001
                     eod_sync_ok = False
                     eod_failed = True

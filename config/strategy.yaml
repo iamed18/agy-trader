@@ -100,6 +100,9 @@ backtest:
   use_fred_tbill_yield: true
   execution_timing: "same_close"
   benchmark_symbol: "SPY"
+  comparison_benchmarks:
+    - "SPMO"
+    - "QMOM"
 
 llm_quota:
   daily_usd_cap: 1.50

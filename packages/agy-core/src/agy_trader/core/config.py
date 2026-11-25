@@ -248,6 +248,7 @@ class BacktestConfig(BaseModel):
     use_fred_tbill_yield: bool = True
     execution_timing: Literal["same_close", "next_open"] = "same_close"
     benchmark_symbol: str = "SPY"
+    comparison_benchmarks: list[str] = Field(default_factory=lambda: ["SPMO", "QMOM"])
 
 
 class LLMQuotaConfig(BaseModel):

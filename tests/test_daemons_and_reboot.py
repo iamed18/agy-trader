@@ -1292,3 +1292,82 @@ def test_m2_news_nlp_per_source_watermarks_and_h3_rotating_logs(tmp_path: Path) 
     finally:
         logging.getLogger().removeHandler(handler)
         handler.close()
+
+
+def test_trader_daemon_snapshot_records_spmo_and_qmom(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    db = StateDB(data_dir / "state.db")
+    bar_store = ParquetBarStore(data_dir / "parquet")
+    universe = load_universe(REPO_CONFIG_DIR)
+    generate_synthetic_dataset(universe=universe, bar_store=bar_store, db=db, days=320, seed=42)
+
+    # Seed QMOM 1d Parquet bars as fallback when live snapshot omits QMOM; provide SPMO live quote
+    spy_df = bar_store.load_bars("SPY", "1d")
+    bar_store.save_bars(
+        "QMOM",
+        _make_daily_bars("QMOM", 30, ensure_utc(spy_df["timestamp"].iloc[-1].to_pydatetime()), base_price=50.0),
+        timeframe="1d",
+        allow_overwrite=True,
+    )
+    expected_qmom = float(bar_store.load_bars("QMOM", "1d")["close"].iloc[-1])
+
+    last_bar_date = ensure_utc(spy_df["timestamp"].iloc[-1].to_pydatetime()).date()
+    snap_now = datetime(last_bar_date.year, last_bar_date.month, last_bar_date.day, 15, 0, tzinfo=UTC)
+
+    class _SnapClient:
+        def get_stock_snapshot(self, req: Any) -> dict[str, Any]:
+            syms = req.symbol_or_symbols
+            if isinstance(syms, str):
+                syms = [syms]
+            out: dict[str, Any] = {}
+            for s in syms:
+                if s == "SPMO":
+                    out[s] = types.SimpleNamespace(
+                        latest_trade=types.SimpleNamespace(price=112.34, timestamp=snap_now),
+                        latest_quote=None,
+                        minute_bar=None,
+                        daily_bar=None,
+                    )
+            return out
+
+    tc = _FakeTradingClient()
+    tc.clock_open = True
+    settings = EnvSettings(
+        alpaca_api_key="paper-key",
+        alpaca_secret_key="paper-secret",
+        alpaca_paper=True,
+        nlp_backend="lexicon",
+        agy_data_dir=data_dir,
+        agy_config_dir=REPO_CONFIG_DIR,
+    )
+    class _EmptyQuoteClient:
+        def get_stock_latest_quote(self, req: Any) -> dict[str, _FakeQuote]:
+            return {}
+
+    broker = AlpacaBroker(
+        settings,
+        db,
+        trading_client=tc,
+        quote_client=_EmptyQuoteClient(),
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: snap_now,
+    )
+    daemon = TraderDaemon(
+        settings,
+        data_dir,
+        REPO_CONFIG_DIR,
+        db=db,
+        bar_store=bar_store,
+        broker=broker,
+        snapshot_client=_SnapClient(),
+        network_check_fn=lambda: True,
+    )
+    daemon.startup(now_utc=snap_now - timedelta(minutes=30))
+    res = daemon.run_once(now_utc=snap_now)
+    assert res["snapshot_recorded"] is True
+    latest = db.get_latest_portfolio_snapshot()
+    assert latest is not None
+    assert latest["spmo_close"] == pytest.approx(112.34)
+    assert latest["qmom_close"] == pytest.approx(expected_qmom)

@@ -3,13 +3,14 @@ from __future__ import annotations
 import logging
 import math
 import re
-from datetime import date
+from datetime import UTC, date, datetime, time
+from zoneinfo import ZoneInfo
 
 import httpx
 import pandas as pd
 import yfinance as yf
 
-from agy_trader.core.models import EarningsEvent, MacroPoint
+from agy_trader.core.models import EarningsEvent, MacroPoint, ensure_utc
 from agy_trader.data.providers import EarningsProvider, EtfHoldingsProvider, MacroProvider
 
 logger = logging.getLogger(__name__)
@@ -238,3 +239,69 @@ class YFinanceEtfHoldingsProvider(EtfHoldingsProvider):
                 continue
 
         return holdings_by_etf
+
+
+_NY_TZ = ZoneInfo("America/New_York")
+_BAR_COLS = ["timestamp", "open", "high", "low", "close", "volume", "vwap"]
+
+
+def fetch_yfinance_consolidated_bars(
+    symbol: str,
+    *,
+    period: str = "2y",
+    interval: str = "1d",
+    max_date_et: date | None = None,
+) -> pd.DataFrame:
+    """Fetch consolidated OHLCV bars via yfinance (avoids thin/zero-volume IEX gaps on ETFs like QMOM)."""
+    clean_sym = symbol.strip().upper()
+    if not clean_sym:
+        return pd.DataFrame(columns=_BAR_COLS)
+    try:
+        raw = yf.Ticker(clean_sym).history(period=period, interval=interval, auto_adjust=False)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to fetch yfinance bars for %s (%s): %s", clean_sym, interval, exc)
+        return pd.DataFrame(columns=_BAR_COLS)
+    if raw is None or raw.empty:
+        return pd.DataFrame(columns=_BAR_COLS)
+
+    rows: list[dict[str, float | datetime]] = []
+    for idx_ts, r in raw.iterrows():
+        c = float(r.get("Close", 0.0) or 0.0)
+        o = float(r.get("Open", c) or c)
+        h = float(r.get("High", max(o, c)) or max(o, c))
+        lo = float(r.get("Low", min(o, c)) or min(o, c))
+        v = float(r.get("Volume", 0.0) or 0.0)
+        if not (math.isfinite(c) and c > 0.0):
+            continue
+        ts_py = pd.Timestamp(idx_ts).to_pydatetime()
+        ts_utc = ensure_utc(ts_py)
+        d_et = ts_utc.astimezone(_NY_TZ).date()
+        if max_date_et is not None and d_et > max_date_et:
+            continue
+        if interval == "1d":
+            ts_utc = datetime.combine(d_et, time(16, 0), tzinfo=_NY_TZ).astimezone(UTC)
+        rows.append(
+            {
+                "timestamp": ts_utc,
+                "open": o if math.isfinite(o) and o > 0.0 else c,
+                "high": max(h, o, c),
+                "low": min(lo, o, c) if lo > 0.0 else min(o, c),
+                "close": c,
+                "volume": max(0.0, v) if math.isfinite(v) else 0.0,
+                "vwap": c,
+            }
+        )
+    if not rows:
+        return pd.DataFrame(columns=_BAR_COLS)
+    return pd.DataFrame(rows, columns=_BAR_COLS)
+
+
+def fetch_yfinance_latest_mark(symbol: str) -> float | None:
+    """Fetch latest regular-session consolidated mark via yfinance 5m bars (fallback to 1d)."""
+    for period, interval in (("5d", "5m"), ("10d", "1d")):
+        df = fetch_yfinance_consolidated_bars(symbol, period=period, interval=interval)
+        if not df.empty:
+            val = float(df["close"].iloc[-1])
+            if math.isfinite(val) and val > 0.0:
+                return val
+    return None

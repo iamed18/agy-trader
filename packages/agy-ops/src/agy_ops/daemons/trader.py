@@ -46,7 +46,7 @@ from agy_trader.core.models import (
     UniverseSymbol,
     ensure_utc,
 )
-from agy_trader.data.macro_and_calendar import FRED_SERIES_IDS
+from agy_trader.data.macro_and_calendar import FRED_SERIES_IDS, fetch_yfinance_latest_mark
 from agy_trader.execution.alpaca_broker import AlpacaBroker
 from agy_trader.risk.engine import HardRiskEngine, PortfolioRiskState
 from agy_trader.storage.db import StateDB
@@ -504,6 +504,33 @@ class TraderDaemon(DaemonRunner):
 
         return marks, mark_ts, snapshots
 
+    def _resolve_symbol_mark(
+        self,
+        symbol: str,
+        live_marks: Mapping[str, float],
+        *,
+        prefer_consolidated_iex_fallback: bool = False,
+    ) -> float | None:
+        if (
+            prefer_consolidated_iex_fallback
+            and self._injected_broker is None
+            and self.settings.alpaca_data_feed == "iex"
+        ):
+            yf_px = fetch_yfinance_latest_mark(symbol)
+            if yf_px is not None:
+                return yf_px
+        live_px = live_marks.get(symbol)
+        if live_px is not None:
+            val = float(live_px)
+            if math.isfinite(val) and val > 0.0:
+                return val
+        df = self.bar_store.load_bars(symbol, timeframe="1d")
+        if not df.empty:
+            val = float(df["close"].iloc[-1])
+            if math.isfinite(val) and val > 0.0:
+                return val
+        return None
+
     def _compute_baselines(
         self,
         universe: list[UniverseSymbol],
@@ -536,11 +563,7 @@ class TraderDaemon(DaemonRunner):
                 if math.isfinite(base_px) and base_px > 0.0:
                     self._ew50_base_prices[sym] = base_px
 
-        spy_close: float | None = live_marks.get(benchmark_symbol)
-        if spy_close is None:
-            spy_df = self.bar_store.load_bars(benchmark_symbol, timeframe="1d")
-            if not spy_df.empty:
-                spy_close = float(spy_df["close"].iloc[-1])
+        spy_close = self._resolve_symbol_mark(benchmark_symbol, live_marks)
 
         ratios: list[float] = []
         for sym in uni_syms:
@@ -1188,7 +1211,14 @@ class TraderDaemon(DaemonRunner):
         )
 
         if should_rebalance or due_for_snapshot:
-            mark_symbols = list(dict.fromkeys(all_symbols + list(positions.keys())))
+            comp_benchmarks = [
+                s.strip().upper()
+                for s in app_cfg.backtest.comparison_benchmarks
+                if s.strip()
+            ]
+            mark_symbols = list(
+                dict.fromkeys(all_symbols + list(positions.keys()) + comp_benchmarks)
+            )
             live_marks, mark_ts, snapshots = self._fetch_live_marks(
                 mark_symbols, broker, positions, now
             )
@@ -1242,6 +1272,12 @@ class TraderDaemon(DaemonRunner):
             spy_close, ew50_index = self._compute_baselines(
                 universe, app_cfg.backtest.benchmark_symbol, live_marks
             )
+            spmo_close = self._resolve_symbol_mark(
+                "SPMO", live_marks, prefer_consolidated_iex_fallback=True
+            )
+            qmom_close = self._resolve_symbol_mark(
+                "QMOM", live_marks, prefer_consolidated_iex_fallback=True
+            )
             self.db.insert_portfolio_snapshot(
                 timestamp=now,
                 equity=round(equity, 2),
@@ -1254,6 +1290,8 @@ class TraderDaemon(DaemonRunner):
                 high_water_mark=round(self._high_water_mark, 2),
                 spy_close=spy_close,
                 ew50_index=ew50_index,
+                spmo_close=spmo_close,
+                qmom_close=qmom_close,
             )
             self._last_snapshot_at = now
             snapshot_recorded = True

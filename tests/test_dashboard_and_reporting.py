@@ -123,6 +123,8 @@ def _seed_operational_state(data_dir: Path, *, now_utc: datetime) -> StateDB:
         high_water_mark=100_000.0,
         spy_close=500.0,
         ew50_index=100.0,
+        spmo_close=100.0,
+        qmom_close=50.0,
     )
     db.insert_portfolio_snapshot(
         timestamp=now_utc,
@@ -136,6 +138,8 @@ def _seed_operational_state(data_dir: Path, *, now_utc: datetime) -> StateDB:
         high_water_mark=103_535.0,
         spy_close=505.0,
         ew50_index=101.5,
+        spmo_close=102.0,
+        qmom_close=50.25,
     )
 
     # Live positions with GTC stops
@@ -258,6 +262,10 @@ def test_dashboard_routes_read_only_and_405_mutations(tmp_path: Path) -> None:
     assert ov_json["total_return_pct"] == pytest.approx(2.5)
     assert ov_json["spy_return_pct"] == pytest.approx(1.0)
     assert ov_json["ew50_return_pct"] == pytest.approx(1.5)
+    assert ov_json["spmo_return_pct"] == pytest.approx(2.0)
+    assert ov_json["qmom_return_pct"] == pytest.approx(0.5)
+    assert ov_json["spmo_daily_return_pct"] == pytest.approx(2.0)
+    assert ov_json["qmom_daily_return_pct"] == pytest.approx(0.5)
     assert ov_json["control_dials"]["exposure_multiplier"] == pytest.approx(0.95)
 
     curve = client.get("/api/equity-curve?limit=100")
@@ -268,6 +276,8 @@ def test_dashboard_routes_read_only_and_405_mutations(tmp_path: Path) -> None:
     assert series[1]["portfolio_index"] == 102.5
     assert series[1]["spy_index"] == 101.0
     assert series[1]["ew50_index"] == 101.5
+    assert series[1]["spmo_index"] == 102.0
+    assert series[1]["qmom_index"] == 100.5
     assert client.get("/api/equity-curve?limit=5001").status_code == 422
 
     pos = client.get("/api/positions")
@@ -355,6 +365,11 @@ def test_reporting_builders_and_agy_ops_cli(
     daily = build_daily_summary(data_dir, REPO_CONFIG_DIR, now_utc=now)
     assert daily["equity"] == 102_500.0
     assert daily["cumulative_return_pct"] == pytest.approx(2.5)
+    assert daily["spmo_daily_return_pct"] == pytest.approx(2.0)
+    assert daily["qmom_daily_return_pct"] == pytest.approx(0.5)
+    assert daily["spmo_cumulative_return_pct"] == pytest.approx(2.0)
+    assert daily["qmom_cumulative_return_pct"] == pytest.approx(0.5)
+    assert "SPMO: +2.00%, QMOM: +0.50%" in daily["markdown_summary"]
     expected_headroom = load_app_config(REPO_CONFIG_DIR).risk.max_drawdown_halt_pct * 100.0 - 1.0
     assert daily["drawdown_headroom_pct"] == pytest.approx(expected_headroom)
     assert len(daily["todays_fills"]) == 2
@@ -737,3 +752,87 @@ def test_daily_summary_benchmark_anchoring_rth_and_holidays(tmp_path: Path) -> N
     assert cash_summary["spy_daily_return_pct"] == pytest.approx(1.0)
     assert cash_summary["ew50_daily_return_pct"] == pytest.approx(2.0)
     assert "since first trade — SPY: N/A, EW-50: N/A" in cash_summary["markdown_summary"]
+
+def test_benchmark_parquet_fallback_for_historical_snapshots(tmp_path: Path) -> None:
+    from zoneinfo import ZoneInfo
+
+    import pandas as pd
+
+    ny_tz = ZoneInfo("America/New_York")
+    data_dir = tmp_path / "data_parquet_fallback"
+    db = StateDB(data_dir / "state.db")
+    bar_store = ParquetBarStore(data_dir / "parquet")
+
+    # Seed Parquet 1d bars for SPMO and QMOM across two sessions (Nov 23 and Nov 24)
+    for sym, closes in (("SPMO", [100.0, 103.0]), ("QMOM", [50.0, 51.0])):
+        df = pd.DataFrame(
+            {
+                "timestamp": [
+                    datetime(2026, 11, 23, 21, 0, tzinfo=UTC),
+                    datetime(2026, 11, 24, 21, 0, tzinfo=UTC),
+                ],
+                "open": closes,
+                "high": closes,
+                "low": closes,
+                "close": closes,
+                "volume": [100_000.0, 100_000.0],
+                "vwap": closes,
+            }
+        )
+        bar_store.save_bars(sym, df, timeframe="1d", allow_overwrite=True)
+
+    # Seed historical snapshots with spmo_close=None, qmom_close=None
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 23, 15, 55, tzinfo=ny_tz).astimezone(UTC),
+        equity=100_000.0,
+        cash=40_000.0,
+        buying_power=140_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=100_000.0,
+        spy_close=500.0,
+        ew50_index=100.0,
+        spmo_close=None,
+        qmom_close=None,
+    )
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2026, 11, 24, 15, 55, tzinfo=ny_tz).astimezone(UTC),
+        equity=101_000.0,
+        cash=40_000.0,
+        buying_power=141_000.0,
+        gross_exposure=0.60,
+        net_exposure=0.60,
+        daily_pnl_pct=0.01,
+        drawdown_pct=0.0,
+        high_water_mark=101_000.0,
+        spy_close=505.0,
+        ew50_index=101.0,
+        spmo_close=None,
+        qmom_close=None,
+    )
+
+    summary = build_daily_summary(
+        data_dir,
+        REPO_CONFIG_DIR,
+        now_utc=datetime(2026, 11, 24, 16, 5, tzinfo=ny_tz).astimezone(UTC),
+    )
+    assert summary["spmo_daily_return_pct"] == pytest.approx(3.0)
+    assert summary["qmom_daily_return_pct"] == pytest.approx(2.0)
+    assert summary["spmo_cumulative_return_pct"] == pytest.approx(3.0)
+    assert summary["qmom_cumulative_return_pct"] == pytest.approx(2.0)
+
+    app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
+    client = TestClient(app)
+    ov = client.get("/api/overview").json()
+    assert ov["spmo_return_pct"] == pytest.approx(3.0)
+    assert ov["qmom_return_pct"] == pytest.approx(2.0)
+    assert ov["spmo_daily_return_pct"] == pytest.approx(3.0)
+    assert ov["qmom_daily_return_pct"] == pytest.approx(2.0)
+
+    series = client.get("/api/equity-curve").json()["series"]
+    assert series[0]["spmo_index"] == pytest.approx(100.0)
+    assert series[0]["qmom_index"] == pytest.approx(100.0)
+    assert series[1]["spmo_index"] == pytest.approx(103.0)
+    assert series[1]["qmom_index"] == pytest.approx(102.0)

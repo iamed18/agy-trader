@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import bisect
 import math
 from collections.abc import Mapping, Sequence
 from datetime import UTC, date, datetime, timedelta
@@ -572,7 +573,10 @@ def select_benchmark_session_snapshots(
     """
     parsed: list[tuple[Mapping[str, Any], datetime, date]] = []
     for snap in snaps:
-        if snap.get("spy_close") is None and snap.get("ew50_index") is None:
+        if not any(
+            snap.get(k) is not None
+            for k in ("spy_close", "ew50_index", "spmo_close", "qmom_close")
+        ):
             continue
         raw_ts = snap.get("timestamp")
         if raw_ts is None:
@@ -600,6 +604,61 @@ def select_benchmark_session_snapshots(
 
     prev_bench_snap, _, _ = _pick_latest_session_snap(prior)
     return (cur_bench_snap, prev_bench_snap)
+
+
+def resolve_snapshot_benchmark_mark(
+    snap: Mapping[str, Any] | None,
+    field: str,
+    symbol: str | None = None,
+    bar_store: ParquetBarStore | None = None,
+    *,
+    bar_cache: dict[str, tuple[list[date], list[float]]] | None = None,
+) -> float | None:
+    """Resolve a benchmark mark from a portfolio snapshot, falling back to 1d Parquet bars."""
+    if snap is None:
+        return None
+    raw = snap.get(field)
+    if raw is not None:
+        val = float(raw)
+        if math.isfinite(val) and val > 0.0:
+            return val
+    if symbol is not None and bar_store is not None:
+        raw_ts = snap.get("timestamp")
+        if raw_ts is None:
+            return None
+        try:
+            ts_utc = (
+                ensure_utc(raw_ts)
+                if isinstance(raw_ts, datetime)
+                else ensure_utc(datetime.fromisoformat(str(raw_ts)))
+            )
+        except (TypeError, ValueError):
+            return None
+        d_et = ts_utc.astimezone(NY_TZ).date()
+        if bar_cache is not None and symbol in bar_cache:
+            dates, closes = bar_cache[symbol]
+        else:
+            df = bar_store.load_bars(symbol, timeframe="1d")
+            if df.empty or "timestamp" not in df.columns or "close" not in df.columns:
+                dates, closes = [], []
+            else:
+                ts_col = df["timestamp"]
+                ts_et_series = (
+                    ts_col.dt.tz_localize(UTC).dt.tz_convert(NY_TZ).dt.date
+                    if ts_col.dt.tz is None
+                    else ts_col.dt.tz_convert(NY_TZ).dt.date
+                )
+                dates = list(ts_et_series)
+                closes = [float(c) for c in df["close"].tolist()]
+            if bar_cache is not None:
+                bar_cache[symbol] = (dates, closes)
+        if dates:
+            idx = bisect.bisect_right(dates, d_et) - 1
+            if idx >= 0:
+                val = closes[idx]
+                if math.isfinite(val) and val > 0.0:
+                    return val
+    return None
 
 
 def build_daily_summary(
@@ -642,23 +701,56 @@ def build_daily_summary(
     if cur_bench_snap is None:
         cur_bench_snap = latest_snap
 
-    spy_daily_pct = (
-        _pct_change(cur_bench_snap.get("spy_close"), prev_bench_snap.get("spy_close"))
-        if cur_bench_snap is not None and prev_bench_snap is not None
-        else None
+    bars_1d_dir = resolved_data / "parquet" / "bars_1d"
+    bar_store = ParquetBarStore(resolved_data / "parquet") if bars_1d_dir.exists() else None
+    bar_cache: dict[str, tuple[list[date], list[float]]] = {}
+
+    cur_spy = resolve_snapshot_benchmark_mark(
+        cur_bench_snap, "spy_close", "SPY", bar_store, bar_cache=bar_cache
     )
-    ew_daily_pct = (
-        _pct_change(cur_bench_snap.get("ew50_index"), prev_bench_snap.get("ew50_index"))
-        if cur_bench_snap is not None and prev_bench_snap is not None
-        else None
+    prev_spy = resolve_snapshot_benchmark_mark(
+        prev_bench_snap, "spy_close", "SPY", bar_store, bar_cache=bar_cache
+    )
+    cur_ew = resolve_snapshot_benchmark_mark(cur_bench_snap, "ew50_index")
+    prev_ew = resolve_snapshot_benchmark_mark(prev_bench_snap, "ew50_index")
+    cur_spmo = resolve_snapshot_benchmark_mark(
+        cur_bench_snap, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
+    )
+    prev_spmo = resolve_snapshot_benchmark_mark(
+        prev_bench_snap, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
+    )
+    cur_qmom = resolve_snapshot_benchmark_mark(
+        cur_bench_snap, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
+    )
+    prev_qmom = resolve_snapshot_benchmark_mark(
+        prev_bench_snap, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
     )
 
+    spy_daily_pct = _pct_change(cur_spy, prev_spy)
+    ew_daily_pct = _pct_change(cur_ew, prev_ew)
+    spmo_daily_pct = _pct_change(cur_spmo, prev_spmo)
+    qmom_daily_pct = _pct_change(cur_qmom, prev_qmom)
+
     if first_invested_snap is not None and cur_bench_snap is not None:
-        spy_cum_pct = _pct_change(cur_bench_snap.get("spy_close"), first_invested_snap.get("spy_close"))
-        ew_cum_pct = _pct_change(cur_bench_snap.get("ew50_index"), first_invested_snap.get("ew50_index"))
+        first_spy = resolve_snapshot_benchmark_mark(
+            first_invested_snap, "spy_close", "SPY", bar_store, bar_cache=bar_cache
+        )
+        first_ew = resolve_snapshot_benchmark_mark(first_invested_snap, "ew50_index")
+        first_spmo = resolve_snapshot_benchmark_mark(
+            first_invested_snap, "spmo_close", "SPMO", bar_store, bar_cache=bar_cache
+        )
+        first_qmom = resolve_snapshot_benchmark_mark(
+            first_invested_snap, "qmom_close", "QMOM", bar_store, bar_cache=bar_cache
+        )
+        spy_cum_pct = _pct_change(cur_spy, first_spy)
+        ew_cum_pct = _pct_change(cur_ew, first_ew)
+        spmo_cum_pct = _pct_change(cur_spmo, first_spmo)
+        qmom_cum_pct = _pct_change(cur_qmom, first_qmom)
     else:
         spy_cum_pct = None
         ew_cum_pct = None
+        spmo_cum_pct = None
+        qmom_cum_pct = None
 
     # Today's fills & slippage vs backtest budget
     todays_fills: list[dict[str, Any]] = []
@@ -735,8 +827,12 @@ def build_daily_summary(
     )
     spy_daily_str = f"{spy_daily_pct:+.2f}%" if spy_daily_pct is not None else "N/A"
     ew_daily_str = f"{ew_daily_pct:+.2f}%" if ew_daily_pct is not None else "N/A"
+    spmo_daily_str = f"{spmo_daily_pct:+.2f}%" if spmo_daily_pct is not None else "N/A"
+    qmom_daily_str = f"{qmom_daily_pct:+.2f}%" if qmom_daily_pct is not None else "N/A"
     spy_cum_str = f"{spy_cum_pct:+.2f}%" if spy_cum_pct is not None else "N/A"
     ew_cum_str = f"{ew_cum_pct:+.2f}%" if ew_cum_pct is not None else "N/A"
+    spmo_cum_str = f"{spmo_cum_pct:+.2f}%" if spmo_cum_pct is not None else "N/A"
+    qmom_cum_str = f"{qmom_cum_pct:+.2f}%" if qmom_cum_pct is not None else "N/A"
     if blackout.halted:
         blackout_summary_str = f"HALTED ({blackout.halt_reason})"
     elif blackout.frozen_symbols:
@@ -748,8 +844,8 @@ def build_daily_summary(
         f"# agy-trader Daily Close Summary ({today_str})",
         "",
         f"- **Equity:** ${equity:,.2f}",
-        f"- **Daily Return:** {daily_return_pct:+.2f}% (SPY: {spy_daily_str}, EW-50: {ew_daily_str})",
-        f"- **Cumulative Return:** {cum_return_pct:+.2f}% (since first trade — SPY: {spy_cum_str}, EW-50: {ew_cum_str})",
+        f"- **Daily Return:** {daily_return_pct:+.2f}% (SPY: {spy_daily_str}, EW-50: {ew_daily_str}, SPMO: {spmo_daily_str}, QMOM: {qmom_daily_str})",
+        f"- **Cumulative Return:** {cum_return_pct:+.2f}% (since first trade — SPY: {spy_cum_str}, EW-50: {ew_cum_str}, SPMO: {spmo_cum_str}, QMOM: {qmom_cum_str})",
         f"- **Drawdown:** {drawdown_pct:.2f}% (Headroom to {halt_pct:.1f}% halt: {drawdown_headroom_pct:.2f}%)",
         f"- **15:40 ET Fills:** {len(todays_fills)} order(s) | Mean Slippage: {slip_text}",
         f"- **Open Positions:** {len(enriched_positions)}",
@@ -763,9 +859,13 @@ def build_daily_summary(
         "daily_return_pct": round(daily_return_pct, 4),
         "spy_daily_return_pct": spy_daily_pct,
         "ew50_daily_return_pct": ew_daily_pct,
+        "spmo_daily_return_pct": spmo_daily_pct,
+        "qmom_daily_return_pct": qmom_daily_pct,
         "cumulative_return_pct": round(cum_return_pct, 4),
         "spy_cumulative_return_pct": spy_cum_pct,
         "ew50_cumulative_return_pct": ew_cum_pct,
+        "spmo_cumulative_return_pct": spmo_cum_pct,
+        "qmom_cumulative_return_pct": qmom_cum_pct,
         "benchmark_anchor_timestamp": first_invested_snap["timestamp"] if first_invested_snap is not None else None,
         "drawdown_pct": round(drawdown_pct, 4),
         "max_drawdown_halt_pct": halt_pct,

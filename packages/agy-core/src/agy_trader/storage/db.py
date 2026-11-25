@@ -264,7 +264,9 @@ class StateDB:
                         drawdown_pct REAL NOT NULL,
                         high_water_mark REAL NOT NULL,
                         spy_close REAL,
-                        ew50_index REAL
+                        ew50_index REAL,
+                        spmo_close REAL,
+                        qmom_close REAL
                     );
 
                     CREATE INDEX IF NOT EXISTS idx_portfolio_snapshots_ts
@@ -301,6 +303,14 @@ class StateDB:
                     );
                     """
             )
+            existing_snap_cols = {
+                str(r["name"])
+                for r in conn.execute("PRAGMA table_info(portfolio_snapshots)").fetchall()
+            }
+            if "spmo_close" not in existing_snap_cols:
+                conn.execute("ALTER TABLE portfolio_snapshots ADD COLUMN spmo_close REAL")
+            if "qmom_close" not in existing_snap_cols:
+                conn.execute("ALTER TABLE portfolio_snapshots ADD COLUMN qmom_close REAL")
 
     def _load_symbols_map(
         self, conn: sqlite3.Connection, article_ids: list[str]
@@ -1324,6 +1334,7 @@ class StateDB:
 
     @staticmethod
     def _row_to_snapshot(row: sqlite3.Row) -> dict[str, Any]:
+        keys = set(row.keys())
         return {
             "id": int(row["id"]),
             "timestamp": str(row["timestamp"]),
@@ -1337,7 +1348,24 @@ class StateDB:
             "high_water_mark": float(row["high_water_mark"]),
             "spy_close": float(row["spy_close"]) if row["spy_close"] is not None else None,
             "ew50_index": float(row["ew50_index"]) if row["ew50_index"] is not None else None,
+            "spmo_close": (
+                float(row["spmo_close"])
+                if "spmo_close" in keys and row["spmo_close"] is not None
+                else None
+            ),
+            "qmom_close": (
+                float(row["qmom_close"])
+                if "qmom_close" in keys and row["qmom_close"] is not None
+                else None
+            ),
         }
+
+    @staticmethod
+    def _clean_opt_pos_float(val: float | None) -> float | None:
+        if val is None:
+            return None
+        f = float(val)
+        return f if math.isfinite(f) and f > 0.0 else None
 
     def insert_portfolio_snapshot(
         self,
@@ -1353,6 +1381,8 @@ class StateDB:
         high_water_mark: float,
         spy_close: float | None = None,
         ew50_index: float | None = None,
+        spmo_close: float | None = None,
+        qmom_close: float | None = None,
     ) -> int:
         required = (
             equity,
@@ -1373,8 +1403,8 @@ class StateDB:
                 INSERT INTO portfolio_snapshots (
                     timestamp, equity, cash, buying_power, gross_exposure,
                     net_exposure, daily_pnl_pct, drawdown_pct, high_water_mark,
-                    spy_close, ew50_index
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    spy_close, ew50_index, spmo_close, qmom_close
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     ts_iso,
@@ -1386,11 +1416,39 @@ class StateDB:
                     float(daily_pnl_pct),
                     float(drawdown_pct),
                     float(high_water_mark),
-                    float(spy_close) if spy_close is not None else None,
-                    float(ew50_index) if ew50_index is not None else None,
+                    self._clean_opt_pos_float(spy_close),
+                    self._clean_opt_pos_float(ew50_index),
+                    self._clean_opt_pos_float(spmo_close),
+                    self._clean_opt_pos_float(qmom_close),
                 ),
             )
             return int(cur.lastrowid or 0)
+
+    def backfill_portfolio_snapshot_benchmarks(
+        self,
+        updates: Sequence[tuple[int, float | None, float | None]],
+    ) -> int:
+        """Backfill missing spmo_close / qmom_close values by snapshot id without overwriting existing non-null marks."""
+        if not updates:
+            return 0
+        updated = 0
+        with closing(self._connect()) as conn, conn:
+            for snap_id, spmo, qmom in updates:
+                cur = conn.execute(
+                    """
+                    UPDATE portfolio_snapshots
+                    SET spmo_close = COALESCE(spmo_close, ?),
+                        qmom_close = COALESCE(qmom_close, ?)
+                    WHERE id = ?
+                    """,
+                    (
+                        self._clean_opt_pos_float(spmo),
+                        self._clean_opt_pos_float(qmom),
+                        int(snap_id),
+                    ),
+                )
+                updated += int(cur.rowcount or 0)
+        return updated
 
     def get_portfolio_snapshots(self, limit: int = 5000) -> list[dict[str, Any]]:
         try:
