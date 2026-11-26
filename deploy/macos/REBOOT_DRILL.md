@@ -68,7 +68,7 @@ uv run --offline agy-ops readiness
 - `<repo-root>/data/logs/*.log`: structured Python application logs (`RotatingFileHandler`, owned by `<user>:<group>`).
 - `/private/var/log/agy-trader/*.log`: `launchd` stdout/stderr logs (owned by `<user>:<group>` `0644` inside `root:wheel` `0755` `/private/var/log/agy-trader/`, rotated by `newsyslog`).
 
-Expected: `status: READY` (or `idle_market_closed` heartbeats outside `09:30–16:00 ET`), WAL integrity `ok`, and dashboard reachable at `http://127.0.0.1:8080`.
+Expected: `status: READY` (or `idle_market_closed` heartbeats outside `09:30–16:00 ET`), WAL integrity `ok`, and dashboard reachable at `http://127.0.0.1:8080` (and `http://<lan-ip>:8080` on the local network).
 
 ---
 
@@ -121,4 +121,4 @@ Verify:
    - All 4 `com.agytrader.*` daemons are running with non-zero PIDs.
    - `wal_ok == true`.
    - `agy-ops readiness` reports `READY` (zero missing GTC stops on open positions).
-   - `http://127.0.0.1:8080` serves the live read-only portfolio dashboard.
+   - `http://127.0.0.1:8080` (and `http://<lan-ip>:8080` from LAN devices) serves the live read-only portfolio dashboard.

@@ -1071,7 +1071,7 @@ def test_cli_reporting_discord_and_dashboard_surface_blackout(
 
     # 3) FastAPI dashboard /api/overview
     dash_app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
-    client = TestClient(dash_app)
+    client = TestClient(dash_app, client=("127.0.0.1", 50000))
     resp = client.get("/api/overview")
     assert resp.status_code == 200
     ov = resp.json()

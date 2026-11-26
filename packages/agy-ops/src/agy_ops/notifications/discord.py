@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import re
 import time
@@ -43,6 +44,7 @@ _WEBHOOK_PATH_RE = re.compile(r"^/api/webhooks/(\d+)/([A-Za-z0-9_-]+)$")
 _WEBHOOK_REDACT_RE = re.compile(r"(/webhooks/[^/\s]+/)([^/?#\s]+)", re.IGNORECASE)
 _WEBHOOK_URL_REDACT_RE = re.compile(r"(/webhooks/[^/?#]+/)([^?#]+)", re.IGNORECASE)
 _USERINFO_REDACT_RE = re.compile(r"(://[^/:@\s]+:)[^/@\s]+(@)")
+_VALID_PNG_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.-]+\.png$")
 
 
 def redact_webhook_url(url: str) -> str:
@@ -136,6 +138,7 @@ def normalize_discord_embed(
     color: int,
     fields: Sequence[Mapping[str, Any]] = (),
     footer: str = DEFAULT_DISCORD_FOOTER,
+    image_url: str | None = None,
 ) -> dict[str, Any]:
     """Normalize and truncate embed fields to strictly satisfy Discord API limits."""
     norm_title = _truncate(str(title), DISCORD_MAX_TITLE_LEN)
@@ -196,6 +199,8 @@ def normalize_discord_embed(
         embed["fields"] = norm_fields
     if norm_footer:
         embed["footer"] = {"text": norm_footer}
+    if image_url is not None and str(image_url).strip():
+        embed["image"] = {"url": str(image_url).strip()}
     return embed
 
 
@@ -264,10 +269,27 @@ class DiscordWebhookNotifier:
 
         return min(MAX_RETRY_DELAY_SECONDS, float(2 ** min(attempt, 10)))
 
-    def _post_with_retries(self, client: httpx.Client, payload: dict[str, Any]) -> httpx.Response:
+    def _post_with_retries(
+        self,
+        client: httpx.Client,
+        payload: dict[str, Any],
+        *,
+        image_bytes: bytes | None = None,
+        image_filename: str = "cumulative_performance.png",
+    ) -> httpx.Response:
+        if image_bytes is not None and _VALID_PNG_FILENAME_RE.fullmatch(image_filename) is None:
+            raise ValueError(f"Invalid PNG attachment filename: {image_filename!r}")
         for attempt in range(self._max_retries + 1):
             try:
-                response = client.post(self.webhook_url, json=payload, follow_redirects=False)
+                if image_bytes is None:
+                    response = client.post(self.webhook_url, json=payload, follow_redirects=False)
+                else:
+                    response = client.post(
+                        self.webhook_url,
+                        data={"payload_json": json.dumps(payload)},
+                        files={"files[0]": (image_filename, image_bytes, "image/png")},
+                        follow_redirects=False,
+                    )
             except httpx.RequestError as exc:
                 safe_detail = _sanitize_error_text(str(exc), self.webhook_url)
                 raise RuntimeError(
@@ -316,19 +338,32 @@ class DiscordWebhookNotifier:
         color: int,
         fields: Sequence[dict[str, Any]] = (),
         footer: str = DEFAULT_DISCORD_FOOTER,
+        image_url: str | None = None,
+        image_bytes: bytes | None = None,
+        image_filename: str = "cumulative_performance.png",
     ) -> dict[str, Any]:
         """Post a single Discord embed to the configured webhook URL."""
+        if image_bytes is not None and _VALID_PNG_FILENAME_RE.fullmatch(image_filename) is None:
+            raise ValueError(f"Invalid PNG attachment filename: {image_filename!r}")
+        resolved_image_url = (
+            f"attachment://{image_filename}"
+            if (image_bytes is not None and image_url is None)
+            else image_url
+        )
         embed = normalize_discord_embed(
             title=title,
             description=description,
             color=color,
             fields=fields,
             footer=footer,
+            image_url=resolved_image_url,
         )
         payload: dict[str, Any] = {
             "username": self.username,
             "embeds": [embed],
         }
+        if image_bytes is not None:
+            payload["attachments"] = [{"id": 0, "filename": image_filename}]
 
         active_client = self._external_client or self._owned_client
         cm = (
@@ -337,7 +372,12 @@ class DiscordWebhookNotifier:
             else httpx.Client(timeout=self._timeout, follow_redirects=False)
         )
         with cm as client:
-            response = self._post_with_retries(client, payload)
+            response = self._post_with_retries(
+                client,
+                payload,
+                image_bytes=image_bytes,
+                image_filename=image_filename,
+            )
 
         response_data: Any = None
         if response.content:
@@ -523,7 +563,11 @@ def build_morning_discord_embed(
     }
 
 
-def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, Any]:
+def build_daily_summary_discord_embed(
+    summary: Mapping[str, Any],
+    *,
+    image_url: str | None = None,
+) -> dict[str, Any]:
     """Build a Discord embed specification from a daily close summary report."""
     session_date = str(summary.get("session_date_et") or "N/A")
     equity = float(summary.get("equity", 0.0))
@@ -564,40 +608,6 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
         f"**Cumulative:** `{cum_ret:+.2f}%` (`SPY`: `{spy_cum_str}` | `EW-50`: `{ew_cum_str}` | `SPMO`: `{spmo_cum_str}` | `QMOM`: `{qmom_cum_str}` since 1st trade)"
     )
 
-    fills = list(summary.get("todays_fills", ()))
-    mean_slip = summary.get("mean_realized_slippage_bps")
-    mean_budget = summary.get("mean_backtest_budget_bps")
-    slip_str = (
-        f"{float(mean_slip):.2f} bps (budget {float(mean_budget):.2f} bps)"
-        if mean_slip is not None and mean_budget is not None
-        else "N/A"
-    )
-    fill_lines = [f"Orders Filled: {len(fills)} | Mean Slippage: {slip_str}"]
-    for ord_row in fills[:6]:
-        slip_val = ord_row.get("realized_slippage_bps")
-        slip_part = f" ({float(slip_val):.2f} bps)" if slip_val is not None else ""
-        fill_lines.append(
-            f"- {ord_row.get('symbol', '?')} {ord_row.get('side', '?')} "
-            f"{ord_row.get('filled_qty', ord_row.get('qty', 0))} @ "
-            f"${float(ord_row.get('filled_avg_price') or 0.0):,.2f}{slip_part}"
-        )
-    if len(fills) > 6:
-        fill_lines.append(f"- (+{len(fills) - 6} more fill(s))")
-
-    positions = list(summary.get("positions", ()))
-    pos_lines = [f"Open Positions: {len(positions)}"]
-    for pos in positions[:8]:
-        stop_price = pos.get("stop_price")
-        dist_pct = pos.get("distance_to_stop_pct")
-        stop_str = f"${float(stop_price):,.2f}" if stop_price is not None else "MISSING"
-        dist_str = f" ({float(dist_pct):.2f}% away)" if dist_pct is not None else ""
-        pos_lines.append(
-            f"- **{pos.get('symbol', '?')}**: qty={pos.get('qty', 0)}, "
-            f"mark=${float(pos.get('market_price', 0.0)):,.2f}, stop={stop_str}{dist_str}"
-        )
-    if len(positions) > 8:
-        pos_lines.append(f"- (+{len(positions) - 8} more position(s))")
-
     drawdown_pct = float(summary.get("drawdown_pct", 0.0))
     halt_pct = float(summary.get("max_drawdown_halt_pct", -8.0))
     headroom_pct = float(summary.get("drawdown_headroom_pct", 0.0))
@@ -626,12 +636,6 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
             "value": pnl_value,
             "inline": False,
         },
-        {
-            "name": "15:40 ET Fills & Realized Slippage vs Budget",
-            "value": "\n".join(fill_lines),
-            "inline": False,
-        },
-        {"name": "Open Positions & GTC Stops", "value": "\n".join(pos_lines), "inline": False},
         {"name": "Drawdown Headroom", "value": dd_value, "inline": False},
         {
             "name": "Notable News / SEC / RSS Events",
@@ -660,14 +664,18 @@ def build_daily_summary_discord_embed(summary: Mapping[str, Any]) -> dict[str, A
         color=color,
         fields=raw_fields,
         footer=DEFAULT_DISCORD_FOOTER,
+        image_url=image_url,
     )
-    return {
+    out: dict[str, Any] = {
         "title": norm["title"],
         "description": norm["description"],
         "color": norm["color"],
         "fields": norm.get("fields", []),
         "footer": str((norm.get("footer") or {}).get("text", DEFAULT_DISCORD_FOOTER)),
     }
+    if "image" in norm:
+        out["image"] = norm["image"]
+    return out
 
 
 def build_test_discord_embed(channel_label: str = DEFAULT_DISCORD_CHANNEL_LABEL) -> dict[str, Any]:

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -30,6 +31,7 @@ from agy_ops.notifications import (
     build_test_discord_embed,
     redact_webhook_url,
 )
+from agy_ops.reporting.charts import render_cumulative_performance_png
 from agy_ops.reporting.digests import (
     build_daily_summary,
     build_morning_plan,
@@ -209,7 +211,10 @@ def daemon_cmd(
         typer.Argument(help="Daemon service: market-data|news-nlp|trader|dashboard"),
     ],
     once: Annotated[bool, typer.Option("--once", help="Run a single deterministic cycle and exit")] = False,
-    host: Annotated[str, typer.Option("--host", help="Dashboard bind host (localhost only)")] = "127.0.0.1",
+    host: Annotated[
+        str,
+        typer.Option("--host", help="Dashboard bind host (localhost, private LAN IP, or 0.0.0.0/::)"),
+    ] = "0.0.0.0",
     port: Annotated[int, typer.Option("--port", min=1, max=65535, help="Dashboard port")] = 8080,
     data_dir: Annotated[Path | None, typer.Option("--data-dir", help="Override data directory")] = None,
     config_dir: Annotated[Path | None, typer.Option("--config-dir", help="Override config directory")] = None,
@@ -318,6 +323,8 @@ def _post_discord_embed(
     embed: dict[str, Any],
     *,
     dry_run: bool,
+    image_bytes: bytes | None = None,
+    image_filename: str = "cumulative_performance.png",
 ) -> tuple[bool, str | None]:
     raw_url = settings.discord_webhook_url.strip()
     if dry_run:
@@ -328,6 +335,11 @@ def _post_discord_embed(
             "(set it in environment/.env or pass --dry-run)."
         )
         raise typer.Exit(code=1)
+    image_url = (
+        embed["image"].get("url")
+        if isinstance(embed.get("image"), Mapping)
+        else None
+    )
     try:
         with DiscordWebhookNotifier(raw_url) as notifier:
             delivery = notifier.send_embed(
@@ -336,6 +348,9 @@ def _post_discord_embed(
                 color=embed["color"],
                 fields=embed.get("fields", ()),
                 footer=embed.get("footer", DEFAULT_DISCORD_FOOTER),
+                image_url=image_url,
+                image_bytes=image_bytes,
+                image_filename=image_filename,
             )
     except (ValueError, RuntimeError) as exc:
         err_console.print(f"[red]Error:[/red] {exc}")
@@ -442,8 +457,24 @@ def notify_close_cmd(
         encoding="utf-8",
     )
 
-    embed = build_daily_summary_discord_embed(summary)
-    sent, redacted_url = _post_discord_embed(settings, embed, dry_run=dry_run)
+    chart_bytes = render_cumulative_performance_png(resolved_data)
+    chart_filename = "cumulative_performance.png"
+    chart_archive_path: Path | None = None
+    if chart_bytes is not None:
+        chart_archive_path = report_dir / "cumulative_performance_latest.png"
+        chart_archive_path.write_bytes(chart_bytes)
+
+    embed = build_daily_summary_discord_embed(
+        summary,
+        image_url=f"attachment://{chart_filename}" if chart_bytes is not None else None,
+    )
+    sent, redacted_url = _post_discord_embed(
+        settings,
+        embed,
+        dry_run=dry_run,
+        image_bytes=chart_bytes,
+        image_filename=chart_filename,
+    )
 
     if json_output:
         _emit_json(
@@ -453,6 +484,7 @@ def notify_close_cmd(
                 "sent": sent,
                 "session_date_et": summary["session_date_et"],
                 "archive_path": str(archive_path),
+                "chart_path": str(chart_archive_path) if chart_archive_path is not None else None,
                 "webhook_url": redacted_url,
                 "embed": embed,
             }

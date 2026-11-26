@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import ipaddress
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Query, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
 from agy_ops.daemons.common import NY_TZ
@@ -21,19 +22,61 @@ from agy_trader.core.models import AssetType, ControlDials, ensure_utc
 from agy_trader.storage.db import StateDB
 from agy_trader.storage.parquet_store import ParquetBarStore
 
-ALLOWED_DASHBOARD_HOSTS: frozenset[str] = frozenset({"127.0.0.1", "localhost", "::1"})
+_LAN_V4_NETWORKS: tuple[ipaddress.IPv4Network, ...] = (
+    ipaddress.IPv4Network("127.0.0.0/8"),     # Loopback
+    ipaddress.IPv4Network("10.0.0.0/8"),      # RFC 1918 private LAN
+    ipaddress.IPv4Network("172.16.0.0/12"),   # RFC 1918 private LAN
+    ipaddress.IPv4Network("192.168.0.0/16"),  # RFC 1918 private LAN
+    ipaddress.IPv4Network("169.254.0.0/16"),  # Link-local
+    ipaddress.IPv4Network("100.64.0.0/10"),   # RFC 6598 CGNAT / Tailscale
+)
+_LAN_V6_NETWORKS: tuple[ipaddress.IPv6Network, ...] = (
+    ipaddress.IPv6Network("::1/128"),         # Loopback
+    ipaddress.IPv6Network("fc00::/7"),        # Unique Local Address (ULA)
+    ipaddress.IPv6Network("fe80::/10"),       # Link-local
+)
+ALLOWED_DASHBOARD_HOSTS: frozenset[str] = frozenset(
+    {"127.0.0.1", "localhost", "::1", "0.0.0.0", "::"}
+)
+SECURITY_HEADERS: dict[str, str] = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; "
+        "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
+    ),
+}
 DAEMON_NAMES: tuple[str, ...] = ("market-data", "news-nlp", "trader", "dashboard")
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+def is_lan_client_host(host: str | None) -> bool:
+    """Return True iff host is a loopback, RFC 1918/ULA, link-local, or RFC 6598 IP."""
+    if not host:
+        return False
+    cleaned = host.strip()
+    if "%" in cleaned:
+        cleaned = cleaned.split("%", 1)[0]
+    try:
+        addr = ipaddress.ip_address(cleaned)
+    except ValueError:
+        return False
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    if isinstance(addr, ipaddress.IPv4Address):
+        return any(addr in net for net in _LAN_V4_NETWORKS)
+    return any(addr in net for net in _LAN_V6_NETWORKS)
+
+
 def validate_dashboard_host(host: str) -> str:
     cleaned = host.strip()
-    if cleaned not in ALLOWED_DASHBOARD_HOSTS:
-        raise ValueError(
-            f"Dashboard host {host!r} rejected: must bind strictly to localhost "
-            f"({sorted(ALLOWED_DASHBOARD_HOSTS)})"
-        )
-    return cleaned
+    if cleaned in ALLOWED_DASHBOARD_HOSTS:
+        return cleaned
+    if "%" not in cleaned and is_lan_client_host(cleaned):
+        return cleaned
+    raise ValueError(
+        f"Dashboard host {host!r} rejected: must be localhost, a private/LAN IP, "
+        f"or wildcard bind ({sorted(ALLOWED_DASHBOARD_HOSTS)})"
+    )
 
 
 def _open_readonly_db(data_dir: Path) -> StateDB | None:
@@ -89,7 +132,12 @@ def _parse_iso_utc(raw: str | None) -> datetime | None:
         return None
 
 
-def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
+def create_dashboard_app(
+    data_dir: Path,
+    config_dir: Path,
+    *,
+    lan_only: bool = True,
+) -> FastAPI:
     """Create a strictly read-only FastAPI dashboard application."""
     resolved_data = Path(data_dir)
     resolved_config = Path(config_dir)
@@ -105,12 +153,17 @@ def create_dashboard_app(data_dir: Path, config_dir: Path) -> FastAPI:
 
     @app.middleware("http")
     async def add_security_headers(request: Request, call_next: Any) -> Response:
+        if lan_only:
+            client_host = request.client.host if request.client is not None else None
+            if not is_lan_client_host(client_host):
+                return PlainTextResponse(
+                    "Forbidden: dashboard access is restricted to localhost and private LAN clients",
+                    status_code=403,
+                    headers=SECURITY_HEADERS,
+                )
         response: Response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; script-src 'self'; style-src 'self'; "
-            "img-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'"
-        )
+        for header_name, header_val in SECURITY_HEADERS.items():
+            response.headers[header_name] = header_val
         return response
 
     if STATIC_DIR.exists():
@@ -531,10 +584,17 @@ def serve_dashboard(
     data_dir: Path,
     config_dir: Path,
     *,
-    host: str = "127.0.0.1",
+    host: str = "0.0.0.0",
     port: int = 8080,
 ) -> None:
-    """Serve the strictly read-only dashboard on localhost only."""
+    """Serve the strictly read-only dashboard on localhost or private LAN."""
     safe_host = validate_dashboard_host(host)
-    app = create_dashboard_app(data_dir=data_dir, config_dir=config_dir)
-    uvicorn.run(app, host=safe_host, port=int(port), log_level="info", access_log=False)
+    app = create_dashboard_app(data_dir=data_dir, config_dir=config_dir, lan_only=True)
+    uvicorn.run(
+        app,
+        host=safe_host,
+        port=int(port),
+        log_level="info",
+        access_log=False,
+        proxy_headers=False,
+    )

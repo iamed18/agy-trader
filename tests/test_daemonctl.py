@@ -51,7 +51,7 @@ def _configure_daemonctl_for_tests(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def _valid_plist_dict(service: str = "trader", log_dir: Path | None = None) -> dict[str, Any]:
     resolved_logs = log_dir or daemonctl.LOG_DIR
-    extra_args = ["--host", "127.0.0.1", "--port", "8080"] if service == "dashboard" else []
+    extra_args = ["--host", "0.0.0.0", "--port", "8080"] if service == "dashboard" else []
     return {
         "Label": f"com.agytrader.{service}",
         "UserName": TEST_RUN_USER,

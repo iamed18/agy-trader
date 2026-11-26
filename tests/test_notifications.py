@@ -19,6 +19,7 @@ from agy_ops.notifications import (
     redact_webhook_url,
     validate_discord_webhook_url,
 )
+from agy_ops.reporting import render_cumulative_performance_png
 from agy_trader.core.config import EnvSettings, load_universe
 from agy_trader.core.models import EarningsEvent, MacroPoint, NewsArticle, SecFilingEvent
 from agy_trader.data.synthetic import generate_synthetic_dataset
@@ -486,18 +487,22 @@ def test_embed_formatters_morning_close_and_test() -> None:
             "notable_news": [],
             "notable_forward_feeds": [],
             "notable_sec_filings": [],
-        }
+        },
+        image_url="attachment://cumulative_performance.png",
     )
     assert pos_close["color"] == 0x22C55E
     assert pos_close["title"] == "AGY Daily Close Summary (2026-11-23)"
     assert "(SPY `-0.47%`)" in pos_close["description"]
+    assert pos_close["image"] == {"url": "attachment://cumulative_performance.png"}
     assert [f["name"] for f in pos_close["fields"]] == [
         "Daily & Cumulative P&L vs SPY, EW-50, SPMO & QMOM",
-        "15:40 ET Fills & Realized Slippage vs Budget",
-        "Open Positions & GTC Stops",
         "Drawdown Headroom",
         "Notable News / SEC / RSS Events",
     ]
+    assert all(
+        "Open Positions" not in f["name"] and "Slippage" not in f["name"]
+        for f in pos_close["fields"]
+    )
     pnl_val = pos_close["fields"][0]["value"]
     assert (
         "**Daily:** `+1.25%` (`SPY`: `-0.47%` | `EW-50`: `-0.79%` | `SPMO`: `+0.35%` | `QMOM`: `-0.22%`)"
@@ -517,6 +522,7 @@ def test_embed_formatters_morning_close_and_test() -> None:
         }
     )
     assert neg_close["color"] == 0xEF4444
+    assert "image" not in neg_close
     assert "(SPY" not in neg_close["description"]
     neg_pnl_val = neg_close["fields"][0]["value"]
     assert "**Daily:** `-1.00%` (`SPY`: `N/A` | `EW-50`: `N/A` | `SPMO`: `N/A` | `QMOM`: `N/A`)" in neg_pnl_val
@@ -662,3 +668,127 @@ def test_cli_notify_morning_close_test_and_errors(
     assert res_fail.exit_code != 0
     assert SAMPLE_TOKEN not in res_fail.output
     assert "/webhooks/123456789012345678/***" in res_fail.output
+
+
+@respx.mock
+def test_notifier_multipart_png_attachment_and_close_cli_chart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from zoneinfo import ZoneInfo
+
+    ny_tz = ZoneInfo("America/New_York")
+    monkeypatch.setenv("NLP_BACKEND", "lexicon")
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "")
+
+    # 1. Empty and single-snapshot DBs return None
+    empty_dir = tmp_path / "empty"
+    assert render_cumulative_performance_png(empty_dir) is None
+
+    single_dir = tmp_path / "single"
+    single_db = StateDB(single_dir / "state.db")
+    single_db.insert_portfolio_snapshot(
+        timestamp=datetime(2025, 12, 30, 15, 40, tzinfo=ny_tz).astimezone(UTC),
+        equity=100_000.0,
+        cash=100_000.0,
+        buying_power=100_000.0,
+        gross_exposure=0.0,
+        net_exposure=0.0,
+        daily_pnl_pct=0.0,
+        drawdown_pct=0.0,
+        high_water_mark=100_000.0,
+        spy_close=500.0,
+        ew50_index=100.0,
+    )
+    assert render_cumulative_performance_png(single_dir) is None
+
+    # 2. Seeded operational DB renders a valid PNG chart
+    data_dir = tmp_path / "data"
+    report_dir = tmp_path / "reports" / "daily"
+    now = datetime(2025, 12, 31, 20, 45, tzinfo=UTC)
+    db = _seed_ops_data(data_dir, now_utc=now)
+    # Also add an after-hours snapshot to exercise RTH benchmark forward-fill
+    db.insert_portfolio_snapshot(
+        timestamp=datetime(2025, 12, 31, 17, 0, tzinfo=ny_tz).astimezone(UTC),
+        equity=101_600.0,
+        cash=39_000.0,
+        buying_power=139_000.0,
+        gross_exposure=0.61,
+        net_exposure=0.61,
+        daily_pnl_pct=0.016,
+        drawdown_pct=-0.004,
+        high_water_mark=102_000.0,
+        spy_close=520.0,
+        ew50_index=115.0,
+    )
+
+    png_bytes = render_cumulative_performance_png(data_dir)
+    assert png_bytes is not None
+    assert png_bytes.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(png_bytes) > 1000
+
+    # 3. notify close --dry-run archives cumulative_performance_latest.png & preserves full markdown
+    res_dry = runner.invoke(
+        ops_cli_app,
+        [
+            "notify",
+            "close",
+            "--dry-run",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--report-dir",
+            str(report_dir),
+            "--json",
+        ],
+    )
+    assert res_dry.exit_code == 0, res_dry.output
+    dry_json = json.loads(res_dry.stdout)
+    expected_chart_path = report_dir / "cumulative_performance_latest.png"
+    assert dry_json["chart_path"] == str(expected_chart_path)
+    assert expected_chart_path.exists()
+    assert expected_chart_path.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+    assert dry_json["embed"]["image"] == {"url": "attachment://cumulative_performance.png"}
+    assert [f["name"] for f in dry_json["embed"]["fields"]] == [
+        "Daily & Cumulative P&L vs SPY, EW-50, SPMO & QMOM",
+        "Drawdown Headroom",
+        "Notable News / SEC / RSS Events",
+    ]
+    md_text = (report_dir / "daily_summary_latest.md").read_text(encoding="utf-8")
+    assert "15:40 ET Fills" in md_text
+    assert "Open Positions" in md_text
+
+    # 4. Live mocked notify close sends multipart/form-data with payload_json + image/png
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", SAMPLE_WEBHOOK)
+    route = respx.post(SAMPLE_WEBHOOK).mock(return_value=httpx.Response(204))
+    res_live = runner.invoke(
+        ops_cli_app,
+        [
+            "notify",
+            "close",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+            "--report-dir",
+            str(report_dir),
+            "--json",
+        ],
+    )
+    assert res_live.exit_code == 0, res_live.output
+    assert SAMPLE_TOKEN not in res_live.output
+    live_json = json.loads(res_live.stdout)
+    assert live_json["sent"] is True
+    assert route.call_count == 1
+
+    req = route.calls[0].request
+    content_type = req.headers.get("content-type", "")
+    assert "multipart/form-data" in content_type
+    body_bytes = req.content
+    assert b'name="payload_json"' in body_bytes
+    assert b'name="files[0]"; filename="cumulative_performance.png"' in body_bytes
+    assert b"Content-Type: image/png" in body_bytes
+    assert b"\x89PNG\r\n\x1a\n" in body_bytes
+    assert b'"attachments": [{"id": 0, "filename": "cumulative_performance.png"}]' in body_bytes
+    assert b'"url": "attachment://cumulative_performance.png"' in body_bytes

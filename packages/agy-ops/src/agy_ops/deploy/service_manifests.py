@@ -40,8 +40,8 @@ DEFAULT_SERVICE_SPECS: tuple[ServiceSpec, ...] = (
         name="dashboard",
         label="com.agytrader.dashboard",
         daemon_arg="dashboard",
-        description="agy-trader Read-Only Portfolio Dashboard (127.0.0.1:8080)",
-        extra_args=("--host", "127.0.0.1", "--port", "8080"),
+        description="agy-trader Read-Only Portfolio Dashboard (0.0.0.0:8080, LAN)",
+        extra_args=("--host", "0.0.0.0", "--port", "8080"),
     ),
 )
 

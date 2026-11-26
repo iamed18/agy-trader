@@ -11,7 +11,12 @@ from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 from agy_ops.cli import app as ops_cli_app
-from agy_ops.dashboard import create_dashboard_app, serve_dashboard
+from agy_ops.dashboard import (
+    create_dashboard_app,
+    is_lan_client_host,
+    serve_dashboard,
+    validate_dashboard_host,
+)
 from agy_ops.reporting import (
     build_daily_summary,
     build_morning_plan,
@@ -219,7 +224,7 @@ def _seed_operational_state(data_dir: Path, *, now_utc: datetime) -> StateDB:
 def test_dashboard_missing_db_and_host_guard(tmp_path: Path) -> None:
     empty_data = tmp_path / "empty_data"
     app = create_dashboard_app(empty_data, REPO_CONFIG_DIR)
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
 
     assert client.get("/").status_code == 200
     assert client.get("/api/overview").json()["has_data"] is False
@@ -232,9 +237,63 @@ def test_dashboard_missing_db_and_host_guard(tmp_path: Path) -> None:
     # Missing DB must NOT be created by read-only dashboard requests!
     assert not (empty_data / "state.db").exists()
 
-    # Localhost-only host guard rejects 0.0.0.0
-    with pytest.raises(ValueError, match="localhost"):
-        serve_dashboard(empty_data, REPO_CONFIG_DIR, host="0.0.0.0", port=8080)
+    # Localhost, wildcard LAN binds, and explicit private LAN IPs are accepted
+    for ok_host in (
+        "127.0.0.1",
+        "localhost",
+        "::1",
+        "0.0.0.0",
+        "::",
+        "192.168.1.50",
+        "10.0.0.5",
+        "172.16.0.5",
+        "100.64.0.5",
+        "fd00::1",
+    ):
+        assert validate_dashboard_host(ok_host) == ok_host
+
+    # Public routable IPs, multicast, and arbitrary hostnames are rejected
+    for bad_host in ("8.8.8.8", "1.1.1.1", "2606:4700:4700::1111", "224.0.0.1", "example.com", ""):
+        with pytest.raises(ValueError, match="rejected"):
+            serve_dashboard(empty_data, REPO_CONFIG_DIR, host=bad_host, port=8080)
+
+
+def test_dashboard_lan_only_client_filter(tmp_path: Path) -> None:
+    empty_data = tmp_path / "empty_data"
+    app = create_dashboard_app(empty_data, REPO_CONFIG_DIR, lan_only=True)
+
+    # Loopback, RFC 1918, link-local, RFC 6598 (Tailscale), and IPv4-mapped LAN clients allowed
+    for allowed_ip in (
+        "127.0.0.1",
+        "::1",
+        "192.168.1.42",
+        "10.0.0.12",
+        "172.20.10.2",
+        "100.64.1.9",
+        "fe80::1%en0",
+        "fd12:3456::1",
+        "::ffff:192.168.1.42",
+    ):
+        assert is_lan_client_host(allowed_ip) is True
+        lan_client = TestClient(app, client=(allowed_ip, 50000))
+        resp = lan_client.get("/api/overview")
+        assert resp.status_code == 200, allowed_ip
+
+    # Public IPs, unspecified wildcard, and non-IP peer hosts fail closed with 403
+    for blocked_ip in (
+        "8.8.8.8",
+        "2606:4700:4700::1111",
+        "::ffff:8.8.8.8",
+        "0.0.0.0",
+        "::",
+        "testclient",
+    ):
+        assert is_lan_client_host(blocked_ip) is False
+        wan_client = TestClient(app, client=(blocked_ip, 50000))
+        resp = wan_client.get("/api/overview", headers={"X-Forwarded-For": "127.0.0.1"})
+        assert resp.status_code == 403, blocked_ip
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert "default-src 'self'" in resp.headers.get("content-security-policy", "")
 
 
 def test_dashboard_routes_read_only_and_405_mutations(tmp_path: Path) -> None:
@@ -248,7 +307,7 @@ def test_dashboard_routes_read_only_and_405_mutations(tmp_path: Path) -> None:
         ro_db.upsert_daemon_heartbeat("evil", "hacked")
 
     app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
 
     assert client.get("/").status_code == 200
     assert client.get("/static/app.js").status_code == 200
@@ -436,8 +495,8 @@ def test_reporting_builders_and_agy_ops_cli(
     assert res_dash.exit_code == 0, res_dash.output
     assert json.loads(res_dash.stdout)["status"] == "healthy"
 
-    # Reject 0.0.0.0 via CLI too
-    res_bad_host = runner.invoke(
+    # Accept 0.0.0.0 for LAN binding and reject public IPs via CLI too
+    res_lan_host = runner.invoke(
         ops_cli_app,
         [
             "daemon",
@@ -445,6 +504,23 @@ def test_reporting_builders_and_agy_ops_cli(
             "--once",
             "--host",
             "0.0.0.0",
+            "--data-dir",
+            str(data_dir),
+            "--config-dir",
+            str(REPO_CONFIG_DIR),
+        ],
+    )
+    assert res_lan_host.exit_code == 0, res_lan_host.output
+    assert json.loads(res_lan_host.stdout)["host"] == "0.0.0.0"
+
+    res_bad_host = runner.invoke(
+        ops_cli_app,
+        [
+            "daemon",
+            "dashboard",
+            "--once",
+            "--host",
+            "8.8.8.8",
             "--data-dir",
             str(data_dir),
             "--config-dir",
@@ -523,7 +599,7 @@ def test_m4_inception_snapshot_preserved_and_security_headers(tmp_path: Path) ->
 
     # Verify security headers, disabled OpenAPI schema, peak_rss_mb, and preserved inception return
     app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
 
     assert client.get("/openapi.json").status_code == 404
     ov = client.get("/api/overview")
@@ -699,7 +775,7 @@ def test_daily_summary_benchmark_anchoring_rth_and_holidays(tmp_path: Path) -> N
 
     # Also verify /api/equity-curve anchors SPY/EW-50 to first invested snapshot (500.0 / 100.0)
     app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
     ov = client.get("/api/overview").json()
     assert ov["spy_daily_return_pct"] == pytest.approx(summary["spy_daily_return_pct"])
     assert ov["ew50_daily_return_pct"] == pytest.approx(summary["ew50_daily_return_pct"])
@@ -751,7 +827,11 @@ def test_daily_summary_benchmark_anchoring_rth_and_holidays(tmp_path: Path) -> N
     assert cash_summary["benchmark_anchor_timestamp"] is None
     assert cash_summary["spy_daily_return_pct"] == pytest.approx(1.0)
     assert cash_summary["ew50_daily_return_pct"] == pytest.approx(2.0)
-    assert "since first trade — SPY: N/A, EW-50: N/A" in cash_summary["markdown_summary"]
+    assert (
+        "since first trade — SPY: N/A, EW-50: N/A, SPMO: N/A, QMOM: N/A"
+        in cash_summary["markdown_summary"]
+    )
+
 
 def test_benchmark_parquet_fallback_for_historical_snapshots(tmp_path: Path) -> None:
     from zoneinfo import ZoneInfo
@@ -824,7 +904,7 @@ def test_benchmark_parquet_fallback_for_historical_snapshots(tmp_path: Path) -> 
     assert summary["qmom_cumulative_return_pct"] == pytest.approx(2.0)
 
     app = create_dashboard_app(data_dir, REPO_CONFIG_DIR)
-    client = TestClient(app)
+    client = TestClient(app, client=("127.0.0.1", 50000))
     ov = client.get("/api/overview").json()
     assert ov["spmo_return_pct"] == pytest.approx(3.0)
     assert ov["qmom_return_pct"] == pytest.approx(2.0)
