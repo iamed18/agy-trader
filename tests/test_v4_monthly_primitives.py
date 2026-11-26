@@ -1152,7 +1152,11 @@ def test_trader_daemon_excludes_etfs_from_signal_universe_when_enabled(tmp_path:
 
         def sync_protective_stops(self, *_args: Any, **_kw: Any) -> Any:
             return types.SimpleNamespace(
-                submitted_stops={}, untouched_blackout_positions=[], untouched_blackout_orders=[], errors=[]
+                submitted_stops={},
+                software_stops={},
+                untouched_blackout_positions=[],
+                untouched_blackout_orders=[],
+                errors=[],
             )
 
     settings = EnvSettings(

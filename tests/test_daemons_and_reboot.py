@@ -1371,3 +1371,308 @@ def test_trader_daemon_snapshot_records_spmo_and_qmom(tmp_path: Path) -> None:
     assert latest is not None
     assert latest["spmo_close"] == pytest.approx(112.34)
     assert latest["qmom_close"] == pytest.approx(expected_qmom)
+
+
+def test_trader_daemon_30s_software_stop_watcher_end_to_end(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    db = StateDB(data_dir / "state.db")
+    bar_store = ParquetBarStore(data_dir / "parquet")
+    universe = load_universe(REPO_CONFIG_DIR)
+    generate_synthetic_dataset(universe=universe, bar_store=bar_store, db=db, days=120, seed=7)
+
+    # Non-rebalance midday timestamp (Friday 2026-11-20 11:00 ET = 16:00 UTC)
+    tick_now = datetime(2026, 11, 20, 16, 0, tzinfo=UTC)
+
+    # Pause new entries to verify protective software stops STILL fire when entries are paused!
+    from agy_trader.core.control_plane import ControlPlane
+
+    ControlPlane(db).set_pause(True, actor="ops", reason="pause entries test", now=tick_now)
+
+    tc = _FakeTradingClient()
+    tc.clock_open = True
+    tc.positions = [
+        _FakePosition("MINI", "0.45", "500.00", "470.00", "-13.50", side="long"),
+        _FakePosition("NVDA", "5.75", "100.00", "100.00", "0.00", side="long"),
+    ]
+    nvda_gtc = _FakeOrder(
+        id="ord-nvda-gtc",
+        client_order_id="cid-nvda-gtc",
+        symbol="NVDA",
+        side="sell",
+        order_type="stop",
+        qty="5",
+        status="new",
+        stop_price="95.00",
+    )
+    tc.orders_by_id[nvda_gtc.id] = nvda_gtc
+    tc.orders_by_cid[nvda_gtc.client_order_id] = nvda_gtc
+
+    # When MINI market sell fills, remove MINI from broker positions to simulate immediate exit fill
+    orig_submit = tc.submit_order
+
+    def _submit_and_close_mini(req: Any) -> _FakeOrder:
+        order = orig_submit(req)
+        if order.symbol == "MINI" and order.order_type == "market" and order.status == "filled":
+            tc.positions = [p for p in tc.positions if p.symbol != "MINI"]
+        return order
+
+    tc.submit_order = _submit_and_close_mini  # type: ignore[method-assign]
+
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "MINI",
+                "qty": 0.45,
+                "avg_entry_price": 500.0,
+                "market_price": 470.0,
+                "unrealized_pnl": -13.5,
+                "stop_order_id": "software",
+                "stop_price": 475.0,
+                "updated_at": tick_now - timedelta(minutes=5),
+            },
+            {
+                "symbol": "NVDA",
+                "qty": 5.75,
+                "avg_entry_price": 100.0,
+                "market_price": 100.0,
+                "unrealized_pnl": 0.0,
+                "stop_order_id": "ord-nvda-gtc",
+                "stop_price": 95.0,
+                "updated_at": tick_now - timedelta(minutes=5),
+            },
+        ]
+    )
+
+    class _SwSnapClient:
+        def get_stock_snapshot(self, req: Any) -> dict[str, Any]:
+            syms = req.symbol_or_symbols
+            if isinstance(syms, str):
+                syms = [syms]
+            marks = {"MINI": 470.0, "NVDA": 100.0, "SPY": 500.0}
+            return {
+                s: types.SimpleNamespace(
+                    latest_trade=types.SimpleNamespace(price=marks.get(s, 100.0), timestamp=tick_now),
+                    latest_quote=None,
+                    minute_bar=None,
+                    daily_bar=None,
+                )
+                for s in syms
+                if s in marks
+            }
+
+    settings = EnvSettings(
+        alpaca_api_key="paper-key",
+        alpaca_secret_key="paper-secret",
+        alpaca_paper=True,
+        nlp_backend="lexicon",
+        agy_data_dir=data_dir,
+        agy_config_dir=REPO_CONFIG_DIR,
+    )
+    broker = AlpacaBroker(
+        settings,
+        db,
+        trading_client=tc,
+        quote_client=_FakeQuoteClient({"MINI": 470.0, "NVDA": 100.0}),
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: tick_now,
+    )
+    daemon = TraderDaemon(
+        settings,
+        data_dir,
+        REPO_CONFIG_DIR,
+        db=db,
+        bar_store=bar_store,
+        broker=broker,
+        snapshot_client=_SwSnapClient(),
+        network_check_fn=lambda: True,
+    )
+
+    res = daemon.run_once(now_utc=tick_now)
+    assert res["rebalance_ran"] is False
+    assert res["paused"] is True
+    assert res["software_stops_triggered"] == ["MINI"]
+    assert res["open_positions"] == 1
+
+    # Verify software_stop daemon event and live_positions update
+    sw_events = db.get_daemon_events(daemon_name="trader", event_type="software_stop")
+    assert len(sw_events) == 1
+    assert sw_events[0]["details"]["triggered"][0]["symbol"] == "MINI"
+    assert sw_events[0]["details"]["triggered"][0]["qty"] == pytest.approx(0.45)
+
+    live_pos = {p["symbol"]: p for p in db.get_live_positions()}
+    assert set(live_pos.keys()) == {"NVDA"}
+    assert live_pos["NVDA"]["stop_order_id"] == "ord-nvda-gtc"
+
+
+def test_software_stop_rejects_stale_and_stub_quotes_and_defers_rebalance_with_backoff(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL #3, HIGH #8, HIGH #9: Reject stale/one-sided/wide quotes; backoff on error; defer rebalance."""
+    data_dir = tmp_path / "data"
+    db = StateDB(data_dir / "state.db")
+    bar_store = ParquetBarStore(data_dir / "parquet")
+    universe = load_universe(REPO_CONFIG_DIR)
+    generate_synthetic_dataset(universe=universe, bar_store=bar_store, db=db, days=320, seed=7)
+    from agy_trader.cli.main import _score_unscored_news
+
+    _score_unscored_news(db, LexiconSentimentScorer())
+
+    spy_df = bar_store.load_bars("SPY", "1d")
+    last_bar_date = ensure_utc(spy_df["timestamp"].iloc[-1].to_pydatetime()).date()
+    rebal_now = datetime(last_bar_date.year, last_bar_date.month, last_bar_date.day, 20, 45, tzinfo=UTC)
+
+    tc = _FakeTradingClient()
+    tc.clock_open = True
+    tc.positions = [
+        _FakePosition("MINI", "0.45", "500.00", "500.00", "0.00", side="long"),
+    ]
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "MINI",
+                "qty": 0.45,
+                "avg_entry_price": 500.0,
+                "market_price": 500.0,
+                "unrealized_pnl": 0.0,
+                "stop_order_id": "software",
+                "stop_price": 475.0,
+                "updated_at": rebal_now - timedelta(minutes=5),
+            }
+        ]
+    )
+
+    # 1) Snapshot has stale trade (10 min old <475), one-sided quote (bid=0.01, ask=None),
+    # and quote_client has wide spread (bid=50, ask=150) -> MUST fall back to pos.market_price=500.0 -> NO trigger!
+    class _StubQuoteSnapClient:
+        def get_stock_snapshot(self, req: Any) -> dict[str, Any]:
+            syms = req.symbol_or_symbols
+            if isinstance(syms, str):
+                syms = [syms]
+            out: dict[str, Any] = {}
+            for s in syms:
+                if s == "MINI":
+                    out[s] = types.SimpleNamespace(
+                        latest_trade=types.SimpleNamespace(
+                            price=400.0, timestamp=rebal_now - timedelta(minutes=10)
+                        ),
+                        latest_quote=types.SimpleNamespace(
+                            bid_price=0.01, ask_price=None, timestamp=rebal_now
+                        ),
+                        minute_bar=None,
+                        daily_bar=None,
+                    )
+                else:
+                    out[s] = types.SimpleNamespace(
+                        latest_trade=types.SimpleNamespace(price=100.0, timestamp=rebal_now),
+                        latest_quote=None,
+                        minute_bar=None,
+                        daily_bar=None,
+                    )
+            return out
+
+    class _WideQuoteClient:
+        def get_stock_latest_quote(self, req: Any) -> dict[str, _FakeQuote]:
+            return {"MINI": _FakeQuote(bid_price=50.0, ask_price=150.0)}
+
+    settings = EnvSettings(
+        alpaca_api_key="paper-key",
+        alpaca_secret_key="paper-secret",
+        alpaca_paper=True,
+        nlp_backend="lexicon",
+        agy_data_dir=data_dir,
+        agy_config_dir=REPO_CONFIG_DIR,
+    )
+    broker = AlpacaBroker(
+        settings,
+        db,
+        trading_client=tc,
+        quote_client=_WideQuoteClient(),
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=lambda _: None,
+        now_fn=lambda: rebal_now,
+    )
+    daemon = TraderDaemon(
+        settings,
+        data_dir,
+        REPO_CONFIG_DIR,
+        db=db,
+        bar_store=bar_store,
+        broker=broker,
+        snapshot_client=_StubQuoteSnapClient(),
+        network_check_fn=lambda: True,
+    )
+
+    sw_marks = daemon._fetch_software_stop_marks(["MINI"], broker, broker.get_broker_positions(), rebal_now)
+    assert sw_marks["MINI"] == pytest.approx(500.0)
+
+    # 2) Valid fresh breach causes submit failure -> 300s backoff prevents spamming on next 30s tick
+    class _BreachSnapClient:
+        def get_stock_snapshot(self, req: Any) -> dict[str, Any]:
+            syms = req.symbol_or_symbols
+            if isinstance(syms, str):
+                syms = [syms]
+            return {
+                s: types.SimpleNamespace(
+                    latest_trade=types.SimpleNamespace(
+                        price=470.0 if s == "MINI" else 100.0, timestamp=rebal_now
+                    ),
+                    latest_quote=None,
+                    minute_bar=None,
+                    daily_bar=None,
+                )
+                for s in syms
+            }
+
+    daemon._snapshot_client = _BreachSnapClient()
+    orig_submit = tc.submit_order
+    submit_attempts = 0
+
+    def _fail_mini_market(req: Any) -> _FakeOrder:
+        nonlocal submit_attempts
+        if getattr(req, "symbol", "") == "MINI" and getattr(req, "stop_price", None) is None:
+            submit_attempts += 1
+            raise RuntimeError("transient broker error")
+        return orig_submit(req)
+
+    tc.submit_order = _fail_mini_market  # type: ignore[method-assign]
+    # Run at midday (non-rebalance) first to test backoff cleanly
+    midday = datetime(last_bar_date.year, last_bar_date.month, last_bar_date.day, 16, 0, tzinfo=UTC)
+    daemon._snapshot_client = types.SimpleNamespace(
+        get_stock_snapshot=lambda req: {
+            s: types.SimpleNamespace(
+                latest_trade=types.SimpleNamespace(
+                    price=470.0 if s == "MINI" else 100.0, timestamp=midday
+                ),
+                latest_quote=None,
+                minute_bar=None,
+                daily_bar=None,
+            )
+            for s in (
+                [req.symbol_or_symbols]
+                if isinstance(req.symbol_or_symbols, str)
+                else req.symbol_or_symbols
+            )
+        }
+    )
+    daemon.run_once(now_utc=midday)
+    assert submit_attempts == 1
+    daemon.run_once(now_utc=midday + timedelta(seconds=30))
+    assert submit_attempts == 1  # Backoff suppressed retry within 300s!
+
+    # 3) HIGH #9: At 15:40 ET rebalance window, when software stop order remains non-terminal, rebalance is deferred!
+    def _open_mini_market(req: Any) -> _FakeOrder:
+        order = orig_submit(req)
+        if order.symbol == "MINI" and order.order_type == "market":
+            order.status = "new"
+            order.filled_qty = "0"
+            order.filled_avg_price = None
+        return order
+
+    tc.submit_order = _open_mini_market  # type: ignore[method-assign]
+    daemon._snapshot_client = _BreachSnapClient()
+    res_defer = daemon.run_once(now_utc=rebal_now)  # > 300s after midday (11:00 ET vs 15:45 ET)
+    assert res_defer["software_stops_triggered"] == ["MINI"]
+    assert res_defer["rebalance_ran"] is False  # Deferred while software stop is non-terminal!

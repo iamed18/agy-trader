@@ -47,7 +47,13 @@ from agy_trader.core.models import (
     ensure_utc,
 )
 from agy_trader.data.macro_and_calendar import FRED_SERIES_IDS, fetch_yfinance_latest_mark
-from agy_trader.execution.alpaca_broker import AlpacaBroker
+from agy_trader.execution.alpaca_broker import (
+    _MIN_STOP_QTY,
+    SOFTWARE_STOP_ORDER_ID,
+    AlpacaBroker,
+    SoftwareStopResult,
+    _same_side_db_stop_price,
+)
 from agy_trader.risk.engine import HardRiskEngine, PortfolioRiskState
 from agy_trader.storage.db import StateDB
 from agy_trader.storage.parquet_store import ParquetBarStore
@@ -257,6 +263,7 @@ class TraderDaemon(DaemonRunner):
         self._ew50_base_prices: dict[str, float] = {}
         self._last_noncompleted_rebalance_at: datetime | None = None
         self._last_noncompleted_rebalance_reason: str | None = None
+        self._sw_stop_backoff: dict[str, tuple[datetime, float]] = {}
 
     def _get_broker(self) -> AlpacaBroker:
         if self.broker is None:
@@ -443,6 +450,7 @@ class TraderDaemon(DaemonRunner):
             "position_diffs_count": len(recon.position_diffs),
             "missing_stop_symbols": recon.missing_stop_symbols,
             "submitted_stops": sorted(stop_sync.submitted_stops.keys()),
+            "software_stops": sorted(stop_sync.software_stops.keys()),
             "equity": round(acct["equity"], 2),
         }
         self.db.record_daemon_event(
@@ -503,6 +511,97 @@ class TraderDaemon(DaemonRunner):
                 mark_ts[sym] = now_utc
 
         return marks, mark_ts, snapshots
+
+    def _fetch_software_stop_marks(
+        self,
+        symbols: list[str],
+        broker: AlpacaBroker,
+        broker_positions: Mapping[str, Mapping[str, float]],
+        now_utc: datetime,
+        *,
+        max_staleness_seconds: float = 300.0,
+    ) -> dict[str, float]:
+        """Resolve validated intraday marks for software stops, rejecting stale or stub quotes."""
+        raw_snaps: dict[str, Any] = {}
+        snap_client = self._get_snapshot_client(broker)
+        if snap_client is not None and hasattr(snap_client, "get_stock_snapshot"):
+            feed = DataFeed.SIP if self.settings.alpaca_data_feed == "sip" else DataFeed.IEX
+            for idx in range(0, len(symbols), 25):
+                batch = symbols[idx : idx + 25]
+                try:
+                    req = StockSnapshotRequest(symbol_or_symbols=batch, feed=feed)
+                    resp = snap_client.get_stock_snapshot(req)
+                    if isinstance(resp, Mapping):
+                        for sym, snap in resp.items():
+                            clean_sym = str(sym).strip().upper()
+                            if clean_sym and snap is not None:
+                                raw_snaps[clean_sym] = snap
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("trader_swstop_snapshot_fetch_failed", error=str(exc))
+
+        def _is_fresh(ts: datetime | None) -> bool:
+            if ts is None:
+                return False
+            age_s = (now_utc - ts).total_seconds()
+            future_s = (ts - now_utc).total_seconds()
+            return age_s <= max_staleness_seconds and future_s <= 60.0
+
+        def _validate_quote_mid(
+            bid: float | None, ask: float | None, pos_mkt: float | None
+        ) -> float | None:
+            if bid is None or ask is None or bid <= 0.0 or ask <= 0.0 or ask < bid:
+                return None
+            mid = (bid + ask) / 2.0
+            if mid <= 0.0 or ((ask - bid) / mid) > 0.02:
+                return None
+            if pos_mkt is not None and mid < pos_mkt * 0.95:
+                return None
+            return mid
+
+        marks: dict[str, float] = {}
+        for sym in symbols:
+            pos = broker_positions.get(sym)
+            pos_mkt = _opt_pos_float(pos.get("market_price")) if pos is not None else None
+            snap = raw_snaps.get(sym)
+            if snap is not None:
+                trade = _get_field(snap, "latest_trade")
+                if trade is not None:
+                    t_px = _opt_pos_float(_get_field(trade, "price", "p"))
+                    t_ts = _parse_ts_any(_get_field(trade, "timestamp", "t"))
+                    if t_px is not None and _is_fresh(t_ts):
+                        marks[sym] = t_px
+                        continue
+
+                mbar = _get_field(snap, "minute_bar")
+                if mbar is not None:
+                    m_px = _opt_pos_float(_get_field(mbar, "close", "c", "price"))
+                    m_ts = _parse_ts_any(_get_field(mbar, "timestamp", "t"))
+                    if m_px is not None and _is_fresh(m_ts):
+                        marks[sym] = m_px
+                        continue
+
+                quote = _get_field(snap, "latest_quote")
+                if quote is not None:
+                    q_bid = _opt_pos_float(_get_field(quote, "bid_price", "bp"))
+                    q_ask = _opt_pos_float(_get_field(quote, "ask_price", "ap"))
+                    q_ts = _parse_ts_any(_get_field(quote, "timestamp", "t"))
+                    if _is_fresh(q_ts):
+                        q_mid = _validate_quote_mid(q_bid, q_ask, pos_mkt)
+                        if q_mid is not None:
+                            marks[sym] = q_mid
+                            continue
+
+            if broker.quote_client is not None:
+                bid, ask = broker.get_latest_quote(sym)
+                q_mid = _validate_quote_mid(bid, ask, pos_mkt)
+                if q_mid is not None:
+                    marks[sym] = q_mid
+                    continue
+
+            if pos_mkt is not None:
+                marks[sym] = pos_mkt
+
+        return marks
 
     def _resolve_symbol_mark(
         self,
@@ -982,17 +1081,10 @@ class TraderDaemon(DaemonRunner):
                 cand_stop = float(v.stop_loss_price)
                 cur_q = current_positions.get(sym, 0.0)
                 prev_stop = existing_db_stops.get(sym)
-                ref_px = prices.get(sym, v.order.reference_price)
                 if cur_q > 1e-9 and v.order.side == OrderSide.buy and prev_stop is not None:
-                    tightened = max(cand_stop, float(prev_stop))
-                    desired_stops[sym] = (
-                        tightened if (ref_px > 0.0 and tightened < ref_px) else cand_stop
-                    )
+                    desired_stops[sym] = max(cand_stop, float(prev_stop))
                 elif cur_q < -1e-9 and v.order.side == OrderSide.sell and prev_stop is not None:
-                    tightened = min(cand_stop, float(prev_stop))
-                    desired_stops[sym] = (
-                        tightened if (ref_px > 0.0 and tightened > ref_px) else cand_stop
-                    )
+                    desired_stops[sym] = min(cand_stop, float(prev_stop))
                 else:
                     desired_stops[sym] = cand_stop
 
@@ -1068,6 +1160,7 @@ class TraderDaemon(DaemonRunner):
             "successful_exec_count": successful_exec_count,
             "executed_count": len(exec_report.records),
             "submitted_stops": sorted(stop_sync.submitted_stops.keys()),
+            "software_stops": sorted(stop_sync.software_stops.keys()),
             "untouched_blackout_positions": stop_sync.untouched_blackout_positions,
             "untouched_blackout_orders": stop_sync.untouched_blackout_orders,
             "blackout": active_blackout.to_status_dict(),
@@ -1165,6 +1258,86 @@ class TraderDaemon(DaemonRunner):
                 timestamp=now,
             )
 
+        # 2b. Hybrid Software Fractional Stop Watcher (strictly when market_open == True and not blackout.halted)
+        sw_stop_result: SoftwareStopResult | None = None
+        if market_open and not blackout.halted and positions:
+            db_pos_map = {p["symbol"]: p for p in self.db.get_live_positions()}
+            sw_watch_syms: list[str] = []
+            for sym, pos in sorted(positions.items()):
+                if pos["qty"] <= _MIN_STOP_QTY or sym in blackout.frozen_symbols:
+                    continue
+                db_pos = db_pos_map.get(sym)
+                same_side_px = _same_side_db_stop_price(db_pos, pos["qty"])
+                is_watched = (
+                    AlpacaBroker._split_hybrid_stop_quantities(pos["qty"])[1] > 0.0
+                    or (db_pos is not None and db_pos.get("stop_order_id") == SOFTWARE_STOP_ORDER_ID)
+                    or (
+                        db_pos is not None
+                        and db_pos.get("stop_order_id") is None
+                        and same_side_px is not None
+                    )
+                )
+                if not is_watched:
+                    continue
+                backoff = self._sw_stop_backoff.get(sym)
+                if backoff is not None:
+                    fail_at, fail_qty = backoff
+                    if (
+                        abs(pos["qty"] - fail_qty) <= _MIN_STOP_QTY
+                        and (now - fail_at).total_seconds() < 300.0
+                    ):
+                        continue
+                    self._sw_stop_backoff.pop(sym, None)
+                sw_watch_syms.append(sym)
+
+            if sw_watch_syms:
+                sw_marks = self._fetch_software_stop_marks(sw_watch_syms, broker, positions, now)
+                sw_stop_result = broker.evaluate_and_execute_software_stops(
+                    sw_marks,
+                    session_date=session_date,
+                    run_id=f"swstop-{now.strftime('%Y%m%dT%H%M%SZ')}",
+                    market_open=market_open,
+                    symbols=sw_watch_syms,
+                )
+                for trig in sw_stop_result.triggered:
+                    if trig.status in {"rejected", "error"} or trig.error is not None:
+                        if trig.symbol in positions:
+                            self._sw_stop_backoff[trig.symbol] = (
+                                now,
+                                float(positions[trig.symbol]["qty"]),
+                            )
+                    else:
+                        self._sw_stop_backoff.pop(trig.symbol, None)
+                for err in sw_stop_result.errors:
+                    err_sym = err.split(":", 1)[0].strip().upper()
+                    if err_sym in positions:
+                        self._sw_stop_backoff[err_sym] = (now, float(positions[err_sym]["qty"]))
+
+                if sw_stop_result.triggered or sw_stop_result.errors:
+                    self.db.record_daemon_event(
+                        self.daemon_name,
+                        "software_stop",
+                        sw_stop_result.model_dump(mode="json"),
+                        timestamp=now,
+                    )
+                if sw_stop_result.triggered:
+                    broker.reconcile_with_broker(daemon_name=self.daemon_name, record_if_clean=False)
+                    acct = broker.get_account_state()
+                    positions = broker.get_broker_positions()
+                    equity = acct["equity"]
+                    cash = acct["cash"]
+                    buying_power = acct["buying_power"]
+                    last_equity = acct["last_equity"]
+                    daily_pnl_pct = (
+                        (equity - last_equity) / last_equity if last_equity > 1e-9 else 0.0
+                    )
+                    self._high_water_mark = max(self._high_water_mark, equity)
+                    drawdown_pct = (
+                        min(0.0, (equity - self._high_water_mark) / self._high_water_mark)
+                        if self._high_water_mark > 1e-9
+                        else 0.0
+                    )
+
         # 3. Scheduled idempotent rebalance checkpoint (strictly gated on market_open == True!)
         rebalance_result: dict[str, Any] | None = None
         live_marks: dict[str, float] = {}
@@ -1186,6 +1359,7 @@ class TraderDaemon(DaemonRunner):
             market_open
             and active_ckpt is not None
             and not self.db.has_session_rebalance_completed(session_date, active_ckpt)
+            and not (sw_stop_result is not None and sw_stop_result.has_open_orders)
         )
         if should_rebalance and self._last_noncompleted_rebalance_at is not None:
             blocker_cleared = (
@@ -1307,6 +1481,9 @@ class TraderDaemon(DaemonRunner):
             "blackout": blackout.to_status_dict(),
             "rebalance_ran": rebalance_result is not None,
             "snapshot_recorded": snapshot_recorded,
+            "software_stops_triggered": (
+                [t.symbol for t in sw_stop_result.triggered] if sw_stop_result else []
+            ),
         }
         self.write_heartbeat(hb_status, details, now_utc=now)
         return {"status": hb_status, "rebalance": rebalance_result, **details}

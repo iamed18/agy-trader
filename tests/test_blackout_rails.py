@@ -834,6 +834,62 @@ def test_alpaca_broker_leaves_frozen_positions_and_resting_stops_untouched(tmp_p
     assert any(c["symbol"] == "GOOGL" for c in flat_override["close_orders"])
 
 
+def test_frozen_blackout_hybrid_transition_preserves_software_stop_locally(
+    tmp_path: Path,
+) -> None:
+    """HIGH #7: Frozen 5.75->0.75 transition preserves stop_order_id='software' and stop_price=95.00."""
+    clock = _FakeClock()
+    tc = _FakeTradingClient()
+    db = StateDB(tmp_path / "state.db")
+    now = clock.now()
+    _seed_etf_holdings(db, now_utc=now)
+    env_p = tmp_path / ".env"
+    env_p.write_text('BLACKOUT_PERIOD="GOOG"\n', encoding="utf-8")
+
+    # Pre-existing frozen GOOGL hybrid position: 5.75 shares, 5-share GTC stop filled -> 0.75 remains
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "GOOGL",
+                "qty": 5.75,
+                "avg_entry_price": 100.0,
+                "market_price": 94.5,
+                "unrealized_pnl": -31.62,
+                "stop_order_id": "stp-googl-5",
+                "stop_price": 95.0,
+                "updated_at": now,
+            }
+        ]
+    )
+    tc.positions = [_FakePosition("GOOGL", "0.75", "100.00", "94.50", "-4.12", side="long")]
+
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+        env_file=env_p,
+        config_dir=REPO_CONFIG_DIR,
+    )
+
+    rec = broker.reconcile_with_broker(daemon_name="trader", record_if_clean=False)
+    assert rec.untouched_blackout_positions == ["GOOGL"]
+    assert tc.submitted_requests == []
+    assert tc.canceled_ids == []
+    live1 = {p["symbol"]: p for p in db.get_live_positions()}
+    assert live1["GOOGL"]["stop_order_id"] == "software"
+    assert live1["GOOGL"]["stop_price"] == pytest.approx(95.00)
+
+    sync_res = broker.sync_protective_stops({}, session_date="2026-11-20", run_id="frozen-sync")
+    assert "GOOGL" in sync_res.untouched_blackout_positions
+    assert tc.submitted_requests == []
+    assert tc.canceled_ids == []
+    live2 = {p["symbol"]: p for p in db.get_live_positions()}
+    assert live2["GOOGL"]["stop_order_id"] == "software"
+    assert live2["GOOGL"]["stop_price"] == pytest.approx(95.00)
+
+
 def test_trader_daemon_hot_reload_and_deduplicated_discord_alert(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     env_p = tmp_path / ".env"

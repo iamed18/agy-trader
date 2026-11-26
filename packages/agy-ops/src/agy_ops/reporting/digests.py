@@ -21,6 +21,11 @@ from agy_trader.core.calendar import (
 from agy_trader.core.config import AppConfig, EnvSettings, load_app_config, load_universe
 from agy_trader.core.models import AssetType, ControlDials, MacroPoint, ensure_utc
 from agy_trader.data.macro_and_calendar import FRED_SERIES_IDS
+from agy_trader.execution.alpaca_broker import (
+    _MIN_STOP_QTY,
+    SOFTWARE_STOP_ORDER_ID,
+    AlpacaBroker,
+)
 from agy_trader.storage.db import StateDB
 from agy_trader.storage.parquet_store import ParquetBarStore
 from agy_trader.strategy.features import compute_macro_regime_scale
@@ -283,13 +288,27 @@ def build_readiness_report(
     else:
         _add_check("sentiment_backlog", "ok", f"0 unscored news backlog ({active_model})")
 
-    # 7. Positions vs resting GTC stops
+    # 7. Positions vs resting GTC / software stops
     positions = db.get_live_positions()
+    trader_check = next((c for c in checks if c["name"] == "daemon:trader"), None)
+    trader_ok = trader_check is not None and trader_check.get("severity") == "ok"
     unprotected = [
         p["symbol"]
         for p in positions
-        if abs(float(p["qty"])) > 1e-5
-        and (not p.get("stop_order_id") or p.get("stop_price") is None)
+        if abs(float(p["qty"])) > _MIN_STOP_QTY
+        and (
+            not p.get("stop_order_id")
+            or p.get("stop_price") is None
+            or float(p["stop_price"]) <= 0.0
+        )
+    ]
+    software_only = [
+        p["symbol"]
+        for p in positions
+        if abs(float(p["qty"])) > _MIN_STOP_QTY
+        and p.get("stop_order_id") == SOFTWARE_STOP_ORDER_ID
+        and p.get("stop_price") is not None
+        and float(p["stop_price"]) > 0.0
     ]
     if unprotected:
         _add_check(
@@ -297,6 +316,23 @@ def build_readiness_report(
             "critical",
             f"Open positions missing resting protective stop: {', '.join(unprotected)}",
             unprotected_symbols=unprotected,
+        )
+    elif software_only and not trader_ok:
+        _add_check(
+            "protective_stops",
+            "critical",
+            (
+                "Software-protected fractional positions active while trader daemon is not healthy: "
+                f"{', '.join(software_only)}"
+            ),
+            software_stop_symbols=software_only,
+        )
+    elif software_only:
+        _add_check(
+            "protective_stops",
+            "ok",
+            f"All {len(positions)} open position(s) protected ({len(software_only)} software-monitored)",
+            software_stop_symbols=software_only,
         )
     else:
         _add_check(
@@ -517,7 +553,22 @@ def build_morning_plan(
         md_lines.append("")
         md_lines.append("## Current Positions & GTC Stops")
         for p in positions:
-            stop_str = f"${float(p['stop_price']):,.2f}" if p.get("stop_price") is not None else "MISSING"
+            qty_val = float(p["qty"])
+            raw_stop_px = p.get("stop_price")
+            stop_id = p.get("stop_order_id")
+            if raw_stop_px is not None and float(raw_stop_px) > 0.0:
+                stop_px_str = f"${float(raw_stop_px):,.2f}"
+                _, sw_frac = AlpacaBroker._split_hybrid_stop_quantities(qty_val)
+                if stop_id == SOFTWARE_STOP_ORDER_ID:
+                    stop_str = f"{stop_px_str} (software)"
+                elif not stop_id:
+                    stop_str = f"MISSING GTC (target {stop_px_str})"
+                elif sw_frac > 0.0:
+                    stop_str = f"{stop_px_str} (GTC+sw)"
+                else:
+                    stop_str = stop_px_str
+            else:
+                stop_str = "MISSING"
             md_lines.append(
                 f"- **{p['symbol']}**: qty={p['qty']}, mark=${float(p['market_price']):,.2f}, stop={stop_str}"
             )

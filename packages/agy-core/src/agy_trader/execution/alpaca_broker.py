@@ -65,6 +65,8 @@ _OPEN_ORDER_STATUSES = frozenset(
 )
 _STOP_PROTECTIVE_TOLERANCE = 0.0025  # 0.25% tolerance when checking existing stop protectiveness
 _MAX_CLIENT_ORDER_ID_LEN = 48
+_MIN_STOP_QTY = 1e-5
+SOFTWARE_STOP_ORDER_ID = "software"
 
 
 class _StrictExecutionModel(BaseModel):
@@ -109,12 +111,39 @@ class StopSyncResult(_StrictExecutionModel):
     run_id: str
     kept_stops: dict[str, str] = Field(default_factory=dict)
     submitted_stops: dict[str, str] = Field(default_factory=dict)
+    software_stops: dict[str, float] = Field(default_factory=dict)
     canceled_orphans: list[str] = Field(default_factory=list)
     canceled_stale: list[str] = Field(default_factory=list)
     untouched_blackout_positions: list[str] = Field(default_factory=list)
     untouched_blackout_orders: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+
+
+class SoftwareStopExecution(_StrictExecutionModel):
+    symbol: str
+    qty: float
+    trigger_price: float
+    stop_price: float
+    client_order_id: str
+    broker_order_id: str | None = None
+    status: str
+    filled_qty: float = 0.0
+    filled_avg_price: float | None = None
+    error: str | None = None
+
+
+class SoftwareStopResult(_StrictExecutionModel):
+    session_date: str
+    run_id: str
+    checked_symbols: list[str] = Field(default_factory=list)
+    triggered: list[SoftwareStopExecution] = Field(default_factory=list)
+    untouched_blackout_positions: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+
+    @property
+    def has_open_orders(self) -> bool:
+        return any(t.status not in _TERMINAL_ORDER_STATUSES for t in self.triggered)
 
 
 class ReconciliationResult(_StrictExecutionModel):
@@ -214,15 +243,43 @@ def _is_not_found_error(exc: Exception) -> bool:
     return status_code == 404 or "404" in msg or "not found" in msg
 
 
+def _open_order_remaining_qty(order: Any) -> float:
+    return max(
+        0.0,
+        _req_float(getattr(order, "qty", 0.0)) - _req_float(getattr(order, "filled_qty", 0.0)),
+    )
+
+
+def _same_side_db_stop_price(
+    db_pos: Mapping[str, Any] | None,
+    signed_qty: float,
+) -> float | None:
+    if db_pos is None:
+        return None
+    raw_px = db_pos.get("stop_price")
+    if raw_px is None:
+        return None
+    px = float(raw_px)
+    if not math.isfinite(px) or px <= 0.0:
+        return None
+    db_qty = float(db_pos.get("qty", 0.0))
+    if (db_qty > 1e-9 and signed_qty > 1e-9) or (db_qty < -1e-9 and signed_qty < -1e-9):
+        return px
+    return None
+
+
 class AlpacaBroker:
     """Idempotent, risk-aware live/paper Alpaca execution adapter.
 
-    Alpaca GTC Stop-Order Constraint:
-        Alpaca only supports ``TimeInForce.GTC`` on whole-share quantities. For fractional
-        long positions (>= 1 share), ``sync_protective_stops`` floors the stop quantity to
-        whole shares with ``GTC`` and logs a warning for the fractional remainder. For
-        fractional long positions strictly below 1.0 share, it falls back to ``TimeInForce.DAY``
-        (with graceful error handling if rejected) and emits a warning.
+    Hybrid Protective Stop Architecture:
+        Alpaca only supports server-side ``StopOrderRequest`` (``TimeInForce.GTC``) on
+        whole-share quantities. For hybrid fractional longs (``N + f`` shares with ``N >= 1``),
+        ``sync_protective_stops`` attaches a server-side ``GTC`` stop on ``N`` whole shares
+        and tracks the fractional remainder ``f`` in ``software_stops`` for 30-second daemon
+        monitoring via ``evaluate_and_execute_software_stops``. For sub-1.0 fractional longs
+        (``0 < f < 1``), no broker ``StopOrderRequest`` is submitted; instead, the position is
+        persisted with ``stop_order_id="software"`` and monitored by the daemon watcher.
+        Shorts remain whole-share ``GTC`` only.
     """
 
     def __init__(
@@ -384,8 +441,14 @@ class AlpacaBroker:
             signed_qty = -raw_qty if (side_str == "short" and raw_qty > 0.0) else raw_qty
             if abs(signed_qty) <= 1e-9:
                 continue
+            qty_avail = _opt_float(getattr(pos, "qty_available", None))
             result[sym] = {
                 "qty": signed_qty,
+                "qty_available": (
+                    float(qty_avail)
+                    if (qty_avail is not None and qty_avail >= 0.0)
+                    else abs(signed_qty)
+                ),
                 "avg_entry_price": _req_float(getattr(pos, "avg_entry_price", 0.0)),
                 "market_price": _req_float(
                     getattr(pos, "current_price", getattr(pos, "market_price", 0.0))
@@ -1379,37 +1442,52 @@ class AlpacaBroker:
         )
 
     @staticmethod
+    def _split_hybrid_stop_quantities(signed_qty: float) -> tuple[float, float]:
+        """Split signed position qty into ``(broker_gtc_qty, software_frac_qty)``."""
+        abs_qty = abs(signed_qty)
+        if abs_qty < _MIN_STOP_QTY:
+            return (0.0, 0.0)
+
+        if signed_qty < 0.0:
+            # Shorts are always whole-share GTC (floor safely instead of rounding up)
+            return (float(math.floor(abs_qty + 1e-9)), 0.0)
+
+        whole = math.floor(abs_qty + 1e-9)
+        frac = round(max(0.0, abs_qty - whole), 6)
+        if frac < _MIN_STOP_QTY:
+            return (float(whole), 0.0)
+        return (float(whole), frac)
+
+    @staticmethod
     def _resolve_stop_qty_and_tif(
         symbol: str, signed_qty: float, warnings: list[str]
     ) -> tuple[float, TimeInForce]:
         abs_qty = abs(signed_qty)
-        if abs_qty < 1e-5:
+        whole, frac = AlpacaBroker._split_hybrid_stop_quantities(signed_qty)
+        if whole == 0.0 and frac == 0.0:
             warnings.append(
-                f"{symbol}: dust position qty {abs_qty:.8f} < 1e-5; skipping protective stop order"
+                f"{symbol}: dust position qty {abs_qty:.8f} < {_MIN_STOP_QTY:.0e}; skipping protective stop order"
             )
             return 0.0, TimeInForce.GTC
 
         if signed_qty < 0.0:
-            # Shorts are always whole shares
-            return float(round(abs_qty)), TimeInForce.GTC
+            return whole, TimeInForce.GTC
 
-        whole = math.floor(abs_qty + 1e-9)
-        frac_remainder = abs_qty - whole
-        if frac_remainder <= 1e-6:
-            return float(whole), TimeInForce.GTC
+        if frac == 0.0:
+            return whole, TimeInForce.GTC
 
-        if whole >= 1:
+        if whole >= 1.0:
             warnings.append(
-                f"{symbol}: fractional long qty {abs_qty:.6f} floored to {whole} whole shares "
-                "for Alpaca GTC stop order"
+                f"{symbol}: fractional long qty {abs_qty:.6f} floored to {int(whole)} whole shares "
+                f"for Alpaca GTC stop; remaining {frac:.6f} fractional share protected via software stop"
             )
-            return float(whole), TimeInForce.GTC
+            return whole, TimeInForce.GTC
 
         warnings.append(
             f"{symbol}: fractional long qty {abs_qty:.6f} < 1.0 cannot use Alpaca GTC stop; "
-            "using TimeInForce.DAY fallback"
+            "protected via software stop"
         )
-        return round(abs_qty, 6), TimeInForce.DAY
+        return 0.0, TimeInForce.GTC
 
     @staticmethod
     def _is_stop_at_least_as_protective(
@@ -1465,6 +1543,7 @@ class AlpacaBroker:
         validate_trading_mode(self.settings)
         now = self._now()
         desired_map = {k.strip().upper(): float(v) for k, v in desired_stops.items()}
+        existing_db_positions = {p["symbol"]: p for p in self.db.get_live_positions()}
         positions = self.get_broker_positions()
         open_orders = self._fetch_open_orders()
         observed_symbols = self._collect_observed_symbols(positions, open_orders)
@@ -1476,6 +1555,7 @@ class AlpacaBroker:
 
         kept_stops: dict[str, str] = {}
         submitted_stops: dict[str, str] = {}
+        software_stops: dict[str, float] = {}
         canceled_orphans: list[str] = []
         canceled_stale: list[str] = []
         untouched_blackout_positions: list[str] = []
@@ -1546,6 +1626,22 @@ class AlpacaBroker:
                 )
                 if active_id:
                     kept_stops[sym] = active_id
+                else:
+                    _, frozen_sw_frac = self._split_hybrid_stop_quantities(signed_qty)
+                    prev_frozen = existing_db_positions.get(sym)
+                    prev_frozen_px = _same_side_db_stop_price(prev_frozen, signed_qty)
+                    if prev_frozen_px is not None and (
+                        (
+                            prev_frozen is not None
+                            and prev_frozen.get("stop_order_id") == SOFTWARE_STOP_ORDER_ID
+                        )
+                        or (
+                            math.floor(abs(signed_qty) + 1e-9) <= 0
+                            and frozen_sw_frac > 0.0
+                        )
+                    ):
+                        active_id = SOFTWARE_STOP_ORDER_ID
+                        active_px = prev_frozen_px
                 if not blackout.halted:
                     warnings.append(
                         f"{sym}: frozen by BLACKOUT_PERIOD; resting orders left untouched"
@@ -1565,9 +1661,54 @@ class AlpacaBroker:
                 continue
             is_long = signed_qty > 0.0
             protective_side = OrderSide.sell if is_long else OrderSide.buy
+            _, software_frac_qty = self._split_hybrid_stop_quantities(signed_qty)
             target_qty, tif = self._resolve_stop_qty_and_tif(sym, signed_qty, warnings)
             desired_px = desired_map.get(sym)
             existing_list = valid_stops_by_symbol.get(sym, [])
+
+            if target_qty <= 0.0 and software_frac_qty > 0.0:
+                for cand in existing_list:
+                    cand_id = str(getattr(cand, "id", ""))
+                    if cand_id:
+                        if self._cancel_and_confirm(
+                            cand_id, timeout_seconds=cancel_ack_timeout
+                        ):
+                            canceled_stale.append(cand_id)
+                        else:
+                            errors.append(
+                                f"{sym}: failed to confirm cancel of stray stop {cand_id}"
+                            )
+                prev_db_stop = _same_side_db_stop_price(
+                    existing_db_positions.get(sym), signed_qty
+                )
+                if desired_px is not None and desired_px > 0.0:
+                    if prev_db_stop is not None:
+                        raw_stop = max(prev_db_stop, float(desired_px))
+                    else:
+                        raw_stop = float(desired_px)
+                elif prev_db_stop is not None:
+                    raw_stop = prev_db_stop
+                else:
+                    ref = pos["market_price"] if pos["market_price"] > 0 else pos["avg_entry_price"]
+                    raw_stop = ref * 0.90
+                    warnings.append(
+                        f"{sym}: missing desired stop price; synthesized conservative fallback software stop {raw_stop:.2f}"
+                    )
+                rounded_sw_stop = max(0.01, round(raw_stop, 2))
+                software_stops[sym] = rounded_sw_stop
+                live_pos_rows.append(
+                    {
+                        "symbol": sym,
+                        "qty": signed_qty,
+                        "avg_entry_price": pos["avg_entry_price"],
+                        "market_price": pos["market_price"],
+                        "unrealized_pnl": pos["unrealized_pnl"],
+                        "stop_order_id": SOFTWARE_STOP_ORDER_ID,
+                        "stop_price": rounded_sw_stop,
+                        "updated_at": now,
+                    }
+                )
+                continue
 
             if target_qty <= 0.0:
                 for cand in existing_list:
@@ -1592,7 +1733,7 @@ class AlpacaBroker:
 
             matched_order: Any | None = None
             for cand in existing_list:
-                cand_qty = _req_float(getattr(cand, "qty", 0.0))
+                cand_qty = _open_order_remaining_qty(cand)
                 cand_stop = _opt_float(getattr(cand, "stop_price", None))
                 if cand_stop is None or cand_stop <= 0.0:
                     continue
@@ -1669,6 +1810,13 @@ class AlpacaBroker:
                     )
                 else:
                     raw_stop = desired_px
+                prev_db_stop = _same_side_db_stop_price(
+                    existing_db_positions.get(sym), signed_qty
+                )
+                if prev_db_stop is not None:
+                    raw_stop = (
+                        max(prev_db_stop, raw_stop) if is_long else min(prev_db_stop, raw_stop)
+                    )
                 rounded_stop = max(0.01, round(raw_stop, 2))
                 leg_tag = hashlib.sha1(
                     f"{run_id}:{rounded_stop:.2f}:{target_qty:.6f}".encode()
@@ -1739,6 +1887,30 @@ class AlpacaBroker:
                         errors.append(err)
                         logger.warning("alpaca_stop_submit_failed", symbol=sym, error=str(exc))
 
+            persisted_stop_px = active_stop_px
+            if persisted_stop_px is None or persisted_stop_px <= 0.0:
+                stop_candidates: list[float] = []
+                if desired_px is not None and math.isfinite(desired_px) and desired_px > 0.0:
+                    stop_candidates.append(float(desired_px))
+                prev_db_stop = _same_side_db_stop_price(
+                    existing_db_positions.get(sym), signed_qty
+                )
+                if prev_db_stop is not None:
+                    stop_candidates.append(prev_db_stop)
+                if stop_candidates:
+                    persisted_stop_px = max(stop_candidates) if is_long else min(stop_candidates)
+            if (
+                persisted_stop_px is not None
+                and math.isfinite(float(persisted_stop_px))
+                and float(persisted_stop_px) > 0.0
+            ):
+                persisted_stop_px = max(0.01, round(float(persisted_stop_px), 2))
+            else:
+                persisted_stop_px = None
+
+            if software_frac_qty > 0.0 and persisted_stop_px is not None:
+                software_stops[sym] = persisted_stop_px
+
             live_pos_rows.append(
                 {
                     "symbol": sym,
@@ -1747,7 +1919,7 @@ class AlpacaBroker:
                     "market_price": pos["market_price"],
                     "unrealized_pnl": pos["unrealized_pnl"],
                     "stop_order_id": active_stop_id,
-                    "stop_price": active_stop_px,
+                    "stop_price": persisted_stop_px,
                     "updated_at": now,
                 }
             )
@@ -1758,6 +1930,7 @@ class AlpacaBroker:
             run_id=run_id,
             kept_stops=kept_stops,
             submitted_stops=submitted_stops,
+            software_stops=software_stops,
             canceled_orphans=canceled_orphans,
             canceled_stale=canceled_stale,
             untouched_blackout_positions=sorted(untouched_blackout_positions),
@@ -1888,7 +2061,15 @@ class AlpacaBroker:
         duplicate_stop_symbols: list[str] = []
         resting_stops: dict[str, Any] = {}
         for sym, pos in sorted(broker_positions.items()):
-            target_qty, _ = self._resolve_stop_qty_and_tif(sym, pos["qty"], [])
+            target_qty, software_frac_qty = self._split_hybrid_stop_quantities(pos["qty"])
+            if target_qty <= 0.0 and software_frac_qty > 0.0:
+                sym_stops = same_side_stops.get(sym, [])
+                if sym_stops:
+                    undersized_stop_symbols.append(sym)
+                    resting_stops[sym] = sym_stops[0]
+                if _same_side_db_stop_price(db_positions.get(sym), pos["qty"]) is None:
+                    missing_stop_symbols.append(sym)
+                continue
             if target_qty <= 0.0:
                 continue
             sym_stops = same_side_stops.get(sym, [])
@@ -1900,7 +2081,7 @@ class AlpacaBroker:
             matching_qty_stops = [
                 s
                 for s in sym_stops
-                if abs(_req_float(getattr(s, "qty", 0.0)) - target_qty) <= 1e-6
+                if abs(_open_order_remaining_qty(s) - target_qty) <= 1e-6
             ]
             if not matching_qty_stops:
                 undersized_stop_symbols.append(sym)
@@ -1952,6 +2133,12 @@ class AlpacaBroker:
                     repair_stops[sym] = existing_stop_px
                     continue
                 pos = broker_positions[sym]
+                same_side_prev_px = _same_side_db_stop_price(
+                    db_positions.get(sym), pos["qty"]
+                )
+                if same_side_prev_px is not None:
+                    repair_stops[sym] = same_side_prev_px
+                    continue
                 ref = pos["market_price"] if pos["market_price"] > 0 else pos["avg_entry_price"]
                 if ref > 0.0:
                     mult = (
@@ -1965,27 +2152,45 @@ class AlpacaBroker:
             )
 
         if stop_sync_result is None:
-            live_pos_rows = [
-                {
-                    "symbol": sym,
-                    "qty": pos["qty"],
-                    "avg_entry_price": pos["avg_entry_price"],
-                    "market_price": pos["market_price"],
-                    "unrealized_pnl": pos["unrealized_pnl"],
-                    "stop_order_id": (
-                        str(getattr(resting_stops[sym], "id", ""))
-                        if sym in resting_stops
-                        else None
-                    ),
-                    "stop_price": (
-                        _opt_float(getattr(resting_stops[sym], "stop_price", None))
-                        if sym in resting_stops
-                        else None
-                    ),
-                    "updated_at": now,
-                }
-                for sym, pos in sorted(broker_positions.items())
-            ]
+            live_pos_rows = []
+            for sym, pos in sorted(broker_positions.items()):
+                row_stop_id: str | None = None
+                row_stop_px: float | None = None
+                if sym in resting_stops:
+                    row_stop_id = str(getattr(resting_stops[sym], "id", "")) or None
+                    row_stop_px = _opt_float(getattr(resting_stops[sym], "stop_price", None))
+                else:
+                    target_qty, software_frac_qty = self._split_hybrid_stop_quantities(pos["qty"])
+                    d_pos = db_positions.get(sym)
+                    same_side_px = _same_side_db_stop_price(d_pos, pos["qty"])
+                    is_frozen = blackout.halted or sym in blackout.frozen_symbols
+                    if same_side_px is not None and (
+                        (not is_frozen and target_qty <= 0.0 and software_frac_qty > 0.0)
+                        or (
+                            is_frozen
+                            and (
+                                (
+                                    d_pos is not None
+                                    and d_pos.get("stop_order_id") == SOFTWARE_STOP_ORDER_ID
+                                )
+                                or (target_qty <= 0.0 and software_frac_qty > 0.0)
+                            )
+                        )
+                    ):
+                        row_stop_id = SOFTWARE_STOP_ORDER_ID
+                        row_stop_px = same_side_px
+                live_pos_rows.append(
+                    {
+                        "symbol": sym,
+                        "qty": pos["qty"],
+                        "avg_entry_price": pos["avg_entry_price"],
+                        "market_price": pos["market_price"],
+                        "unrealized_pnl": pos["unrealized_pnl"],
+                        "stop_order_id": row_stop_id,
+                        "stop_price": row_stop_px,
+                        "updated_at": now,
+                    }
+                )
             self.db.replace_live_positions(live_pos_rows)
 
         has_changes = bool(
@@ -2020,6 +2225,9 @@ class AlpacaBroker:
                     "repaired_stops": (
                         sorted(stop_sync_result.submitted_stops) if stop_sync_result else []
                     ),
+                    "software_stops": (
+                        sorted(stop_sync_result.software_stops) if stop_sync_result else []
+                    ),
                     "untouched_blackout_positions": untouched_blackout_positions,
                     "untouched_blackout_orders": untouched_blackout_orders,
                 },
@@ -2037,6 +2245,262 @@ class AlpacaBroker:
             untouched_blackout_positions=untouched_blackout_positions,
             untouched_blackout_orders=untouched_blackout_orders,
             stop_sync_result=stop_sync_result,
+        )
+
+    def evaluate_and_execute_software_stops(
+        self,
+        live_marks: Mapping[str, float],
+        *,
+        session_date: str,
+        run_id: str,
+        market_open: bool = False,
+        symbols: Iterable[str] | None = None,
+    ) -> SoftwareStopResult:
+        """Evaluate and execute daemon-managed software stops on unprotected fractional longs.
+
+        Protects sub-1.0 fractional long positions, the fractional remainder of ``N + f``
+        hybrid longs, and any long position with a failed/missing broker stop that still has
+        a persisted ``stop_price`` during regular market hours while respecting
+        ``BLACKOUT_PERIOD`` freezes, open sell/stop quantities, ``qty_available``, and
+        cross-tick idempotent ``client_order_id`` disambiguation.
+        """
+        validate_trading_mode(self.settings)
+        if not market_open:
+            return SoftwareStopResult(session_date=session_date, run_id=run_id)
+
+        # CRITICAL #1: Fetch open_orders BEFORE broker_positions to avoid TOCTOU double-sell
+        open_orders = self._fetch_open_orders()
+        broker_positions = self.get_broker_positions()
+        db_positions = {p["symbol"]: p for p in self.db.get_live_positions()}
+        observed_symbols = self._collect_observed_symbols(broker_positions, open_orders)
+        blackout = self.resolve_blackout_state(
+            now_utc=self._now(),
+            observed_broker_symbols=observed_symbols,
+        )
+        if blackout.halted:
+            return SoftwareStopResult(
+                session_date=session_date,
+                run_id=run_id,
+                untouched_blackout_positions=sorted(broker_positions.keys()),
+            )
+
+        target_symbol_set = (
+            {str(s).strip().upper() for s in symbols if str(s).strip()}
+            if symbols is not None
+            else None
+        )
+
+        open_sell_qty_by_sym: dict[str, float] = defaultdict(float)
+        open_sell_stop_px_by_sym: dict[str, float] = {}
+        for order in open_orders:
+            sym = str(getattr(order, "symbol", "")).strip().upper()
+            if not sym:
+                continue
+            if _enum_str(getattr(order, "side", "")) != "sell":
+                continue
+            rem = _open_order_remaining_qty(order)
+            open_sell_qty_by_sym[sym] += rem
+            otype = _enum_str(getattr(order, "order_type", None) or getattr(order, "type", None))
+            if otype in {"stop", "stop_limit"}:
+                spx = _opt_float(getattr(order, "stop_price", None))
+                if spx is not None and spx > 0.0:
+                    prev_spx = open_sell_stop_px_by_sym.get(sym)
+                    if prev_spx is None or spx > prev_spx:
+                        open_sell_stop_px_by_sym[sym] = spx
+
+        normalized_marks: dict[str, float] = {}
+        for k, v in live_marks.items():
+            clean_k = str(k).strip().upper()
+            parsed_v = _opt_float(v)
+            if clean_k and parsed_v is not None and parsed_v > 0.0:
+                normalized_marks[clean_k] = parsed_v
+
+        checked_symbols: list[str] = []
+        triggered: list[SoftwareStopExecution] = []
+        untouched_blackout_positions: list[str] = []
+        errors: list[str] = []
+
+        for sym, pos in sorted(broker_positions.items()):
+            if target_symbol_set is not None and sym not in target_symbol_set:
+                continue
+            signed_qty = float(pos["qty"])
+            if signed_qty <= _MIN_STOP_QTY:
+                continue
+
+            _, software_frac_qty = self._split_hybrid_stop_quantities(signed_qty)
+            db_pos = db_positions.get(sym)
+            same_side_db_stop = _same_side_db_stop_price(db_pos, signed_qty)
+            is_watched = (
+                software_frac_qty > 0.0
+                or (db_pos is not None and db_pos.get("stop_order_id") == SOFTWARE_STOP_ORDER_ID)
+                or (
+                    db_pos is not None
+                    and db_pos.get("stop_order_id") is None
+                    and same_side_db_stop is not None
+                )
+            )
+            if not is_watched:
+                continue
+
+            if sym in blackout.frozen_symbols:
+                untouched_blackout_positions.append(sym)
+                continue
+
+            checked_symbols.append(sym)
+
+            stop_candidates: list[float] = []
+            open_spx = open_sell_stop_px_by_sym.get(sym)
+            if open_spx is not None and open_spx > 0.0:
+                stop_candidates.append(open_spx)
+            if same_side_db_stop is not None:
+                stop_candidates.append(same_side_db_stop)
+            if not stop_candidates:
+                continue
+            stop_px = max(stop_candidates)
+
+            mark_px = normalized_marks.get(sym)
+            if mark_px is None:
+                pos_mkt = _opt_float(pos.get("market_price"))
+                if pos_mkt is not None and pos_mkt > 0.0:
+                    mark_px = pos_mkt
+            if mark_px is None:
+                continue
+
+            if mark_px > stop_px:
+                continue
+
+            qty_available = float(pos.get("qty_available", signed_qty))
+            unprotected_qty = round(
+                min(
+                    max(0.0, signed_qty - open_sell_qty_by_sym.get(sym, 0.0)),
+                    max(0.0, qty_available),
+                ),
+                6,
+            )
+            if unprotected_qty <= _MIN_STOP_QTY:
+                continue
+
+            # HIGH #8: Skip < $1 partial fractional remainders while whole shares still rest via GTC
+            if (
+                unprotected_qty < signed_qty - _MIN_STOP_QTY
+                and unprotected_qty * mark_px < 1.0
+            ):
+                logger.info(
+                    "alpaca_software_stop_sub_dollar_partial_skip",
+                    symbol=sym,
+                    unprotected_qty=unprotected_qty,
+                    mark_price=mark_px,
+                    notional=round(unprotected_qty * mark_px, 4),
+                )
+                continue
+
+            # Re-check blackout immediately before submitting (defense-in-depth)
+            blackout_pre = self.resolve_blackout_state(
+                now_utc=self._now(),
+                observed_broker_symbols=observed_symbols,
+            )
+            if blackout_pre.halted or sym in blackout_pre.frozen_symbols:
+                untouched_blackout_positions.append(sym)
+                continue
+
+            # HIGH #8: Key leg_tag on stop_px and unprotected_qty (NOT run_id) for cross-tick idempotency
+            leg_tag = hashlib.sha1(
+                f"{stop_px:.2f}:{unprotected_qty:.6f}".encode()
+            ).hexdigest()[:6]
+            chosen_cid: str | None = None
+            sub_order: Any | None = None
+            for attempt in range(20):
+                leg_name = f"sw{leg_tag}" if attempt == 0 else f"sw{leg_tag}s{attempt}"
+                cand_cid = build_client_order_id(
+                    session_date,
+                    "swstp",
+                    sym,
+                    OrderSide.sell,
+                    leg=leg_name,
+                )
+                existing_order = self._fetch_order_by_client_id(cand_cid)
+                if existing_order is not None:
+                    existing_status = _enum_str(getattr(existing_order, "status", ""))
+                    if existing_status in _OPEN_ORDER_STATUSES:
+                        chosen_cid = cand_cid
+                        sub_order = existing_order
+                        break
+                    continue
+                chosen_cid = cand_cid
+                break
+
+            if chosen_cid is None:
+                errors.append(
+                    f"{sym}: exhausted client_order_id disambiguation attempts for software stop"
+                )
+                continue
+
+            try:
+                if sub_order is None:
+                    mkt_req = MarketOrderRequest(
+                        symbol=sym,
+                        qty=unprotected_qty,
+                        side=AlpacaOrderSide.SELL,
+                        time_in_force=TimeInForce.DAY,
+                        client_order_id=chosen_cid,
+                    )
+                    sub_order = self.trading_client.submit_order(mkt_req)
+                b_id, status, f_qty, f_px, _ = self._persist_broker_order(
+                    sub_order,
+                    client_order_id=chosen_cid,
+                    run_id=run_id,
+                    symbol=sym,
+                    side=OrderSide.sell,
+                    order_type="market",
+                    qty=unprotected_qty,
+                    reference_price=mark_px,
+                    is_risk_reducing=True,
+                    stop_price=stop_px,
+                )
+                if status not in _TERMINAL_ORDER_STATUSES:
+                    polled = self._poll_order(
+                        broker_order_id=b_id,
+                        client_order_id=chosen_cid,
+                        timeout_seconds=min(5.0, self.limit_timeout_seconds),
+                    )
+                    if polled is not None:
+                        b_id, status, f_qty, f_px, _ = self._persist_broker_order(
+                            polled,
+                            client_order_id=chosen_cid,
+                            run_id=run_id,
+                            symbol=sym,
+                            side=OrderSide.sell,
+                            order_type="market",
+                            qty=unprotected_qty,
+                            reference_price=mark_px,
+                            is_risk_reducing=True,
+                            stop_price=stop_px,
+                        )
+                triggered.append(
+                    SoftwareStopExecution(
+                        symbol=sym,
+                        qty=unprotected_qty,
+                        trigger_price=mark_px,
+                        stop_price=stop_px,
+                        client_order_id=chosen_cid,
+                        broker_order_id=b_id,
+                        status=status,
+                        filled_qty=f_qty,
+                        filled_avg_price=f_px,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate per-symbol software stop error
+                err_msg = f"{sym}: failed to execute software stop market sell: {exc}"
+                errors.append(err_msg)
+                logger.warning("alpaca_software_stop_failed", symbol=sym, error=str(exc))
+
+        return SoftwareStopResult(
+            session_date=session_date,
+            run_id=run_id,
+            checked_symbols=checked_symbols,
+            triggered=triggered,
+            untouched_blackout_positions=sorted(set(untouched_blackout_positions)),
+            errors=errors,
         )
 
     def emergency_flatten(

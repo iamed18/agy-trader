@@ -45,6 +45,7 @@ class _FakePosition:
     current_price: str
     unrealized_pl: str
     side: str = "long"
+    qty_available: str | None = None
 
 
 @dataclass
@@ -89,6 +90,8 @@ class _FakeTradingClient:
         self._seq = 0
         self.on_submit: Any = None
         self.on_poll: Any = None
+        self.reject_stop_above_market: bool = False
+        self.reject_oversell: bool = False
 
     def get_account(self) -> _FakeAccount:
         return self.account
@@ -123,6 +126,31 @@ class _FakeTradingClient:
         return order
 
     def submit_order(self, order_data: Any) -> _FakeOrder:
+        if isinstance(order_data, StopOrderRequest):
+            stop_qty = float(order_data.qty) if order_data.qty is not None else 0.0
+            if abs(stop_qty - round(stop_qty)) > 1e-6:
+                raise RuntimeError("fractional stop orders not supported")
+            if self.reject_stop_above_market:
+                sym_u = str(order_data.symbol).upper()
+                pos_obj = next((p for p in self.positions if p.symbol == sym_u), None)
+                if pos_obj is not None:
+                    mkt = float(pos_obj.current_price)
+                    spx = float(order_data.stop_price) if order_data.stop_price is not None else 0.0
+                    side_u = getattr(order_data.side, "value", str(order_data.side)).lower()
+                    if side_u == "sell" and spx >= mkt:
+                        raise RuntimeError(f"stop_price {spx} >= market {mkt}")
+        if self.reject_oversell:
+            side_u = getattr(order_data.side, "value", str(order_data.side)).lower()
+            if side_u == "sell":
+                sym_u = str(order_data.symbol).upper()
+                pos_obj = next((p for p in self.positions if p.symbol == sym_u), None)
+                avail = (
+                    float(pos_obj.qty_available)
+                    if (pos_obj is not None and pos_obj.qty_available is not None)
+                    else (float(pos_obj.qty) if pos_obj is not None else 0.0)
+                )
+                if float(order_data.qty) > avail + 1e-6:
+                    raise RuntimeError(f"insufficient qty_available {avail} for sell {order_data.qty}")
         self.submitted_requests.append(order_data)
         self._seq += 1
         oid = f"brk-{self._seq}"
@@ -242,6 +270,10 @@ def test_double_lock_enforced_on_init_and_execution(tmp_path: Path) -> None:
         broker.sync_protective_stops({}, session_date="2026-11-20", run_id="r1")
     with pytest.raises(ValueError, match="double-lock"):
         broker.emergency_flatten(confirm=True, reason="test")
+    with pytest.raises(ValueError, match="double-lock"):
+        broker.evaluate_and_execute_software_stops(
+            {}, session_date="2026-11-20", run_id="r1", market_open=True
+        )
 
     # With exact confirmation phrase, live mode passes validation
     live_ok = EnvSettings(
@@ -470,8 +502,8 @@ def test_sync_protective_stops_orphans_never_widen_and_fractional_gtc_constraint
 
     # Open positions:
     # - AAPL: whole long 10 shares; existing tighter stop at 195.00 (desired 190.00 -> MUST keep 195.00!)
-    # - NVDA: fractional long 5.75 shares; no stop yet -> floors to 5.0 whole shares GTC + warning
-    # - MINI: sub-1 fractional long 0.45 shares -> DAY fallback + warning
+    # - NVDA: fractional long 5.75 shares; no stop yet -> floors to 5.0 whole shares GTC + software stop for 0.75
+    # - MINI: sub-1 fractional long 0.45 shares -> ZERO broker stop order; protected via software stop
     # - TSLA: short -8 shares (side="short", positive qty string to test sign normalization!) -> needs BUY GTC stop
     tc.positions = [
         _FakePosition("AAPL", "10", "200.00", "205.00", "50.00", side="long"),
@@ -510,7 +542,11 @@ def test_sync_protective_stops_orphans_never_widen_and_fractional_gtc_constraint
     assert set(res.canceled_orphans) == {"ord-orphan", "ord-wrong"}
     assert res.canceled_stale == ["ord-tsla-wide"]
     assert res.kept_stops == {"AAPL": "ord-aapl-ok"}
-    assert set(res.submitted_stops) == {"MINI", "NVDA", "TSLA"}
+    assert set(res.submitted_stops) == {"NVDA", "TSLA"}
+    assert res.software_stops == {
+        "MINI": pytest.approx(475.00),
+        "NVDA": pytest.approx(115.00),
+    }
     assert res.errors == []
 
     # Verify submitted StopOrderRequests respect Alpaca fractional-GTC constraint
@@ -520,20 +556,21 @@ def test_sync_protective_stops_orphans_never_widen_and_fractional_gtc_constraint
     assert by_sym_req["NVDA"].time_in_force == TimeInForce.GTC
     assert by_sym_req["NVDA"].side == AlpacaOrderSide.SELL
 
-    assert by_sym_req["MINI"].qty == pytest.approx(0.45)
-    assert by_sym_req["MINI"].time_in_force == TimeInForce.DAY
+    assert "MINI" not in by_sym_req
 
     assert by_sym_req["TSLA"].qty == pytest.approx(8.0)
     assert by_sym_req["TSLA"].time_in_force == TimeInForce.GTC
     assert by_sym_req["TSLA"].side == AlpacaOrderSide.BUY
     assert by_sym_req["TSLA"].stop_price == pytest.approx(265.00)
 
-    assert any("NVDA" in w and "floored" in w for w in res.warnings)
-    assert any("MINI" in w and "DAY" in w for w in res.warnings)
+    assert any("NVDA" in w and "floored" in w and "software stop" in w for w in res.warnings)
+    assert any("MINI" in w and "software stop" in w for w in res.warnings)
 
     live_pos = {p["symbol"]: p for p in db.get_live_positions()}
     assert live_pos["AAPL"]["stop_order_id"] == "ord-aapl-ok"
     assert live_pos["AAPL"]["stop_price"] == pytest.approx(195.00)
+    assert live_pos["MINI"]["stop_order_id"] == "software"
+    assert live_pos["MINI"]["stop_price"] == pytest.approx(475.00)
     assert live_pos["TSLA"]["qty"] == pytest.approx(-8.0)
     assert live_pos["TSLA"]["stop_price"] == pytest.approx(265.00)
 
@@ -1163,3 +1200,579 @@ def test_alpaca_broker_context_manager_closes_only_owned_sessions(
         pass
     assert injected_tc._session.closed is False
     assert injected_qc._session.closed is False
+
+
+def test_software_stop_preservation_and_non_widening_ratchet(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+
+    tc.positions = [_FakePosition("MINI", "0.45", "500.00", "505.00", "2.25", side="long")]
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+
+    # Initial sync establishes software stop at 475.00 with zero broker submits
+    res1 = broker.sync_protective_stops(
+        {"MINI": 475.00}, session_date="2026-11-20", run_id="sw-init"
+    )
+    assert res1.software_stops == {"MINI": pytest.approx(475.00)}
+    assert tc.submitted_requests == []
+
+    # Clean reconcile preserves stop_order_id="software" and stop_price=475.00 without spamming events
+    rec1 = broker.reconcile_with_broker(daemon_name="trader", record_if_clean=False)
+    assert rec1.stop_sync_result is None
+    assert rec1.missing_stop_symbols == []
+    live = {p["symbol"]: p for p in db.get_live_positions()}
+    assert live["MINI"]["stop_order_id"] == "software"
+    assert live["MINI"]["stop_price"] == pytest.approx(475.00)
+    assert len(db.get_daemon_events(daemon_name="trader", event_type="reconcile")) == 0
+
+    # Sync with LOWER desired_px (460.00) must NEVER widen below 475.00
+    res_no_widen = broker.sync_protective_stops(
+        {"MINI": 460.00}, session_date="2026-11-20", run_id="sw-nowiden"
+    )
+    assert res_no_widen.software_stops["MINI"] == pytest.approx(475.00)
+    assert db.get_live_positions()[0]["stop_price"] == pytest.approx(475.00)
+
+    # Sync with HIGHER desired_px (485.00) ratchets up to 485.00
+    res_ratchet = broker.sync_protective_stops(
+        {"MINI": 485.00}, session_date="2026-11-20", run_id="sw-ratchet"
+    )
+    assert res_ratchet.software_stops["MINI"] == pytest.approx(485.00)
+    assert db.get_live_positions()[0]["stop_price"] == pytest.approx(485.00)
+
+    # Stray broker stop on sub-1.0 position is detected, canceled, and software stop preserved
+    stray = _FakeOrder("ord-stray-mini", "cid-stray", "MINI", "sell", "stop", "1", "new", stop_price="470.00")
+    tc.orders_by_id[stray.id] = stray
+    tc.orders_by_cid[stray.client_order_id] = stray
+    rec_stray = broker.reconcile_with_broker(daemon_name="trader", record_if_clean=False)
+    assert rec_stray.stop_sync_result is not None
+    assert "ord-stray-mini" in rec_stray.stop_sync_result.canceled_stale
+    assert db.get_live_positions()[0]["stop_order_id"] == "software"
+    assert db.get_live_positions()[0]["stop_price"] == pytest.approx(485.00)
+
+
+def test_hybrid_transition_after_gtc_stop_fill_and_software_execution(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+
+    def _fill_market(order: _FakeOrder, req: Any) -> None:
+        if isinstance(req, MarketOrderRequest):
+            order.status = "filled"
+            order.filled_qty = order.qty
+            order.filled_avg_price = "94.45"
+
+    tc.on_submit = _fill_market
+
+    # Start with hybrid 5.75 NVDA and resting 5.0-share GTC stop at 95.00
+    tc.positions = [_FakePosition("NVDA", "5.75", "100.00", "102.00", "11.50", side="long")]
+    gtc_stop = _FakeOrder(
+        "ord-nvda-5", "cid-nvda-5", "NVDA", "sell", "stop", "5", "new", stop_price="95.00"
+    )
+    tc.orders_by_id[gtc_stop.id] = gtc_stop
+    tc.orders_by_cid[gtc_stop.client_order_id] = gtc_stop
+
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    sync_res = broker.sync_protective_stops(
+        {"NVDA": 95.00}, session_date="2026-11-20", run_id="hybrid-1"
+    )
+    assert sync_res.kept_stops == {"NVDA": "ord-nvda-5"}
+    assert sync_res.software_stops == {"NVDA": pytest.approx(95.00)}
+
+    # Broker GTC stop fills 5 shares, leaving 0.75 shares on broker with NO open broker stop
+    gtc_stop.status = "filled"
+    gtc_stop.filled_qty = "5"
+    gtc_stop.filled_avg_price = "95.00"
+    tc.positions = [_FakePosition("NVDA", "0.75", "100.00", "94.50", "-4.12", side="long")]
+
+    rec = broker.reconcile_with_broker(daemon_name="trader", record_if_clean=False)
+    assert rec.missing_stop_symbols == []
+    live = {p["symbol"]: p for p in db.get_live_positions()}
+    assert live["NVDA"]["stop_order_id"] == "software"
+    assert live["NVDA"]["stop_price"] == pytest.approx(95.00)
+
+    # Mark above stop -> no trigger
+    res_hold = broker.evaluate_and_execute_software_stops(
+        {"NVDA": 96.00}, session_date="2026-11-20", run_id="sw-hold", market_open=True
+    )
+    assert res_hold.checked_symbols == ["NVDA"]
+    assert res_hold.triggered == []
+    assert tc.submitted_requests == []
+
+    # Mark breaches stop (94.50 <= 95.00) -> executes MarketOrderRequest(DAY) for 0.75 shares
+    res_trig = broker.evaluate_and_execute_software_stops(
+        {"NVDA": 94.50}, session_date="2026-11-20", run_id="sw-trig", market_open=True
+    )
+    assert len(res_trig.triggered) == 1
+    ex = res_trig.triggered[0]
+    assert ex.symbol == "NVDA"
+    assert ex.qty == pytest.approx(0.75)
+    assert ex.trigger_price == pytest.approx(94.50)
+    assert ex.stop_price == pytest.approx(95.00)
+    assert ex.status == "filled"
+    assert ex.filled_qty == pytest.approx(0.75)
+    assert ex.filled_avg_price == pytest.approx(94.45)
+
+    assert len(tc.submitted_requests) == 1
+    req = tc.submitted_requests[0]
+    assert isinstance(req, MarketOrderRequest)
+    assert req.qty == pytest.approx(0.75)
+    assert req.side == AlpacaOrderSide.SELL
+    assert req.time_in_force == TimeInForce.DAY
+
+
+def test_hybrid_race_safety_open_gtc_stop_and_duplicate_sell_protection(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+
+    # NVDA has 5.75 shares with an OPEN 5.0-share GTC stop at 95.00 while mark drops to 94.50
+    tc.positions = [_FakePosition("NVDA", "5.75", "100.00", "94.50", "-31.62", side="long")]
+    gtc_stop = _FakeOrder(
+        "ord-nvda-open", "cid-nvda-open", "NVDA", "sell", "stop", "5", "new", stop_price="95.00"
+    )
+    tc.orders_by_id[gtc_stop.id] = gtc_stop
+    tc.orders_by_cid[gtc_stop.client_order_id] = gtc_stop
+
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    broker.sync_protective_stops({"NVDA": 95.00}, session_date="2026-11-20", run_id="race-1")
+    tc.submitted_requests.clear()
+
+    # Software stop MUST sell ONLY the unprotected 0.75 remainder (never 5.75!)
+    res = broker.evaluate_and_execute_software_stops(
+        {"NVDA": 94.50}, session_date="2026-11-20", run_id="race-exec", market_open=True
+    )
+    assert len(res.triggered) == 1
+    assert res.triggered[0].qty == pytest.approx(0.75)
+    assert len(tc.submitted_requests) == 1
+    assert tc.submitted_requests[0].qty == pytest.approx(0.75)
+
+    # While that 0.75 sell order is still open (5.0 + 0.75 = 5.75 covered), re-evaluating submits ZERO orders
+    res_dup = broker.evaluate_and_execute_software_stops(
+        {"NVDA": 94.00}, session_date="2026-11-20", run_id="race-exec-2", market_open=True
+    )
+    assert res_dup.triggered == []
+    assert len(tc.submitted_requests) == 1
+
+
+def test_software_stop_market_closed_and_blackout_rails(tmp_path: Path) -> None:
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+    env_p = tmp_path / ".env"
+    env_p.write_text('BLACKOUT_PERIOD="ACME"\n', encoding="utf-8")
+    repo_config_dir = Path(__file__).resolve().parents[1] / "config"
+
+    tc.positions = [
+        _FakePosition("ACME", "0.40", "100.00", "80.00", "-8.00", side="long"),
+        _FakePosition("AAPL", "0.50", "100.00", "85.00", "-7.50", side="long"),
+    ]
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "ACME",
+                "qty": 0.40,
+                "avg_entry_price": 100.0,
+                "market_price": 80.0,
+                "unrealized_pnl": -8.0,
+                "stop_order_id": "software",
+                "stop_price": 90.0,
+            },
+            {
+                "symbol": "AAPL",
+                "qty": 0.50,
+                "avg_entry_price": 100.0,
+                "market_price": 85.0,
+                "unrealized_pnl": -7.5,
+                "stop_order_id": "software",
+                "stop_price": 90.0,
+            },
+        ]
+    )
+
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+        env_file=env_p,
+        config_dir=repo_config_dir,
+    )
+
+    # 1) Market closed (both explicit market_open=False and fail-closed default) -> ZERO triggers
+    res_default = broker.evaluate_and_execute_software_stops(
+        {"ACME": 80.0, "AAPL": 85.0},
+        session_date="2026-11-20",
+        run_id="sw-default",
+    )
+    assert res_default.triggered == []
+    assert res_default.checked_symbols == []
+
+    res_closed = broker.evaluate_and_execute_software_stops(
+        {"ACME": 80.0, "AAPL": 85.0},
+        session_date="2026-11-20",
+        run_id="sw-closed",
+        market_open=False,
+    )
+    assert res_closed.triggered == []
+    assert res_closed.checked_symbols == []
+    assert tc.submitted_requests == []
+
+    # 2) Market open with ACME frozen -> ACME untouched, in-universe AAPL triggers normally
+    res_open = broker.evaluate_and_execute_software_stops(
+        {"ACME": 80.0, "AAPL": 85.0},
+        session_date="2026-11-20",
+        run_id="sw-open",
+        market_open=True,
+    )
+    assert res_open.untouched_blackout_positions == ["ACME"]
+    assert res_open.checked_symbols == ["AAPL"]
+    assert [t.symbol for t in res_open.triggered] == ["AAPL"]
+    assert [r.symbol for r in tc.submitted_requests] == ["AAPL"]
+
+    # 3) Global blackout halt (malformed .env) -> ZERO triggers, all positions untouched
+    tc.submitted_requests.clear()
+    env_p.write_text('BLACKOUT_PERIOD="ACME;DROP"\n', encoding="utf-8")
+    res_halt = broker.evaluate_and_execute_software_stops(
+        {"ACME": 80.0, "AAPL": 85.0},
+        session_date="2026-11-20",
+        run_id="sw-halt",
+        market_open=True,
+    )
+    assert res_halt.triggered == []
+    assert res_halt.untouched_blackout_positions == ["AAPL", "ACME"]
+    assert tc.submitted_requests == []
+
+
+def test_software_stop_toctou_fill_and_qty_available_cap(tmp_path: Path) -> None:
+    """CRITICAL #1: Open orders fetched before positions + qty_available prevents double-sell."""
+    db = StateDB(tmp_path / "state.db")
+    clock = _FakeClock()
+
+    class _ToctouTradingClient(_FakeTradingClient):
+        def get_all_positions(self) -> list[_FakePosition]:
+            # Simulate GTC stop filling AFTER get_orders() already returned the 5-share GTC stop!
+            return [_FakePosition("NVDA", "0.75", "100.00", "94.50", "-4.12", side="long")]
+
+    tc = _ToctouTradingClient()
+    gtc_stop = _FakeOrder("ord-nvda-gtc", "cid-nvda-gtc", "NVDA", "sell", "stop", "5", "new", stop_price="95.00")
+    tc.orders_by_id[gtc_stop.id] = gtc_stop
+    tc.orders_by_cid[gtc_stop.client_order_id] = gtc_stop
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "NVDA",
+                "qty": 5.75,
+                "avg_entry_price": 100.0,
+                "market_price": 94.5,
+                "unrealized_pnl": -31.62,
+                "stop_order_id": "ord-nvda-gtc",
+                "stop_price": 95.0,
+            }
+        ]
+    )
+
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    res_toctou = broker.evaluate_and_execute_software_stops(
+        {"NVDA": 94.50}, session_date="2026-11-20", run_id="toctou", market_open=True
+    )
+    assert res_toctou.triggered == []
+    assert tc.submitted_requests == []
+
+    # Now test qty_available cap even when open_orders is stale/empty
+    tc2 = _FakeTradingClient()
+    tc2.positions = [
+        _FakePosition("NVDA", "5.75", "100.00", "94.50", "-31.62", side="long", qty_available="0.75")
+    ]
+    broker2 = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc2,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    res_cap = broker2.evaluate_and_execute_software_stops(
+        {"NVDA": 94.50}, session_date="2026-11-20", run_id="cap", market_open=True
+    )
+    assert len(res_cap.triggered) == 1
+    assert res_cap.triggered[0].qty == pytest.approx(0.75)
+
+
+def test_partially_filled_gtc_stop_is_kept_not_canceled(tmp_path: Path) -> None:
+    """CRITICAL #4: Actively partially_filled GTC stop matches remaining qty (qty - filled_qty)."""
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+
+    # 3 of 5 shares filled -> broker position is now 2.75 (target_qty=2.0), stop remaining is 5-3=2.0!
+    tc.positions = [_FakePosition("NVDA", "2.75", "100.00", "95.00", "-13.75", side="long")]
+    partial_stop = _FakeOrder(
+        "ord-nvda-partial",
+        "cid-nvda-partial",
+        "NVDA",
+        "sell",
+        "stop",
+        "5",
+        status="partially_filled",
+        filled_qty="3",
+        stop_price="95.00",
+    )
+    tc.orders_by_id[partial_stop.id] = partial_stop
+    tc.orders_by_cid[partial_stop.client_order_id] = partial_stop
+
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    rec = broker.reconcile_with_broker(daemon_name="trader", record_if_clean=False)
+    assert rec.stop_sync_result is None
+    assert tc.canceled_ids == []
+
+    sync_res = broker.sync_protective_stops(
+        {"NVDA": 95.00}, session_date="2026-11-20", run_id="partial-keep"
+    )
+    assert sync_res.kept_stops == {"NVDA": "ord-nvda-partial"}
+    assert tc.canceled_ids == []
+    assert tc.submitted_requests == []
+
+
+def test_gtc_stop_submit_failure_preserves_stop_price_and_software_stop_rescues(
+    tmp_path: Path,
+) -> None:
+    """CRITICAL #2: Failed GTC stop submit preserves stop_price in StateDB and software stop rescues."""
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    tc.reject_stop_above_market = True
+    clock = _FakeClock()
+
+    # AAPL gapped below desired 190.00 stop (market_price=180.00) -> StopOrderRequest fails!
+    tc.positions = [_FakePosition("AAPL", "10", "200.00", "180.00", "-200.00", side="long")]
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+
+    sync_res = broker.sync_protective_stops(
+        {"AAPL": 190.00}, session_date="2026-11-20", run_id="gap-fail"
+    )
+    assert sync_res.submitted_stops == {}
+    assert any("AAPL" in e for e in sync_res.errors)
+    live = {p["symbol"]: p for p in db.get_live_positions()}
+    assert live["AAPL"]["stop_order_id"] is None
+    assert live["AAPL"]["stop_price"] == pytest.approx(190.00)
+
+    # Software stop sees stop_order_id=None with persisted stop_price=190.00 and rescues at 180.00!
+    rescue = broker.evaluate_and_execute_software_stops(
+        {"AAPL": 180.00}, session_date="2026-11-20", run_id="rescue", market_open=True
+    )
+    assert len(rescue.triggered) == 1
+    assert rescue.triggered[0].symbol == "AAPL"
+    assert rescue.triggered[0].qty == pytest.approx(10.0)
+
+
+def test_reconcile_preserves_same_side_stop_and_blocks_short_to_long_flip_contamination(
+    tmp_path: Path,
+) -> None:
+    """HIGH #5 & #6: Reconcile reuses same-side stop_price without widening; side-flip never inherits."""
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+
+    # AAPL had tighter stop 195.00 in DB while broker lost the GTC stop; market=200.00 -> must NOT widen to 180.00
+    # MINI flipped from SHORT -10 (stop 550.00) to fractional LONG +0.45 -> must NOT inherit 550.00!
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "AAPL",
+                "qty": 10.0,
+                "avg_entry_price": 190.0,
+                "market_price": 200.0,
+                "unrealized_pnl": 100.0,
+                "stop_order_id": "old-aapl",
+                "stop_price": 195.0,
+            },
+            {
+                "symbol": "MINI",
+                "qty": -10.0,
+                "avg_entry_price": 500.0,
+                "market_price": 490.0,
+                "unrealized_pnl": 100.0,
+                "stop_order_id": "old-mini-short",
+                "stop_price": 550.0,
+            },
+        ]
+    )
+    tc.positions = [
+        _FakePosition("AAPL", "10", "190.00", "200.00", "100.00", side="long"),
+        _FakePosition("MINI", "0.45", "500.00", "505.00", "2.25", side="long"),
+    ]
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+
+    rec = broker.reconcile_with_broker(daemon_name="trader", record_if_clean=False)
+    assert set(rec.missing_stop_symbols) == {"AAPL", "MINI"}
+    live = {p["symbol"]: p for p in db.get_live_positions()}
+    assert live["AAPL"]["stop_price"] == pytest.approx(195.00)
+    # MINI fell back to conservative 0.90 * 505 = 454.50 instead of inheriting 550.00 from short!
+    assert live["MINI"]["stop_price"] == pytest.approx(454.50)
+
+    # Also verify sync_protective_stops ignores opposite-side DB stop on side flip
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "MINI",
+                "qty": -10.0,
+                "avg_entry_price": 500.0,
+                "market_price": 490.0,
+                "unrealized_pnl": 100.0,
+                "stop_order_id": "old-mini-short",
+                "stop_price": 550.0,
+            }
+        ]
+    )
+    tc.positions = [_FakePosition("MINI", "0.45", "500.00", "505.00", "2.25", side="long")]
+    sync_flip = broker.sync_protective_stops(
+        {"MINI": 475.00}, session_date="2026-11-20", run_id="flip-sync"
+    )
+    assert sync_flip.software_stops["MINI"] == pytest.approx(475.00)
+
+
+def test_cross_tick_idempotency_and_sub_dollar_partial_skip(tmp_path: Path) -> None:
+    """HIGH #8: Cross-tick client_order_id adopts open orders; < $1 partial remainder skipped."""
+    db = StateDB(tmp_path / "state.db")
+    tc = _FakeTradingClient()
+    clock = _FakeClock()
+
+    # 1) Open software stop order from prior tick (even with different run_id) is adopted, NOT duplicated
+    tc.positions = [_FakePosition("MINI", "0.45", "500.00", "470.00", "-13.50", side="long")]
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "MINI",
+                "qty": 0.45,
+                "avg_entry_price": 500.0,
+                "market_price": 470.0,
+                "unrealized_pnl": -13.5,
+                "stop_order_id": "software",
+                "stop_price": 475.0,
+            }
+        ]
+    )
+    broker = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db,
+        trading_client=tc,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    res1 = broker.evaluate_and_execute_software_stops(
+        {"MINI": 470.0}, session_date="2026-11-20", run_id="tick-1", market_open=True
+    )
+    assert len(res1.triggered) == 1
+    cid1 = res1.triggered[0].client_order_id
+
+    # Simulate _fetch_open_orders temporarily omitting the open order while get_order_by_client_id finds it
+    orig_get_orders = tc.get_orders
+    tc.get_orders = lambda filter=None: []  # type: ignore[method-assign]
+    res2 = broker.evaluate_and_execute_software_stops(
+        {"MINI": 469.0}, session_date="2026-11-20", run_id="tick-2-different", market_open=True
+    )
+    tc.get_orders = orig_get_orders  # type: ignore[method-assign]
+    assert len(res2.triggered) == 1
+    assert res2.triggered[0].client_order_id == cid1
+    assert len(tc.submitted_requests) == 1  # Zero duplicate submit!
+
+    # 2) Sub-$1 partial fractional remainder (0.005 * $100 = $0.50) while 5.0 GTC stop rests -> skipped
+    tc2 = _FakeTradingClient()
+    tc2.positions = [_FakePosition("NVDA", "5.005", "100.00", "94.00", "-30.00", side="long")]
+    gtc = _FakeOrder("ord-5", "cid-5", "NVDA", "sell", "stop", "5", "new", stop_price="95.00")
+    tc2.orders_by_id[gtc.id] = gtc
+    tc2.orders_by_cid[gtc.client_order_id] = gtc
+    db2 = StateDB(tmp_path / "state2.db")
+    db2.replace_live_positions(
+        [
+            {
+                "symbol": "NVDA",
+                "qty": 5.005,
+                "avg_entry_price": 100.0,
+                "market_price": 94.0,
+                "unrealized_pnl": -30.0,
+                "stop_order_id": "ord-5",
+                "stop_price": 95.0,
+            }
+        ]
+    )
+    broker2 = AlpacaBroker(
+        EnvSettings(alpaca_paper=True),
+        db2,
+        trading_client=tc2,
+        limit_timeout_seconds=0.0,
+        poll_interval_seconds=0.0,
+        sleep_fn=clock.sleep,
+        now_fn=clock.now,
+    )
+    res_sub1 = broker2.evaluate_and_execute_software_stops(
+        {"NVDA": 94.0}, session_date="2026-11-20", run_id="sub1", market_open=True
+    )
+    assert res_sub1.triggered == []
+    assert tc2.submitted_requests == []
+
+    # Once GTC fills and 0.005 is the ENTIRE position (full close), it DOES submit!
+    gtc.status = "filled"
+    gtc.filled_qty = "5"
+    tc2.positions = [_FakePosition("NVDA", "0.005", "100.00", "94.00", "-0.03", side="long")]
+    res_full = broker2.evaluate_and_execute_software_stops(
+        {"NVDA": 94.0}, session_date="2026-11-20", run_id="sub1-full", market_open=True
+    )
+    assert len(res_full.triggered) == 1
+    assert res_full.triggered[0].qty == pytest.approx(0.005)

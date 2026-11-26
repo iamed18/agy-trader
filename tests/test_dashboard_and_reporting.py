@@ -836,3 +836,96 @@ def test_benchmark_parquet_fallback_for_historical_snapshots(tmp_path: Path) -> 
     assert series[0]["qmom_index"] == pytest.approx(100.0)
     assert series[1]["spmo_index"] == pytest.approx(103.0)
     assert series[1]["qmom_index"] == pytest.approx(102.0)
+
+
+def test_reporting_hybrid_software_stops_and_readiness_escalation(tmp_path: Path) -> None:
+    """MEDIUM #12: digests annotate (software), (GTC+sw), MISSING GTC, and escalate when trader is down."""
+    data_dir = tmp_path / "data"
+    now = datetime(2025, 12, 31, 20, 45, tzinfo=UTC)
+    db = _seed_operational_state(data_dir, now_utc=now)
+
+    # Seed hybrid, software-only, and missing-GTC-with-target positions
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "MINI",
+                "qty": 0.45,
+                "avg_entry_price": 500.0,
+                "market_price": 505.0,
+                "unrealized_pnl": 2.25,
+                "stop_order_id": "software",
+                "stop_price": 475.0,
+                "updated_at": now,
+            },
+            {
+                "symbol": "NVDA",
+                "qty": 5.75,
+                "avg_entry_price": 120.0,
+                "market_price": 125.0,
+                "unrealized_pnl": 28.75,
+                "stop_order_id": "stp-nvda-5",
+                "stop_price": 115.0,
+                "updated_at": now,
+            },
+            {
+                "symbol": "AAPL",
+                "qty": 10.0,
+                "avg_entry_price": 195.0,
+                "market_price": 200.0,
+                "unrealized_pnl": 50.0,
+                "stop_order_id": None,
+                "stop_price": 190.0,
+                "updated_at": now,
+            },
+        ]
+    )
+
+    morning = build_morning_plan(data_dir, REPO_CONFIG_DIR, now_utc=now)
+    md = morning["markdown_summary"]
+    assert "$475.00 (software)" in md
+    assert "$115.00 (GTC+sw)" in md
+    assert "MISSING GTC (target $190.00)" in md
+
+    # Remove AAPL missing GTC so only MINI (software) + NVDA (GTC+sw) remain -> READY when trader healthy
+    db.replace_live_positions(
+        [
+            {
+                "symbol": "MINI",
+                "qty": 0.45,
+                "avg_entry_price": 500.0,
+                "market_price": 505.0,
+                "unrealized_pnl": 2.25,
+                "stop_order_id": "software",
+                "stop_price": 475.0,
+                "updated_at": now,
+            },
+            {
+                "symbol": "NVDA",
+                "qty": 5.75,
+                "avg_entry_price": 120.0,
+                "market_price": 125.0,
+                "unrealized_pnl": 28.75,
+                "stop_order_id": "stp-nvda-5",
+                "stop_price": 115.0,
+                "updated_at": now,
+            },
+        ]
+    )
+    ready_ok = build_readiness_report(data_dir, REPO_CONFIG_DIR, now_utc=now)
+    assert ready_ok["status"] == "READY", ready_ok["issues"]
+    stop_chk_ok = next(c for c in ready_ok["checks"] if c["name"] == "protective_stops")
+    assert stop_chk_ok["severity"] == "ok"
+    assert "software-monitored" in stop_chk_ok["message"]
+
+    # When trader daemon becomes stale/critical while software-only position exists -> protective_stops escalates to critical!
+    db.upsert_daemon_heartbeat(
+        "trader",
+        "critical",
+        {"pid": 12345},
+        now_utc=now - timedelta(hours=1),
+    )
+    ready_crit = build_readiness_report(data_dir, REPO_CONFIG_DIR, now_utc=now)
+    assert ready_crit["status"] == "CRITICAL"
+    stop_chk_crit = next(c for c in ready_crit["checks"] if c["name"] == "protective_stops")
+    assert stop_chk_crit["severity"] == "critical"
+    assert "MINI" in stop_chk_crit["message"]

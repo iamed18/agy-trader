@@ -34,9 +34,10 @@ strategy:
   min_signal_threshold: 0.0
   exit_signal_threshold: -0.5
   rebalance_deadband_pct: 0.015
-  # Alpaca restricts protective stop orders on <1.0 share fractional quantities; whole-share longs
-  # guarantee 100% GTC protective stop attachment across all S&P 500 price levels (e.g. BKNG/AZO).
-  allow_fractional_longs: false
+  # Fractional longs enabled for small-account capital efficiency (<= $10k):
+  # AlpacaBroker + TraderDaemon enforce hybrid protective stops — server-side GTC stops
+  # on floor(qty) whole shares and 30-second daemon software stops on fractional remainders.
+  allow_fractional_longs: true
   rebalance_every_n_days: 1
   rebalance_schedule: "monthly_first"
   hold_rank_buffer: 8
