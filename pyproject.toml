@@ -22,6 +22,10 @@ dev = [
     "respx>=0.21",
     "types-PyYAML>=6.0",
 ]
+research = [
+    "cvxpy>=1.6",
+    "scikit-learn>=1.5",
+]
 
 [tool.uv]
 package = false
